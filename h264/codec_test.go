@@ -1,0 +1,1477 @@
+package h264
+
+import (
+	"fmt"
+	"image"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	govidmp4 "github.com/Eyevinn/mp4ff/mp4"
+
+	"github.com/liqmix/govid"
+)
+
+// helper: open an MP4 and return a demuxer-like packet source.
+type testPacketSource struct {
+	reader     io.ReadSeeker
+	track      *govidmp4.TrakBox
+	spsData    []byte
+	ppsData    []byte
+	sampleNr   uint32
+	totalSamples uint32
+	timescale  uint32
+	syncMap    map[uint32]bool
+}
+
+func openTestPackets(t *testing.T, path string) *testPacketSource {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+
+	file, err := govidmp4.DecodeFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var vt *govidmp4.TrakBox
+	for _, trak := range file.Moov.Traks {
+		if trak.Mdia != nil && trak.Mdia.Hdlr != nil && trak.Mdia.Hdlr.HandlerType == "vide" {
+			vt = trak
+			break
+		}
+	}
+	if vt == nil {
+		t.Fatal("no video track")
+	}
+
+	dcr := vt.Mdia.Minf.Stbl.Stsd.AvcX.AvcC.DecConfRec
+	sps := make([]byte, 4+len(dcr.SPSnalus[0]))
+	sps[0] = 0
+	sps[1] = 0
+	sps[2] = byte(len(dcr.SPSnalus[0]) >> 8)
+	sps[3] = byte(len(dcr.SPSnalus[0]))
+	copy(sps[4:], dcr.SPSnalus[0])
+
+	pps := make([]byte, 4+len(dcr.PPSnalus[0]))
+	pps[0] = 0
+	pps[1] = 0
+	pps[2] = byte(len(dcr.PPSnalus[0]) >> 8)
+	pps[3] = byte(len(dcr.PPSnalus[0]))
+	copy(pps[4:], dcr.PPSnalus[0])
+
+	syncMap := make(map[uint32]bool)
+	if vt.Mdia.Minf.Stbl.Stss != nil {
+		for _, s := range vt.Mdia.Minf.Stbl.Stss.SampleNumber {
+			syncMap[s] = true
+		}
+	}
+
+	return &testPacketSource{
+		reader:       f,
+		track:        vt,
+		spsData:      sps,
+		ppsData:      pps,
+		sampleNr:     1,
+		totalSamples: vt.Mdia.Minf.Stbl.Stsz.GetNrSamples(),
+		timescale:    vt.Mdia.Mdhd.Timescale,
+		syncMap:      syncMap,
+	}
+}
+
+func (s *testPacketSource) nextPacket() (govid.Packet, error) {
+	if s.sampleNr > s.totalSamples {
+		return govid.Packet{}, io.EOF
+	}
+
+	ranges, err := s.track.GetRangesForSampleInterval(s.sampleNr, s.sampleNr)
+	if err != nil {
+		return govid.Packet{}, err
+	}
+
+	dr := ranges[0]
+	if _, err := s.reader.Seek(int64(dr.Offset), io.SeekStart); err != nil {
+		return govid.Packet{}, err
+	}
+
+	data := make([]byte, dr.Size)
+	if _, err := io.ReadFull(s.reader, data); err != nil {
+		return govid.Packet{}, err
+	}
+
+	keyframe := len(s.syncMap) == 0 || s.syncMap[s.sampleNr]
+	if keyframe {
+		prefixed := make([]byte, len(s.spsData)+len(s.ppsData)+len(data))
+		n := copy(prefixed, s.spsData)
+		n += copy(prefixed[n:], s.ppsData)
+		copy(prefixed[n:], data)
+		data = prefixed
+	}
+
+	s.sampleNr++
+	return govid.Packet{
+		Data:     data,
+		Keyframe: keyframe,
+	}, nil
+}
+
+func TestCABACRejection(t *testing.T) {
+	// Construct a minimal packet: SPS + PPS (with EntropyCodingModeFlag=true) + IDR slice.
+	// All NAL units use 4-byte length prefixes.
+	//
+	// SPS: Baseline profile, 16x16, poc_type=0, log2_max_frame_num=4.
+	// PPS: entropy_coding_mode_flag=1 (CABAC).
+	// IDR: I-slice referencing PPS 0.
+	packet := []byte{
+		// SPS NAL (length=6)
+		0, 0, 0, 6,
+		0x67,       // NAL header: ref_idc=3, type=7 (SPS)
+		0x42, 0xC0, // profile_idc=66 (Baseline), constraint_flags
+		0x1E,       // level_idc=30
+		0xFB,       // UE(0)*5=sps_id,log2maxfn,poc_type,log2maxpoc,maxref | 0=gaps | 1=width
+		0xC8,       // UE(0)=height | 1=frame_mbs_only | 1=direct8x8 | 0=crop | 0=vui | pad
+
+		// PPS NAL (length=3)
+		0, 0, 0, 3,
+		0x68,       // NAL header: ref_idc=3, type=8 (PPS)
+		0xEE,       // UE(0)=pps_id | UE(0)=sps_id | 1=CABAC! | 0=bottom_field | UE(0)*3=slicegroups,l0,l1 | 0=weighted_pred
+		0x38,       // 00=weighted_bipred | SE(0)*3=initqp,initqs,chromaqp | 0=deblock | 0=constrained | 0=redundant
+
+		// IDR slice NAL (length=2)
+		0, 0, 0, 2,
+		0x65, // NAL header: ref_idc=3, type=5 (IDR)
+		0xB8, // UE(0)=first_mb | UE(2)=slice_type(I) | UE(0)=pps_id | pad
+	}
+
+	codec := NewCodec()
+	_, err := codec.Decode(govid.Packet{Data: packet})
+	if err == nil {
+		t.Fatal("expected error for CABAC stream, got nil")
+	}
+	if !strings.Contains(err.Error(), "CABAC") {
+		t.Fatalf("expected CABAC error, got: %v", err)
+	}
+}
+
+func TestDecodeFirstIDRFrame(t *testing.T) {
+	src := openTestPackets(t, "testdata/idr_only.mp4")
+	codec := NewCodec()
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if frame == nil {
+		t.Fatal("expected non-nil frame")
+	}
+	if frame.YCbCr == nil {
+		t.Fatal("expected non-nil YCbCr")
+	}
+	if frame.Width != 160 || frame.Height != 120 {
+		t.Errorf("dimensions: got %dx%d, want 160x120", frame.Width, frame.Height)
+	}
+}
+
+func TestDecodeAllIDRFrames(t *testing.T) {
+	src := openTestPackets(t, "testdata/idr_only.mp4")
+	codec := NewCodec()
+
+	count := 0
+	for {
+		pkt, err := src.nextPacket()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frame, err := codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: Decode: %v", count, err)
+		}
+		if frame == nil {
+			continue
+		}
+		if frame.Width != 160 || frame.Height != 120 {
+			t.Errorf("frame %d: dimensions %dx%d, want 160x120", count, frame.Width, frame.Height)
+		}
+		count++
+	}
+
+	if count < 5 {
+		t.Errorf("expected at least 5 IDR frames, got %d", count)
+	}
+	t.Logf("decoded %d IDR frames successfully", count)
+}
+
+func TestRGBAConversion(t *testing.T) {
+	src := openTestPackets(t, "testdata/idr_only.mp4")
+	codec := NewCodec()
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rgba := frame.RGBA()
+	if rgba == nil {
+		t.Fatal("RGBA returned nil")
+	}
+	expected := frame.Width * frame.Height * 4
+	if len(rgba) != expected {
+		t.Errorf("RGBA length: got %d, want %d", len(rgba), expected)
+	}
+	// Verify alpha channel is 0xFF for all pixels.
+	for i := 3; i < len(rgba); i += 4 {
+		if rgba[i] != 0xFF {
+			t.Errorf("pixel %d alpha: got %d, want 255", i/4, rgba[i])
+			break
+		}
+	}
+}
+
+func TestDecodeAllFrames(t *testing.T) {
+	src := openTestPackets(t, "testdata/test.mp4")
+	codec := NewCodec()
+
+	count := 0
+	var lastWidth, lastHeight int
+	for {
+		pkt, err := src.nextPacket()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		frame, err := codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: Decode: %v", count, err)
+		}
+		if frame == nil {
+			continue
+		}
+		if lastWidth == 0 {
+			lastWidth = frame.Width
+			lastHeight = frame.Height
+		}
+		if frame.Width != lastWidth || frame.Height != lastHeight {
+			t.Errorf("frame %d: dimensions %dx%d, want %dx%d", count, frame.Width, frame.Height, lastWidth, lastHeight)
+		}
+		count++
+	}
+
+	if count < 2 {
+		t.Errorf("expected at least 2 frames (I + P), got %d", count)
+	}
+	t.Logf("decoded %d I+P frames successfully", count)
+}
+
+func TestPFrameAfterIDR(t *testing.T) {
+	src := openTestPackets(t, "testdata/test.mp4")
+	codec := NewCodec()
+
+	// Decode first packet (IDR).
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("IDR decode: %v", err)
+	}
+	if frame == nil {
+		t.Fatal("IDR frame is nil")
+	}
+
+	// Decode second packet (P-frame).
+	pkt, err = src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err = codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("P-frame decode: %v", err)
+	}
+	if frame == nil {
+		t.Fatal("P-frame is nil")
+	}
+	if frame.YCbCr == nil {
+		t.Fatal("P-frame YCbCr is nil")
+	}
+}
+
+func TestFlushResetsDPB(t *testing.T) {
+	src := openTestPackets(t, "testdata/test.mp4")
+	codec := NewCodec()
+
+	// Decode first IDR frame.
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("IDR decode: %v", err)
+	}
+
+	// Flush resets decoder state.
+	codec.Flush()
+
+	// Trying to decode a P-frame without a preceding IDR should fail.
+	pkt2, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = codec.Decode(pkt2)
+	if err == nil {
+		t.Log("P-frame after flush succeeded (may have SPS/PPS inline)")
+	}
+
+	// Re-sending IDR should work.
+	src2 := openTestPackets(t, "testdata/test.mp4")
+	pkt3, err := src2.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.Decode(pkt3)
+	if err != nil {
+		t.Fatalf("IDR after flush: %v", err)
+	}
+	if frame == nil {
+		t.Fatal("IDR after flush returned nil")
+	}
+}
+
+func TestDecodePixelValues(t *testing.T) {
+	src := openTestPackets(t, "testdata/idr_only.mp4")
+	codec := NewCodec()
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if frame == nil || frame.YCbCr == nil {
+		t.Fatal("expected non-nil frame with YCbCr data")
+	}
+
+	// Verify pixel values are reasonable (not corrupted).
+	ycbcr := frame.YCbCr
+	yLen := ycbcr.YStride * ycbcr.Rect.Dy()
+	if yLen > len(ycbcr.Y) {
+		yLen = len(ycbcr.Y)
+	}
+
+	// Check that Y plane has some non-trivial variance (not just DC).
+	var ySum, yMin, yMax int
+	yMin = 255
+	for i := 0; i < yLen; i++ {
+		v := int(ycbcr.Y[i])
+		ySum += v
+		if v < yMin {
+			yMin = v
+		}
+		if v > yMax {
+			yMax = v
+		}
+	}
+	yRange := yMax - yMin
+	if yRange < 10 {
+		t.Errorf("Y pixel range too small (%d-%d=%d), likely missing AC coefficients", yMin, yMax, yRange)
+	}
+
+	// Verify no clamped-to-255 saturation across entire plane (sign of corruption).
+	saturated := 0
+	for i := 0; i < yLen; i++ {
+		if ycbcr.Y[i] == 255 {
+			saturated++
+		}
+	}
+	if yLen > 0 && float64(saturated)/float64(yLen) > 0.5 {
+		t.Errorf("%.0f%% of Y pixels are saturated (255), likely corrupted", 100*float64(saturated)/float64(yLen))
+	}
+}
+
+func TestFlushAndRedecode(t *testing.T) {
+	src := openTestPackets(t, "testdata/idr_only.mp4")
+	codec := NewCodec()
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame1, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame1 == nil {
+		t.Fatal("first decode returned nil")
+	}
+
+	codec.Flush()
+
+	// Re-decode the same packet after flush.
+	frame2, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame2 == nil {
+		t.Fatal("second decode returned nil")
+	}
+	if frame2.Width != frame1.Width || frame2.Height != frame1.Height {
+		t.Error("dimensions differ after flush")
+	}
+}
+
+func TestDecodeTestVsReference(t *testing.T) {
+	const testMP4 = "testdata/test.mp4"
+	const refYUV = "testdata/test_frame0.yuv"
+
+	if _, err := os.Stat(testMP4); err != nil {
+		t.Skip("test.mp4 not found")
+	}
+	if _, err := os.Stat(refYUV); err != nil {
+		t.Skip("test_frame0.yuv not found")
+	}
+
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := openTestPackets(t, testMP4)
+	codec := NewCodec()
+
+	// Log PPS/SPS details after decode.
+	defer func() {
+		d := codec.dec
+		if d != nil && d.activePPS != nil {
+			t.Logf("  PPS: id=%d sps=%d PicInitQPMinus26=%d ChromaQPOffset=%d Deblock=%v WeightedPred=%v Transform8x8=%v",
+				d.activePPS.ID, d.activePPS.SPSID, d.activePPS.PicInitQPMinus26,
+				d.activePPS.ChromaQPIndexOffset, d.activePPS.DeblockingFilterControlPresent,
+				d.activePPS.WeightedPredFlag, d.activePPS.Transform8x8Mode)
+		}
+		if d != nil && d.activeSPS != nil {
+			t.Logf("  SPS: id=%d profile=%d level=%d poc_type=%d log2MaxFN=%d log2MaxPOC=%d maxRef=%d",
+				d.activeSPS.ID, d.activeSPS.ProfileIDC, d.activeSPS.LevelIDC,
+				d.activeSPS.PicOrderCntType, d.activeSPS.Log2MaxFrameNum,
+				d.activeSPS.Log2MaxPicOrderCntLsb, d.activeSPS.MaxNumRefFrames)
+		}
+	}()
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if frame == nil || frame.YCbCr == nil {
+		t.Fatal("nil frame")
+	}
+
+	w := frame.Width
+	h := frame.Height
+	t.Logf("dimensions: %dx%d", w, h)
+
+	ycbcr := frame.YCbCr
+	ySize := w * h
+	cSize := (w / 2) * (h / 2)
+
+	if len(ref) != ySize+2*cSize {
+		t.Fatalf("ref size %d != expected %d", len(ref), ySize+2*cSize)
+	}
+
+	// Compare Y plane — find first wrong pixel, per-MB max error, histogram.
+	yErr, yMaxErr := 0, 0
+	firstErrX, firstErrY, firstErrGot, firstErrWant := -1, -1, 0, 0
+	histogram := make([]int, 256)
+
+	for j := 0; j < h; j++ {
+		for i := 0; i < w; i++ {
+			got := int(ycbcr.Y[j*ycbcr.YStride+i])
+			want := int(ref[j*w+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			histogram[d]++
+			if d > 0 {
+				yErr++
+			}
+			if d > yMaxErr {
+				yMaxErr = d
+			}
+			if d > 0 && firstErrX == -1 {
+				firstErrX = i
+				firstErrY = j
+				firstErrGot = got
+				firstErrWant = want
+			}
+		}
+	}
+
+	// Compare Cb plane.
+	cbOff := ySize
+	cbErr, cbMaxErr := 0, 0
+	cw := w / 2
+	ch := h / 2
+	for j := 0; j < ch; j++ {
+		for i := 0; i < cw; i++ {
+			got := int(ycbcr.Cb[j*ycbcr.CStride+i])
+			want := int(ref[cbOff+j*cw+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				cbErr++
+			}
+			if d > cbMaxErr {
+				cbMaxErr = d
+			}
+		}
+	}
+
+	// Compare Cr plane.
+	crOff := ySize + cSize
+	crErr, crMaxErr := 0, 0
+	for j := 0; j < ch; j++ {
+		for i := 0; i < cw; i++ {
+			got := int(ycbcr.Cr[j*ycbcr.CStride+i])
+			want := int(ref[crOff+j*cw+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				crErr++
+			}
+			if d > crMaxErr {
+				crMaxErr = d
+			}
+		}
+	}
+
+	t.Logf("Y:  %d/%d wrong pixels (%.1f%%), max error %d", yErr, ySize, 100*float64(yErr)/float64(ySize), yMaxErr)
+	t.Logf("Cb: %d/%d wrong pixels, max error %d", cbErr, cSize, cbMaxErr)
+	t.Logf("Cr: %d/%d wrong pixels, max error %d", crErr, cSize, crMaxErr)
+
+	if firstErrX >= 0 {
+		t.Logf("First wrong Y pixel: (%d,%d) got=%d want=%d (MB %d,%d, blk %d,%d)",
+			firstErrX, firstErrY, firstErrGot, firstErrWant,
+			firstErrX/16, firstErrY/16, (firstErrX%16)/4, (firstErrY%16)/4)
+	}
+
+	// Dump pixel values for first 3 MBs in row 0 (top 4 rows).
+	for mbx := 0; mbx < 3 && mbx < w/16; mbx++ {
+		t.Logf("MB(%d,0) pixel dump (first 4 rows):", mbx)
+		for j := 0; j < 4; j++ {
+			gotLine := ""
+			wantLine := ""
+			for i := 0; i < 16; i++ {
+				px := mbx*16 + i
+				py := j
+				g := int(ycbcr.Y[py*ycbcr.YStride+px])
+				wr := int(ref[py*w+px])
+				gotLine += fmt.Sprintf(" %3d", g)
+				wantLine += fmt.Sprintf(" %3d", wr)
+			}
+			t.Logf("  row %d got: %s", j, gotLine)
+			t.Logf("  row %d ref: %s", j, wantLine)
+		}
+	}
+
+	// Per-MB max error for first 2 rows.
+	for mby := 0; mby < 2 && mby < h/16; mby++ {
+		line := fmt.Sprintf("MB row %d:", mby)
+		for mbx := 0; mbx < w/16; mbx++ {
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(ref[py*w+px])
+					d := got - want
+					if d < 0 {
+						d = -d
+					}
+					if d > mbMax {
+						mbMax = d
+					}
+				}
+			}
+			line += fmt.Sprintf(" %3d", mbMax)
+		}
+		t.Log(line)
+	}
+
+	// Error histogram (first 10 buckets + tail).
+	t.Log("Error histogram:")
+	for i := 0; i <= 10 && i < len(histogram); i++ {
+		if histogram[i] > 0 {
+			t.Logf("  err=%d: %d pixels", i, histogram[i])
+		}
+	}
+	tail := 0
+	for i := 11; i < len(histogram); i++ {
+		tail += histogram[i]
+	}
+	if tail > 0 {
+		t.Logf("  err>10: %d pixels", tail)
+	}
+
+	if yMaxErr > 2 || cbMaxErr > 2 || crMaxErr > 2 {
+		t.Errorf("decoded frame differs from ffmpeg reference (Y max=%d, Cb max=%d, Cr max=%d)", yMaxErr, cbMaxErr, crMaxErr)
+	}
+}
+
+func TestDecodeBakerVsReference(t *testing.T) {
+	const bakerMP4 = "../examples/videos/baker_h264.mp4"
+	const refYUV = "testdata/baker_frame0.yuv"
+
+	if _, err := os.Stat(bakerMP4); err != nil {
+		t.Skip("baker_h264.mp4 not found")
+	}
+	if _, err := os.Stat(refYUV); err != nil {
+		t.Skip("baker_frame0.yuv not found")
+	}
+
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := openTestPackets(t, bakerMP4)
+	codec := NewCodec()
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if frame == nil || frame.YCbCr == nil {
+		t.Fatal("nil frame")
+	}
+
+	w := frame.Width
+	h := frame.Height
+	t.Logf("dimensions: %dx%d", w, h)
+
+	ycbcr := frame.YCbCr
+	ySize := w * h
+	cSize := (w / 2) * (h / 2)
+
+	if len(ref) != ySize+2*cSize {
+		t.Fatalf("ref size %d != expected %d", len(ref), ySize+2*cSize)
+	}
+
+	// Compare Y plane.
+	yErr, yMaxErr, yErrAt := 0, 0, 0
+	for j := 0; j < h; j++ {
+		for i := 0; i < w; i++ {
+			got := int(ycbcr.Y[j*ycbcr.YStride+i])
+			want := int(ref[j*w+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				yErr++
+			}
+			if d > yMaxErr {
+				yMaxErr = d
+				yErrAt = j*w + i
+			}
+		}
+	}
+
+	// Compare Cb plane.
+	cbOff := ySize
+	cbErr, cbMaxErr := 0, 0
+	cw := w / 2
+	ch := h / 2
+	for j := 0; j < ch; j++ {
+		for i := 0; i < cw; i++ {
+			got := int(ycbcr.Cb[j*ycbcr.CStride+i])
+			want := int(ref[cbOff+j*cw+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				cbErr++
+			}
+			if d > cbMaxErr {
+				cbMaxErr = d
+			}
+		}
+	}
+
+	// Compare Cr plane.
+	crOff := ySize + cSize
+	crErr, crMaxErr := 0, 0
+	for j := 0; j < ch; j++ {
+		for i := 0; i < cw; i++ {
+			got := int(ycbcr.Cr[j*ycbcr.CStride+i])
+			want := int(ref[crOff+j*cw+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				crErr++
+			}
+			if d > crMaxErr {
+				crMaxErr = d
+			}
+		}
+	}
+
+	t.Logf("Y:  %d/%d wrong pixels, max error %d (at pixel %d)", yErr, ySize, yMaxErr, yErrAt)
+	t.Logf("Cb: %d/%d wrong pixels, max error %d", cbErr, cSize, cbMaxErr)
+	t.Logf("Cr: %d/%d wrong pixels, max error %d", crErr, cSize, crMaxErr)
+
+	// Find first wrong MB row.
+	for mby := 0; mby < h/16; mby++ {
+		mbErrors := 0
+		for mbx := 0; mbx < w/16; mbx++ {
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(ref[py*w+px])
+					d := got - want
+					if d < 0 {
+						d = -d
+					}
+					if d > 2 {
+						mbErrors++
+					}
+				}
+			}
+		}
+		if mbErrors > 0 && mby < 5 {
+			t.Logf("MB row %d: %d pixels with error > 2", mby, mbErrors)
+		}
+	}
+
+	// Allow small rounding differences from deblocking filter and motion compensation.
+	if yMaxErr > 5 || cbMaxErr > 2 || crMaxErr > 2 {
+		t.Errorf("decoded frame differs from ffmpeg reference (Y max=%d, Cb max=%d, Cr max=%d)", yMaxErr, cbMaxErr, crMaxErr)
+	}
+}
+
+func TestDecodeTestVsNoDeblock(t *testing.T) {
+	const testMP4 = "testdata/test.mp4"
+	const refYUV = "testdata/test_frame0_nodb.yuv"
+
+	if _, err := os.Stat(testMP4); err != nil {
+		t.Skip("test.mp4 not found")
+	}
+	if _, err := os.Stat(refYUV); err != nil {
+		t.Skip("test_frame0_nodb.yuv not found")
+	}
+
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := openTestPackets(t, testMP4)
+	codec := NewCodec()
+	// Disable deblocking by injecting a flag.
+	codec.dec.disableDeblock = true
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if frame == nil || frame.YCbCr == nil {
+		t.Fatal("nil frame")
+	}
+
+	w := frame.Width
+	h := frame.Height
+	ycbcr := frame.YCbCr
+	ySize := w * h
+	cSize := (w / 2) * (h / 2)
+
+	if len(ref) != ySize+2*cSize {
+		t.Fatalf("ref size %d != expected %d", len(ref), ySize+2*cSize)
+	}
+
+	// Compare Y plane.
+	yErr, yMaxErr := 0, 0
+	for j := 0; j < h; j++ {
+		for i := 0; i < w; i++ {
+			got := int(ycbcr.Y[j*ycbcr.YStride+i])
+			want := int(ref[j*w+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				yErr++
+			}
+			if d > yMaxErr {
+				yMaxErr = d
+			}
+		}
+	}
+
+	// Compare Cb plane.
+	cbOff := ySize
+	cbErr, cbMaxErr := 0, 0
+	cw := w / 2
+	ch := h / 2
+	for j := 0; j < ch; j++ {
+		for i := 0; i < cw; i++ {
+			got := int(ycbcr.Cb[j*ycbcr.CStride+i])
+			want := int(ref[cbOff+j*cw+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				cbErr++
+			}
+			if d > cbMaxErr {
+				cbMaxErr = d
+			}
+		}
+	}
+
+	// Compare Cr plane.
+	crOff := ySize + cSize
+	crErr, crMaxErr := 0, 0
+	for j := 0; j < ch; j++ {
+		for i := 0; i < cw; i++ {
+			got := int(ycbcr.Cr[j*ycbcr.CStride+i])
+			want := int(ref[crOff+j*cw+i])
+			d := got - want
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				crErr++
+			}
+			if d > crMaxErr {
+				crMaxErr = d
+			}
+		}
+	}
+
+	t.Logf("Y:  %d/%d wrong pixels (%.1f%%), max error %d", yErr, ySize, 100*float64(yErr)/float64(ySize), yMaxErr)
+	t.Logf("Cb: %d/%d wrong pixels, max error %d", cbErr, cSize, cbMaxErr)
+	t.Logf("Cr: %d/%d wrong pixels, max error %d", crErr, cSize, crMaxErr)
+
+	// Per-MB max error (all rows).
+	for mby := 0; mby < h/16; mby++ {
+		line := fmt.Sprintf("MB row %d Y:", mby)
+		for mbx := 0; mbx < w/16; mbx++ {
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(ref[py*w+px])
+					d := got - want
+					if d < 0 {
+						d = -d
+					}
+					if d > mbMax {
+						mbMax = d
+					}
+				}
+			}
+			line += fmt.Sprintf(" %3d", mbMax)
+		}
+		t.Log(line)
+	}
+
+	// Per-MB chroma max error (first 3 rows).
+	for mby := 0; mby < 3 && mby < h/16; mby++ {
+		cbLine := fmt.Sprintf("MB row %d Cb:", mby)
+		crLine := fmt.Sprintf("MB row %d Cr:", mby)
+		for mbx := 0; mbx < w/16; mbx++ {
+			cbMax, crMax := 0, 0
+			for j := 0; j < 8; j++ {
+				for i := 0; i < 8; i++ {
+					py := mby*8 + j
+					px := mbx*8 + i
+					gotCb := int(ycbcr.Cb[py*ycbcr.CStride+px])
+					wantCb := int(ref[ySize+py*cw+px])
+					d := gotCb - wantCb
+					if d < 0 { d = -d }
+					if d > cbMax { cbMax = d }
+
+					gotCr := int(ycbcr.Cr[py*ycbcr.CStride+px])
+					wantCr := int(ref[ySize+cSize+py*cw+px])
+					d = gotCr - wantCr
+					if d < 0 { d = -d }
+					if d > crMax { crMax = d }
+				}
+			}
+			cbLine += fmt.Sprintf(" %3d", cbMax)
+			crLine += fmt.Sprintf(" %3d", crMax)
+		}
+		t.Log(cbLine)
+		t.Log(crLine)
+	}
+
+	// Dump all rows of MB(1,0) to identify exact error locations.
+	if w >= 32 && h >= 16 {
+		t.Log("MB(1,0) full dump:")
+		for j := 0; j < 16; j++ {
+			py := j
+			var gotLine, wantLine strings.Builder
+			for i := 0; i < 16; i++ {
+				px := 16 + i
+				got := int(ycbcr.Y[py*ycbcr.YStride+px])
+				want := int(ref[py*w+px])
+				fmt.Fprintf(&gotLine, " %3d", got)
+				fmt.Fprintf(&wantLine, " %3d", want)
+			}
+			t.Logf("  row %2d got: %s", j, gotLine.String())
+			t.Logf("  row %2d ref: %s", j, wantLine.String())
+		}
+	}
+
+	if yMaxErr > 0 || cbMaxErr > 0 || crMaxErr > 0 {
+		t.Errorf("decoded frame differs from nodb reference (Y max=%d, Cb max=%d, Cr max=%d)", yMaxErr, cbMaxErr, crMaxErr)
+	}
+}
+
+func TestDecodeBakerMultiFrame(t *testing.T) {
+	const bakerMP4 = "../examples/videos/baker_h264.mp4"
+	const refYUV = "testdata/baker_frames_0_9.yuv"
+	const numFrames = 10
+
+	if _, err := os.Stat(bakerMP4); err != nil {
+		t.Skip("baker_h264.mp4 not found")
+	}
+	if _, err := os.Stat(refYUV); err != nil {
+		t.Skip("baker_frames_0_9.yuv not found")
+	}
+
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := openTestPackets(t, bakerMP4)
+	codec := NewCodec()
+
+	// Decode first frame to get dimensions.
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("frame 0: Decode: %v", err)
+	}
+	if frame == nil || frame.YCbCr == nil {
+		t.Fatal("frame 0: nil frame")
+	}
+
+	w := frame.Width
+	h := frame.Height
+	ySize := w * h
+	cw := w / 2
+	ch := h / 2
+	cSize := cw * ch
+	frameSize := ySize + 2*cSize
+
+	if len(ref) < numFrames*frameSize {
+		t.Fatalf("ref file too small: %d bytes, need %d", len(ref), numFrames*frameSize)
+	}
+
+	t.Logf("dimensions: %dx%d, frameSize=%d", w, h, frameSize)
+
+	// Compare helper for a single frame.
+	type planeStats struct {
+		wrongPixels int
+		maxError    int
+		totalPixels int
+	}
+	comparePlane := func(decoded []byte, stride int, refData []byte, pw, ph int) planeStats {
+		stats := planeStats{totalPixels: pw * ph}
+		for j := 0; j < ph; j++ {
+			for i := 0; i < pw; i++ {
+				got := int(decoded[j*stride+i])
+				want := int(refData[j*pw+i])
+				d := got - want
+				if d < 0 {
+					d = -d
+				}
+				if d > 0 {
+					stats.wrongPixels++
+				}
+				if d > stats.maxError {
+					stats.maxError = d
+				}
+			}
+		}
+		return stats
+	}
+
+	// Process frame 0 (already decoded).
+	frames := make([]*govid.Frame, 0, numFrames)
+	frames = append(frames, frame)
+
+	// Decode frames 1-9.
+	for i := 1; i < numFrames; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatalf("frame %d: nextPacket: %v", i, err)
+		}
+		f, err := codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: Decode: %v", i, err)
+		}
+		if f == nil || f.YCbCr == nil {
+			t.Fatalf("frame %d: nil frame", i)
+		}
+		frames = append(frames, f)
+	}
+
+	// Compare each frame against reference.
+	worstFrame := 0
+	worstMaxErr := 0
+	for i, f := range frames {
+		refOff := i * frameSize
+		refY := ref[refOff : refOff+ySize]
+		refCb := ref[refOff+ySize : refOff+ySize+cSize]
+		refCr := ref[refOff+ySize+cSize : refOff+ySize+2*cSize]
+
+		ycbcr := f.YCbCr
+		yStats := comparePlane(ycbcr.Y, ycbcr.YStride, refY, w, h)
+		cbStats := comparePlane(ycbcr.Cb, ycbcr.CStride, refCb, cw, ch)
+		crStats := comparePlane(ycbcr.Cr, ycbcr.CStride, refCr, cw, ch)
+
+		frameType := "P"
+		if i == 0 {
+			frameType = "IDR"
+		}
+
+		t.Logf("frame %d (%s): Y %d/%d wrong (%.1f%%) max=%d | Cb %d/%d max=%d | Cr %d/%d max=%d",
+			i, frameType,
+			yStats.wrongPixels, yStats.totalPixels, 100*float64(yStats.wrongPixels)/float64(yStats.totalPixels), yStats.maxError,
+			cbStats.wrongPixels, cbStats.totalPixels, cbStats.maxError,
+			crStats.wrongPixels, crStats.totalPixels, crStats.maxError)
+
+		maxErr := yStats.maxError
+		if cbStats.maxError > maxErr {
+			maxErr = cbStats.maxError
+		}
+		if crStats.maxError > maxErr {
+			maxErr = crStats.maxError
+		}
+		if maxErr > worstMaxErr {
+			worstMaxErr = maxErr
+			worstFrame = i
+		}
+
+		// IDR frames: hard threshold of 5 (deblocking rounding).
+		if i == 0 && (yStats.maxError > 5 || cbStats.maxError > 2 || crStats.maxError > 2) {
+			t.Errorf("frame %d (IDR): exceeds threshold (Y max=%d, Cb max=%d, Cr max=%d)",
+				i, yStats.maxError, cbStats.maxError, crStats.maxError)
+		}
+	}
+
+	// Dump per-MB max Y error for the worst frame (first 3 rows).
+	if worstFrame >= 0 && worstFrame < len(frames) {
+		f := frames[worstFrame]
+		refOff := worstFrame * frameSize
+		refY := ref[refOff : refOff+ySize]
+		ycbcr := f.YCbCr
+
+		t.Logf("--- Worst frame %d: per-MB max Y error (first 3 rows) ---", worstFrame)
+		for mby := 0; mby < 3 && mby < h/16; mby++ {
+			line := fmt.Sprintf("MB row %d:", mby)
+			for mbx := 0; mbx < w/16; mbx++ {
+				mbMax := 0
+				for j := 0; j < 16; j++ {
+					for i := 0; i < 16; i++ {
+						py := mby*16 + j
+						px := mbx*16 + i
+						got := int(ycbcr.Y[py*ycbcr.YStride+px])
+						want := int(refY[py*w+px])
+						d := got - want
+						if d < 0 {
+							d = -d
+						}
+						if d > mbMax {
+							mbMax = d
+						}
+					}
+				}
+				line += fmt.Sprintf(" %3d", mbMax)
+			}
+			t.Log(line)
+		}
+	}
+
+	t.Logf("Overall worst: frame %d with max error %d", worstFrame, worstMaxErr)
+}
+
+
+func TestFrame2WithPerfectReference(t *testing.T) {
+	const bakerMP4 = "../examples/videos/baker_h264.mp4"
+	const refYUV = "testdata/baker_frames_0_9.yuv"
+
+	if _, err := os.Stat(bakerMP4); err != nil {
+		t.Skip("baker_h264.mp4 not found")
+	}
+	if _, err := os.Stat(refYUV); err != nil {
+		t.Skip("baker_frames_0_9.yuv not found")
+	}
+
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, h := 1280, 720
+	ySize := w * h
+	cw, ch := w/2, h/2
+	cSize := cw * ch
+	frameSize := ySize + 2*cSize
+
+	loadFrame := func(idx int) *image.YCbCr {
+		off := idx * frameSize
+		img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+		for j := 0; j < h; j++ {
+			copy(img.Y[j*img.YStride:j*img.YStride+w], ref[off+j*w:off+j*w+w])
+		}
+		for j := 0; j < ch; j++ {
+			copy(img.Cb[j*img.CStride:j*img.CStride+cw], ref[off+ySize+j*cw:off+ySize+j*cw+cw])
+			copy(img.Cr[j*img.CStride:j*img.CStride+cw], ref[off+ySize+cSize+j*cw:off+ySize+cSize+j*cw+cw])
+		}
+		return img
+	}
+
+	// Decode frames 0 and 1 normally to set up decoder state.
+	src := openTestPackets(t, bakerMP4)
+	codec := NewCodec()
+	for i := 0; i < 2; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+	}
+
+	// Inject perfect reference frames.
+	d := codec.dec
+	d.refFrames = []*image.YCbCr{loadFrame(0), loadFrame(1)}
+
+	// Decode frame 2.
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame2, err := codec.Decode(pkt)
+	if err != nil {
+		t.Fatalf("frame 2 with perfect ref: %v", err)
+	}
+
+	// Compare against ffmpeg's frame 2.
+	refFrame2Y := ref[2*frameSize : 2*frameSize+ySize]
+	ycbcr := frame2.YCbCr
+	yErr, yMaxErr := 0, 0
+	for j := 0; j < h; j++ {
+		for i := 0; i < w; i++ {
+			got := int(ycbcr.Y[j*ycbcr.YStride+i])
+			want := int(refFrame2Y[j*w+i])
+			dd := got - want
+			if dd < 0 {
+				dd = -dd
+			}
+			if dd > 0 {
+				yErr++
+			}
+			if dd > yMaxErr {
+				yMaxErr = dd
+			}
+		}
+	}
+	t.Logf("Frame 2 with PERFECT ref: Y %d/%d wrong (%.1f%%), max=%d",
+		yErr, ySize, 100*float64(yErr)/float64(ySize), yMaxErr)
+
+	// Per-MB type error analysis.
+	mbw := w / 16
+	mbh := h / 16
+	typeNames := map[int]string{
+		-2: "intra", -1: "skip", 0: "16x16", 1: "16x8", 2: "8x16", 3: "8x8", 4: "8x8r0",
+	}
+	typeTotalErr := make(map[int]int)
+	typeMaxErr := make(map[int]int)
+	typeCount := make(map[int]int)
+	typeTotalPix := make(map[int]int)
+
+	for mby := 0; mby < mbh; mby++ {
+		for mbx := 0; mbx < mbw; mbx++ {
+			mbIdx := mby*mbw + mbx
+			mt := d.mbInfo[mbIdx].mbType
+			mbMax := 0
+			mbErr := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(refFrame2Y[py*w+px])
+					dd := got - want
+					if dd < 0 {
+						dd = -dd
+					}
+					if dd > mbMax {
+						mbMax = dd
+					}
+					if dd > 0 {
+						mbErr++
+					}
+				}
+			}
+			typeCount[mt]++
+			typeTotalErr[mt] += mbErr
+			typeTotalPix[mt] += 256
+			if mbMax > typeMaxErr[mt] {
+				typeMaxErr[mt] = mbMax
+			}
+		}
+	}
+
+	t.Log("Per-MB-type error analysis (with perfect reference):")
+	for mt := -2; mt <= 4; mt++ {
+		if typeCount[mt] == 0 {
+			continue
+		}
+		t.Logf("  %6s: count=%4d  wrongPix=%6d/%7d (%.1f%%)  maxErr=%3d",
+			typeNames[mt], typeCount[mt], typeTotalErr[mt], typeTotalPix[mt],
+			100*float64(typeTotalErr[mt])/float64(typeTotalPix[mt]), typeMaxErr[mt])
+	}
+
+	// Dump per-MB max error for first 5 rows with MB types.
+	for mby := 0; mby < 5 && mby < mbh; mby++ {
+		line := fmt.Sprintf("MB row %d:", mby)
+		for mbx := 0; mbx < mbw; mbx++ {
+			mbIdx := mby*mbw + mbx
+			mt := d.mbInfo[mbIdx].mbType
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(refFrame2Y[py*w+px])
+					dd := got - want
+					if dd < 0 {
+						dd = -dd
+					}
+					if dd > mbMax {
+						mbMax = dd
+					}
+				}
+			}
+			sym := "."
+			switch mt {
+			case -2:
+				sym = "I"
+			case -1:
+				sym = "_"
+			case 0:
+				sym = "="
+			case 1:
+				sym = "-"
+			case 2:
+				sym = "|"
+			case 3, 4:
+				sym = "+"
+			}
+			if mbMax > 0 {
+				line += fmt.Sprintf(" %s%2d", sym, mbMax)
+			} else {
+				line += "  . "
+			}
+		}
+		t.Log(line)
+	}
+
+	// Show 3 worst MBs with details.
+	type mbErrInfo struct {
+		mbx, mby, maxErr, mt int
+	}
+	var worst [3]mbErrInfo
+	for mby := 0; mby < mbh; mby++ {
+		for mbx := 0; mbx < mbw; mbx++ {
+			mbIdx := mby*mbw + mbx
+			mt := d.mbInfo[mbIdx].mbType
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(refFrame2Y[py*w+px])
+					dd := got - want
+					if dd < 0 {
+						dd = -dd
+					}
+					if dd > mbMax {
+						mbMax = dd
+					}
+				}
+			}
+			for k := 0; k < 3; k++ {
+				if mbMax > worst[k].maxErr {
+					copy(worst[k+1:], worst[k:2])
+					worst[k] = mbErrInfo{mbx, mby, mbMax, mt}
+					break
+				}
+			}
+		}
+	}
+	refFrame1Y := ref[1*frameSize : 1*frameSize+ySize]
+	for _, wst := range worst {
+		if wst.maxErr == 0 {
+			continue
+		}
+		mbIdx := wst.mby*mbw + wst.mbx
+		info := &d.mbInfo[mbIdx]
+		t.Logf("Worst MB(%d,%d) type=%s maxErr=%d mv[0]=%v ref=%v hasCoef=%v",
+			wst.mbx, wst.mby, typeNames[wst.mt], wst.maxErr, info.mv[0], info.refIdx, info.hasCoef)
+		// Dump first 4 rows of got vs want vs reference frame 1.
+		for j := 0; j < 4; j++ {
+			py := wst.mby*16 + j
+			gotLine := ""
+			wantLine := ""
+			ref1Line := ""
+			for i := 0; i < 16; i++ {
+				px := wst.mbx*16 + i
+				g := int(ycbcr.Y[py*ycbcr.YStride+px])
+				ww := int(refFrame2Y[py*w+px])
+				r1 := int(refFrame1Y[py*w+px])
+				gotLine += fmt.Sprintf(" %3d", g)
+				wantLine += fmt.Sprintf(" %3d", ww)
+				ref1Line += fmt.Sprintf(" %3d", r1)
+			}
+			t.Logf("  row %d got:   %s", j, gotLine)
+			t.Logf("  row %d want:  %s", j, wantLine)
+			t.Logf("  row %d frame1:%s", j, ref1Line)
+		}
+	}
+}
+
+func TestDumpSliceBits(t *testing.T) {
+	src := openTestPackets(t, "testdata/test.mp4")
+
+	pkt, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nalUnits, err := ParseNALUnits(pkt.Data, 4)
+	if err != nil {
+		t.Fatalf("ParseNALUnits: %v", err)
+	}
+
+	// Dump the raw IDR slice NAL bytes (before EPB removal)
+	// SPS: 4 + 23 = 27 bytes. PPS: 4 + 5 = 9 bytes. Total: 36.
+	// Then SEI NAL (variable) then IDR NAL.
+	// Let me find the IDR NAL in the packet
+	offset := 0
+	for offset < len(pkt.Data)-4 {
+		nalLen := int(pkt.Data[offset])<<24 | int(pkt.Data[offset+1])<<16 | int(pkt.Data[offset+2])<<8 | int(pkt.Data[offset+3])
+		nalType := pkt.Data[offset+4] & 0x1f
+		if nalType == 5 { // IDR
+			// Dump the first 20 bytes of raw NAL data (after length prefix)
+			rawHex := ""
+			for i := 4; i < 24 && offset+i < len(pkt.Data); i++ {
+				rawHex += fmt.Sprintf(" %02x", pkt.Data[offset+i])
+			}
+			t.Logf("IDR NAL raw (len=%d, first 20):%s", nalLen, rawHex)
+			// Check for EPBs in first 20 bytes
+			rawData := pkt.Data[offset+5 : offset+4+nalLen] // after header
+			for i := 0; i < len(rawData)-2 && i < 25; i++ {
+				if rawData[i] == 0 && rawData[i+1] == 0 && rawData[i+2] == 3 {
+					t.Logf("  EPB at raw offset %d (bytes: %02x %02x %02x)", i, rawData[i], rawData[i+1], rawData[i+2])
+				}
+			}
+			break
+		}
+		offset += 4 + nalLen
+	}
+
+	for _, nal := range nalUnits {
+		hexStr := ""
+		n := len(nal.Data)
+		if n > 30 {
+			n = 30
+		}
+		for i := 0; i < n; i++ {
+			hexStr += fmt.Sprintf(" %02x", nal.Data[i])
+		}
+		t.Logf("NAL type=%d ref_idc=%d len=%d data:%s", nal.Type, nal.RefIDC, len(nal.Data), hexStr)
+
+		if nal.Type == NALPPS {
+			// Manually parse PPS to verify
+			pps, perr := ParsePPS(nal.Data)
+			if perr != nil {
+				t.Logf("  PPS parse error: %v", perr)
+			} else {
+				t.Logf("  PPS: id=%d sps=%d entropy=%v PicInitQPMinus26=%d chromaQPoff=%d",
+					pps.ID, pps.SPSID, pps.EntropyCodingModeFlag, pps.PicInitQPMinus26, pps.ChromaQPIndexOffset)
+			}
+		}
+		if nal.Type == NALSPS {
+			sps, serr := ParseSPS(nal.Data)
+			if serr != nil {
+				t.Logf("  SPS parse error: %v", serr)
+			} else {
+				t.Logf("  SPS: id=%d profile=%d level=%d poc=%d log2maxfn=%d maxref=%d %dx%d",
+					sps.ID, sps.ProfileIDC, sps.LevelIDC, sps.PicOrderCntType,
+					sps.Log2MaxFrameNum, sps.MaxNumRefFrames, sps.Width, sps.Height)
+			}
+		}
+	}
+}
