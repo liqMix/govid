@@ -158,8 +158,11 @@ func (td *tileDecoder) decodeModeInfo(miRow, miCol, bSize int) (*blockInfo, erro
 		bi.txSize = TXSizeForBlockSize[bSize]
 	}
 
-	// TX type: for keyframes, use DCT_DCT.
-	bi.txType = TxTypeDCT_DCT
+	// 13. TX type (once per block).
+	bi.txType, err = td.readTXType(bi.yMode, bi.txSize, bi.skip)
+	if err != nil {
+		return nil, err
+	}
 
 	// Update above/left mode context.
 	bw4 := MISizeWide[bSize]
@@ -216,25 +219,28 @@ func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) error {
 		return nil
 	}
 
-	// Delta Q: symbol from DeltaQ CDF (4 symbols: 0, 1, 2, 3+).
-	dqAbs, err := td.sc.ReadSymbol(td.cdf.DeltaQ, 4)
+	// Delta Q: per dav1d, 4-symbol CDF then exponential extension if sym==3.
+	deltaQAbs, err := td.readDeltaAbsValue(td.cdf.DeltaQ)
 	if err != nil {
 		return err
 	}
-	if dqAbs == 3 {
-		nBits, err := td.sc.ReadLiteral(3)
-		if err != nil {
-			return err
-		}
-		_, err = td.sc.ReadLiteral(int(nBits) + 1)
-		if err != nil {
-			return err
+	deltaQSign := 0
+	if deltaQAbs > 0 {
+		if td.sc.ReadBoolEqui() {
+			deltaQSign = -1
+		} else {
+			deltaQSign = 1
 		}
 	}
-	if dqAbs > 0 {
-		_, err := td.sc.ReadLiteral(1)
-		if err != nil {
-			return err
+	// Apply delta Q to current quantizer index.
+	if deltaQAbs > 0 {
+		deltaQ := deltaQSign * deltaQAbs
+		td.currentQIdx += deltaQ
+		if td.currentQIdx < 1 {
+			td.currentQIdx = 1
+		}
+		if td.currentQIdx > 255 {
+			td.currentQIdx = 255
 		}
 	}
 
@@ -253,27 +259,49 @@ func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) error {
 			if err != nil {
 				return err
 			}
+			dlAbsVal := int(dlAbs)
 			if dlAbs == 3 {
-				nBits, err := td.sc.ReadLiteral(3)
+				n, err := td.sc.ReadLiteral(3)
 				if err != nil {
 					return err
 				}
-				_, err = td.sc.ReadLiteral(int(nBits) + 1)
+				nBits := int(n) + 1
+				extra, err := td.sc.ReadLiteral(nBits)
 				if err != nil {
 					return err
 				}
+				dlAbsVal = int(extra) + 1 + (1 << nBits)
 			}
-			if dlAbs > 0 {
-				_, err := td.sc.ReadLiteral(1)
-				if err != nil {
-					return err
-				}
+			if dlAbsVal > 0 {
+				td.sc.ReadBoolEqui() // sign bit (unused)
 			}
 		}
 	}
 
 	td.readDeltas = false
 	return nil
+}
+
+// readDeltaAbsValue reads a delta absolute value using CDF + exponential extension.
+// Per dav1d: sym ∈ {0,1,2}; if sym==3 (rare): n_bits=1+bools(3), val=bools(n_bits)+1+(1<<n_bits).
+func (td *tileDecoder) readDeltaAbsValue(cdf []uint16) (int, error) {
+	sym, err := td.sc.ReadSymbol(cdf, 4)
+	if err != nil {
+		return 0, err
+	}
+	if sym < 3 {
+		return int(sym), nil
+	}
+	n, err := td.sc.ReadLiteral(3)
+	if err != nil {
+		return 3, err
+	}
+	nBits := int(n) + 1
+	extra, err := td.sc.ReadLiteral(nBits)
+	if err != nil {
+		return 3, err
+	}
+	return int(extra) + 1 + (1 << nBits), nil
 }
 
 // readCfLAlphas reads CfL sign and alpha magnitudes.
@@ -563,6 +591,126 @@ func (td *tileDecoder) getTXSize(bSize int) (int, error) {
 		return result, nil
 	default:
 		return maxTx, nil
+	}
+}
+
+// dav1d tx_types_per_set mapping tables:
+// Intra2 (reduced/TX16x16): 5 symbols → TX types
+var txTypesIntra2 = [5]int{
+	TxTypeIDENTITY_IDENTITY, // 0: IDTX
+	TxTypeDCT_DCT,           // 1: DCT_DCT
+	TxTypeADST_ADST,         // 2: ADST_ADST
+	TxTypeADST_DCT,          // 3: ADST_DCT
+	TxTypeDCT_ADST,          // 4: DCT_ADST
+}
+
+// Intra1 (non-reduced, TX4x4/TX8x8): 7 symbols → TX types
+var txTypesIntra1 = [7]int{
+	TxTypeIDENTITY_IDENTITY, // 0: IDTX
+	TxTypeDCT_DCT,           // 1: DCT_DCT
+	TxTypeIDENTITY_DCT,      // 2: V_DCT
+	TxTypeDCT_IDENTITY,      // 3: H_DCT
+	TxTypeADST_ADST,         // 4: ADST_ADST
+	TxTypeADST_DCT,          // 5: ADST_DCT
+	TxTypeDCT_ADST,          // 6: DCT_ADST
+}
+
+// readTXType reads or derives the TX type for an intra block.
+// Matches dav1d decode.c: derives for TX32x32+, reads intra2 for TX16x16/reduced,
+// reads intra1 for TX4x4/TX8x8 non-reduced.
+func (td *tileDecoder) readTXType(yMode, txSize int, skip bool) (int, error) {
+	fh := td.dec.frameHdr
+
+	if skip || fh.CodedLossless {
+		return TxTypeDCT_DCT, nil
+	}
+
+	// For intra: max+1 >= TX_64X64 means txSize >= TX32x32 → derive DCT_DCT
+	if txSize >= TX32x32 {
+		return TxTypeDCT_DCT, nil
+	}
+
+	modeCtx := yMode
+	if modeCtx >= NumIntraModes {
+		modeCtx = 0
+	}
+
+	if fh.ReducedTXSet || txSize == TX16x16 {
+		// Intra2: reduced set (4 symbols = nsymbs 5)
+		minCtx := txSize
+		if minCtx > 2 {
+			minCtx = 2
+		}
+		cdf := td.cdf.IntraTXType2[minCtx][modeCtx]
+		if cdf == nil {
+			return TxTypeDCT_DCT, nil
+		}
+		sym, err := td.sc.ReadSymbol(cdf, 5)
+		if err != nil {
+			return TxTypeDCT_DCT, err
+		}
+		if sym < len(txTypesIntra2) {
+			return txTypesIntra2[sym], nil
+		}
+		return TxTypeDCT_DCT, nil
+	}
+
+	// Intra1: non-reduced, TX4x4/TX8x8 (6 symbols = nsymbs 7)
+	minCtx := txSize
+	if minCtx > 1 {
+		minCtx = 1
+	}
+	cdf := td.cdf.IntraTXType1[minCtx][modeCtx]
+	if cdf == nil {
+		return TxTypeDCT_DCT, nil
+	}
+	sym, err := td.sc.ReadSymbol(cdf, 7)
+	if err != nil {
+		return TxTypeDCT_DCT, err
+	}
+	if sym < len(txTypesIntra1) {
+		return txTypesIntra1[sym], nil
+	}
+	return TxTypeDCT_DCT, nil
+}
+
+// intraModeToTxType derives the TX type from the intra prediction mode.
+// Per AV1 spec Table 7-10. For TX sizes > 16x16, ADST falls back to DCT.
+func intraModeToTxType(mode, txSize int) int {
+	// AV1 spec: ADST/FLIPADST not available for TX sizes > 16x16.
+	if txSize > TX16x16 {
+		return TxTypeDCT_DCT
+	}
+
+	switch mode {
+	case IntraDC:
+		return TxTypeDCT_DCT
+	case IntraVertical:
+		return TxTypeADST_DCT
+	case IntraHorizontal:
+		return TxTypeDCT_ADST
+	case IntraD45:
+		return TxTypeDCT_DCT
+	case IntraD135:
+		return TxTypeADST_ADST
+	case IntraD113:
+		return TxTypeADST_DCT
+	case IntraD157:
+		return TxTypeDCT_ADST
+	case IntraD203:
+		return TxTypeDCT_ADST
+	case IntraD67:
+		return TxTypeADST_DCT
+	case IntraSmooth:
+		return TxTypeADST_ADST
+	case IntraSmoothV:
+		return TxTypeADST_DCT
+	case IntraSmoothH:
+		return TxTypeDCT_ADST
+	case IntraPaeth:
+		return TxTypeADST_ADST
+	default:
+		return TxTypeDCT_DCT
 	}
 }
 

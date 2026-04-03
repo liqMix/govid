@@ -21,6 +21,23 @@ type Decoder struct {
 
 	// Reference frame pool (8 slots).
 	refFrames [numRefFrames]*image.YCbCr
+
+	// Diagnostic counters accumulated across all tiles in a frame.
+	diagBlockCount int
+	diagSkipCount  int
+	diagTxbCount   int
+	diagTxbNzCount int
+	diagPartitions []int // first N partition decisions (partition type values)
+
+	// First block diagnostics.
+	diagFirstBlock     *blockInfo
+	diagFirstTXBCoeffs []int32 // raw coefficient levels (before dequant)
+	diagFirstTXBDCQ    int     // DC quantizer used
+	diagFirstTXBACQ    int     // AC quantizer used
+	diagBaseQIdx       int     // frame header BaseQIdx
+	diagFirstTXBEOB    int     // EOB position of first TXB
+	diagFirstTXBN      int     // coefficient count (n) of first TXB
+	diagCodecPosAfterSB1 int  // codec byte position after first SB
 }
 
 // NewDecoder creates a new AV1 decoder.
@@ -95,6 +112,16 @@ func (d *Decoder) DecodePacket(data []byte) (*image.YCbCr, error) {
 			headerBytes := (headerBits + 7) / 8
 			d.ensureImg()
 			d.cdf = NewCDFTables(d.frameHdr.Quant.BaseQIdx)
+
+			// Reset diagnostic counters for this frame.
+			d.diagBlockCount = 0
+			d.diagSkipCount = 0
+			d.diagTxbCount = 0
+			d.diagTxbNzCount = 0
+			d.diagPartitions = nil
+			d.diagFirstBlock = nil
+			d.diagFirstTXBCoeffs = nil
+			d.diagBaseQIdx = fh.Quant.BaseQIdx
 
 			if headerBytes < len(obu.Data) {
 				tileData := obu.Data[headerBytes:]

@@ -258,7 +258,7 @@ func TestReferenceFrameCorrect(t *testing.T) {
 				}
 			}
 
-			fs := dec2.computeInterFilterParam(mbx, mby)
+			fs := dec2.lookupFilterParam()
 			fs.inner = fs.inner || !skip
 			dec2.perMBFilterParams[dec2.mbw*mby+mbx] = fs
 			mbIdx++

@@ -41,24 +41,26 @@ var (
 // uniformProb represents a 50% probability that the next bit is 0.
 const uniformProb = 128
 
+// bdValueSize is the bit width of the value register. libvpx uses size_t
+// which is 64-bit on 64-bit platforms.
+const bdValueSize = 64
+
+// lotsOfBits is added to count when the buffer is nearly exhausted,
+// matching libvpx's VP8_LOTS_OF_BITS. It prevents further fill attempts.
+const lotsOfBits = 0x40000000
+
 // partition holds arithmetic-coded bits.
-// The implementation matches libvpx's vp8dx_bool_decoder (lazy refill).
+// The implementation matches libvpx's vp8dx_bool_decoder with a 64-bit
+// value register and the full fill logic including EOF handling.
 type partition struct {
-	// buf is the input bytes.
-	buf []byte
-	// r is how many of buf's bytes have been consumed.
-	r int
-	// rng is the decoder range [1..255].
-	rng uint32
-	// value is the MSB-aligned coded data register.
-	value uint32
-	// count is a signed bit counter; refill when < 0.
-	count int
-	// unexpectedEOF tells whether we tried to read past buf.
+	buf           []byte
+	r             int
+	rng           uint32
+	value         uint64
+	count         int
 	unexpectedEOF bool
 }
 
-// init initializes the partition.
 func (p *partition) init(buf []byte) {
 	p.buf = buf
 	p.r = 0
@@ -69,36 +71,51 @@ func (p *partition) init(buf []byte) {
 	p.fill()
 }
 
-// fill reads bytes from buf into value, matching vp8dx_bool_decoder_fill.
+// fill matches libvpx's vp8dx_bool_decoder_fill exactly, including the
+// VP8_LOTS_OF_BITS EOF handling that prevents re-fill attempts.
 func (p *partition) fill() {
-	shift := uint(24 - (p.count + 8))
-	for shift < 32 && p.r < len(p.buf) {
-		p.value |= uint32(p.buf[p.r]) << shift
-		p.r++
-		p.count += 8
-		shift -= 8
+	shift := bdValueSize - 8 - (p.count + 8)
+	bytesLeft := len(p.buf) - p.r
+	bitsLeft := bytesLeft * 8
+	x := shift + 8 - bitsLeft
+	loopEnd := 0
+
+	if x >= 0 {
+		p.count += lotsOfBits
+		loopEnd = x
+	}
+
+	if x < 0 || bitsLeft > 0 {
+		for shift >= loopEnd {
+			p.count += 8
+			p.value |= uint64(p.buf[p.r]) << uint(shift)
+			p.r++
+			shift -= 8
+		}
+	} else {
+		// Buffer completely exhausted — no bytes to load at all.
+		p.unexpectedEOF = true
 	}
 }
 
-// readBit returns the next bit, matching libvpx vp8dx_decode_bool.
 func (p *partition) readBit(prob uint8) bool {
+	split := 1 + ((p.rng - 1) * uint32(prob) >> 8)
+
 	if p.count < 0 {
 		p.fill()
-		if p.count < 0 {
-			// Buffer exhausted and fill couldn't provide enough bits.
-			p.unexpectedEOF = true
-		}
 	}
-	split := 1 + ((p.rng - 1) * uint32(prob) >> 8)
-	bigsplit := split << 24
+
+	bigsplit := uint64(split) << (bdValueSize - 8)
 	bit := p.value >= bigsplit
+
 	if bit {
 		p.rng -= split
 		p.value -= bigsplit
 	} else {
 		p.rng = split
 	}
-	// Normalize: rng is stored as rng-1 index into LUT.
+
+	// Normalize using LUT (equivalent to libvpx's vp8_norm table).
 	idx := p.rng - 1
 	if idx < 127 {
 		shift := lutShift[idx]
@@ -106,6 +123,7 @@ func (p *partition) readBit(prob uint8) bool {
 		p.value <<= shift
 		p.count -= int(shift)
 	}
+
 	return bit
 }
 

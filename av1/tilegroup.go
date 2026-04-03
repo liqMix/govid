@@ -29,6 +29,7 @@ type tileDecoder struct {
 	skipCount   int       // blocks with skip=true
 	txbCount    int       // transform blocks decoded
 	txbNzCount  int       // transform blocks with non-zero coefficients
+	partitionLog []int    // partition decisions (for diagnostics)
 
 	// DC sign context arrays for coefficient coding.
 	// Values: 0=zero/unknown, 1=positive, 2=negative.
@@ -37,6 +38,7 @@ type tileDecoder struct {
 
 	// Per-SB state for delta Q/LF reads.
 	readDeltas bool
+	currentQIdx int // current quantizer index (BaseQIdx + accumulated delta)
 
 	// CDEF tracking: which 64x64 regions have had their CDEF index read.
 	cdefRead map[[2]int]bool
@@ -167,9 +169,12 @@ func (d *Decoder) decodeTile(tileRow, tileCol int, data []byte) error {
 	aboveW := miColEnd - miColStart
 	leftH := miRowEnd - miRowStart
 
+	sc := NewSymbolCodec(data)
+	sc.allowUpdateCDF = !fh.DisableCDFUpdate
+
 	td := &tileDecoder{
 		dec:          d,
-		sc:           NewSymbolCodec(data),
+		sc:           sc,
 		cdf:          d.cdf,
 		miRowStart:   miRowStart,
 		miRowEnd:     miRowEnd,
@@ -182,6 +187,7 @@ func (d *Decoder) decodeTile(tileRow, tileCol int, data []byte) error {
 		leftModeCtx:  make([]int, leftH),
 		leftSkipCtx:  make([]bool, leftH),
 		cdefRead:     make(map[[2]int]bool),
+		currentQIdx:  fh.Quant.BaseQIdx,
 	}
 
 	// Init nonzero context and DC sign context per plane.
@@ -241,8 +247,20 @@ func (d *Decoder) decodeTile(tileRow, tileCol int, data []byte) error {
 			if err := td.decodePartition(miRow, miCol, sbBS); err != nil {
 				return fmt.Errorf("SB[%d,%d] after %d blocks: %w", sbRow, sbCol, td.blockCount, err)
 			}
+
+			// Track codec position after first SB.
+			if sbRow == 0 && sbCol == 0 && d.diagCodecPosAfterSB1 == 0 {
+				d.diagCodecPosAfterSB1 = sc.bytePos
+			}
 		}
 	}
+
+	// Accumulate tile diagnostics into the decoder.
+	d.diagBlockCount += td.blockCount
+	d.diagSkipCount += td.skipCount
+	d.diagTxbCount += td.txbCount
+	d.diagTxbNzCount += td.txbNzCount
+	d.diagPartitions = append(d.diagPartitions, td.partitionLog...)
 
 	return nil
 }

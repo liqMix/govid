@@ -43,7 +43,7 @@ func TestManualDecodeFirst3MBRow(t *testing.T) {
 			dec.aboveLeftInterMB = prevAbove
 			prevAbove = dec.upInterMB[mbx]
 			skip := dec.reconstruct(mbx, mby)
-			fs := dec.computeInterFilterParam(mbx, mby)
+			fs := dec.lookupFilterParam()
 			fs.inner = fs.inner || !skip
 			dec.perMBFilterParams[dec.mbw*mby+mbx] = fs
 		}

@@ -26,26 +26,41 @@ func init() {
 	generateDiagonalScan(defaultScan32x32[:], 32, 32)
 }
 
-// generateDiagonalScan fills scan[] with a diagonal scan pattern for a w x h block.
-// This traverses diagonals from top-right to bottom-left.
+// generateDiagonalScan fills scan[] with a zigzag diagonal scan for a w x h block.
+// AV1 alternates direction on each anti-diagonal:
+//   odd d:  top-right → bottom-left (col decreasing, row increasing)
+//   even d: bottom-left → top-right (row decreasing, col increasing)
 func generateDiagonalScan(scan []int, w, h int) {
 	idx := 0
 	for d := 0; d < w+h-1; d++ {
-		// Each diagonal has constant (row + col) = d.
-		// We scan from bottom-left to top-right within each diagonal.
-		var r, c int
-		if d < h {
-			r = d
-			c = 0
+		if d%2 == 1 {
+			// Odd diagonal: start from top, go down-left.
+			r := 0
+			c := d
+			if c >= w {
+				r = d - (w - 1)
+				c = w - 1
+			}
+			for r < h && c >= 0 {
+				scan[idx] = r*w + c
+				idx++
+				r++
+				c--
+			}
 		} else {
-			r = h - 1
-			c = d - (h - 1)
-		}
-		for r >= 0 && c < w {
-			scan[idx] = r*w + c
-			idx++
-			r--
-			c++
+			// Even diagonal: start from left, go up-right.
+			r := d
+			c := 0
+			if r >= h {
+				c = d - (h - 1)
+				r = h - 1
+			}
+			for r >= 0 && c < w {
+				scan[idx] = r*w + c
+				idx++
+				r--
+				c++
+			}
 		}
 	}
 }

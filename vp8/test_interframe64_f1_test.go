@@ -106,7 +106,7 @@ func TestInterframe64Frame1Trace(t *testing.T) {
 				mvStr += "]"
 			}
 
-			fs := dec.computeInterFilterParam(mbx, mby)
+			fs := dec.lookupFilterParam()
 			fs.inner = fs.inner || !skip
 			dec.perMBFilterParams[dec.mbw*mby+mbx] = fs
 

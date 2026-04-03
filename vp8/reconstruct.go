@@ -444,7 +444,9 @@ func (d *Decoder) reconstructInterframe(mbx, mby int, skip bool) bool {
 		d.parseIntraYModeInter(mbx)
 		d.parsePredModeC8Inter()
 		if !skip {
-			skip = d.parseResiduals(mbx, mby)
+			if d.parseResiduals(mbx, mby) {
+				skip = true // All parsed coefficients are zero.
+			}
 		} else {
 			d.clearResidualState(mbx)
 		}
@@ -457,7 +459,9 @@ func (d *Decoder) reconstructInterframe(mbx, mby int, skip bool) bool {
 		// modes use 16x16 prediction (Y2/WHT block for DC coefficients).
 		d.usePredY16 = d.curMode != interModeSPLITMV
 		if !skip {
-			skip = d.parseResiduals(mbx, mby)
+			if d.parseResiduals(mbx, mby) {
+				skip = true // All parsed coefficients are zero.
+			}
 		} else {
 			d.clearResidualState(mbx)
 		}
@@ -465,6 +469,9 @@ func (d *Decoder) reconstructInterframe(mbx, mby int, skip bool) bool {
 	}
 
 	d.copyMBToImg(mbx, mby)
+	// Return the effective skip: bitstream skip OR all parsed coefficients zero.
+	// Per §15.1, inner sub-block filtering is skipped when no DCT coefficients
+	// are coded, which libvpx/ffmpeg implement as the coefficient-based skip.
 	return skip
 }
 

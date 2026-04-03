@@ -657,7 +657,7 @@ func TestSmallFrame1BitTrace(t *testing.T) {
 			}
 
 			// Compute filter param like main decode loop does.
-			fs := dec.computeInterFilterParam(mbx, mby)
+			fs := dec.lookupFilterParam()
 			fs.inner = fs.inner || !skip
 			dec.perMBFilterParams[dec.mbw*mby+mbx] = fs
 

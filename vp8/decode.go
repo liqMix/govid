@@ -121,8 +121,14 @@ type Decoder struct {
 	useSkipProb bool
 	skipProb    uint8
 	// Loop filter parameters.
-	filterParams      [nSegment][2]filterParam
 	perMBFilterParams []filterParam
+	// Precomputed filter LUTs (ported from libvpx).
+	filterLvl     [nSegment][4][4]int // lvl[seg][ref][modeLFLut] — filter level per combo
+	filterLim     [65]uint8           // block_inside_limit per filter level (index 0 unused)
+	filterBlim    [65]uint8           // 2*filt_lvl + lim (sub-block edge threshold)
+	filterMblim   [65]uint8           // 2*(filt_lvl+2) + lim (MB edge threshold)
+	filterHevThr  [2][65]uint8        // [0]=KEY, [1]=INTER per filter level
+	lastSharpness int8                // track sharpness changes
 
 	// The eight fields below relate to the current macroblock being decoded.
 	//
@@ -184,7 +190,9 @@ type Decoder struct {
 
 // NewDecoder returns a new Decoder.
 func NewDecoder() *Decoder {
-	return &Decoder{}
+	d := &Decoder{lastSharpness: -1}
+	d.loopFilterInitLUT()
+	return d
 }
 
 // Init initializes the decoder to read at most n bytes from r.
@@ -288,11 +296,18 @@ func (d *Decoder) parseFilterHeader() {
 	d.filterHeader.sharpness = uint8(d.fp.readUint(uniformProb, 3))
 	d.filterHeader.useLFDelta = d.fp.readBit(uniformProb)
 	if d.filterHeader.useLFDelta && d.fp.readBit(uniformProb) {
+		// Per-delta update: only overwrite if the individual flag is set.
+		// readOptionalInt returns 0 for "no update" but the spec says the
+		// delta should RETAIN its previous value (persist across frames).
 		for i := range d.filterHeader.refLFDelta {
-			d.filterHeader.refLFDelta[i] = int8(d.fp.readOptionalInt(uniformProb, 6))
+			if d.fp.readBit(uniformProb) {
+				d.filterHeader.refLFDelta[i] = int8(d.fp.readInt(uniformProb, 6))
+			}
 		}
 		for i := range d.filterHeader.modeLFDelta {
-			d.filterHeader.modeLFDelta[i] = int8(d.fp.readOptionalInt(uniformProb, 6))
+			if d.fp.readBit(uniformProb) {
+				d.filterHeader.modeLFDelta[i] = int8(d.fp.readInt(uniformProb, 6))
+			}
 		}
 	}
 	if d.filterHeader.level == 0 {
@@ -309,7 +324,7 @@ func (d *Decoder) parseFilterHeader() {
 	} else {
 		d.filterHeader.perSegmentLevel[0] = d.filterHeader.level
 	}
-	d.computeFilterParams()
+	// Filter LUT is initialized per-frame in DecodeFrame via loopFilterFrameInit.
 }
 
 // parseOtherPartitions parses the other partitions, as specified in section 9.5.
@@ -422,6 +437,9 @@ func (d *Decoder) DecodeFrame() (*image.YCbCr, error) {
 	if err := d.parseOtherHeaders(); err != nil {
 		return nil, err
 	}
+	// Precompute filter level LUT for this frame (port of libvpx
+	// vp8_loop_filter_frame_init).
+	d.loopFilterFrameInit()
 	// Reconstruct the rows.
 	for mbx := 0; mbx < d.mbw; mbx++ {
 		d.upMB[mbx] = mb{}
@@ -435,15 +453,9 @@ func (d *Decoder) DecodeFrame() (*image.YCbCr, error) {
 			d.aboveLeftInterMB = prevAbove
 			prevAbove = d.upInterMB[mbx] // save before overwrite
 			skip := d.reconstruct(mbx, mby)
-			if d.frameHeader.KeyFrame {
-				fs := d.filterParams[d.segment][btou(!d.usePredY16)]
-				fs.inner = fs.inner || !skip
-				d.perMBFilterParams[d.mbw*mby+mbx] = fs
-			} else {
-				fs := d.computeInterFilterParam(mbx, mby)
-				fs.inner = fs.inner || !skip
-				d.perMBFilterParams[d.mbw*mby+mbx] = fs
-			}
+			fs := d.lookupFilterParam()
+			fs.inner = fs.inner || !skip
+			d.perMBFilterParams[d.mbw*mby+mbx] = fs
 		}
 	}
 	// First partition EOF is only fatal for keyframes. For inter-frames,

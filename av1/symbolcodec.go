@@ -1,153 +1,149 @@
 package av1
 
-import "fmt"
+import (
+	"math/bits"
+)
 
 // SymbolCodec implements the AV1 multi-symbol arithmetic decoder.
-// Uses a 16-bit value window with range normalized to [32768, 65535].
+// Uses a 64-bit value window matching dav1d's msac.c exactly.
 type SymbolCodec struct {
-	data    []byte
-	pos     int    // byte position in data
-	value   uint32 // current coded value (16-bit)
-	range_  uint32 // current range, always in [32768, 65535] after normalization
-	cnt     int    // bit counter for refill
-	padding int    // padding bytes when data exhausted
+	data           []byte
+	bytePos        int
+	dif            uint64
+	rng            uint32
+	cnt            int
+	allowUpdateCDF bool
 }
 
 // NewSymbolCodec creates a new symbol codec from compressed data.
 func NewSymbolCodec(data []byte) *SymbolCodec {
 	sc := &SymbolCodec{
-		data:   data,
-		range_: 65535, // (1 << 16) - 1
+		data:           data,
+		dif:            0,
+		rng:            0x8000,
+		cnt:            -15,
+		allowUpdateCDF: true,
 	}
-
-	// Read initial 2 bytes into value (XOR'd per AV1/dav1d complement convention).
-	if len(data) >= 1 {
-		sc.value = uint32(data[0]^0xFF) << 8
-		sc.pos = 1
-	}
-	if len(data) >= 2 {
-		sc.value |= uint32(data[1] ^ 0xFF)
-		sc.pos = 2
-	}
-	sc.cnt = -15
-
+	sc.refill()
 	return sc
 }
 
-// ReadSymbol reads a symbol using the given CDF (descending format).
-// cdf has nsymbs+1 entries: cdf[0..nsymbs-1] are descending cumulative frequencies,
-// cdf[nsymbs] is the adaptation counter.
-func (sc *SymbolCodec) ReadSymbol(cdf []uint16, nsymbs int) (int, error) {
-	if sc.padding > 4 {
-		return 0, fmt.Errorf("symbol codec: data exhausted")
+// refill reads bytes into the value window. Matches dav1d ctx_refill exactly.
+func (sc *SymbolCodec) refill() {
+	c := 64 - sc.cnt - 24
+	for c >= 0 && sc.bytePos < len(sc.data) {
+		sc.dif |= uint64(sc.data[sc.bytePos]^0xFF) << uint(c)
+		sc.bytePos++
+		c -= 8
 	}
+	if c >= 0 {
+		// EOF: fill remaining bits with 1s
+		sc.dif |= ^(^uint64(0xFF) << uint(c))
+	}
+	sc.cnt = 64 - c - 24
+}
 
-	c := sc.range_ >> 8
-	symbol := 0
-	u := sc.range_
+// normalize renormalizes the range and value. Matches dav1d ctx_norm.
+func (sc *SymbolCodec) normalize(dif uint64, rng uint32) {
+	d := int(bits.LeadingZeros32(rng)) - 16
+	sc.cnt -= d
+	sc.dif = ((dif + 1) << uint(d)) - 1
+	sc.rng = rng << uint(d)
+	if sc.cnt < 0 {
+		sc.refill()
+	}
+}
+
+// ReadSymbol reads a symbol using the given CDF (descending format).
+// nsymbs is the number of symbols. CDF has nsymbs entries:
+// nsymbs-1 CDF values followed by 1 adaptation counter.
+func (sc *SymbolCodec) ReadSymbol(cdf []uint16, nsymbs int) (int, error) {
+	n := nsymbs - 1 // dav1d's n_symbols
+	c := uint32(sc.dif >> 48)
+	r := sc.rng >> 8
+	u := sc.rng
+	val := 0
 
 	var v uint32
 	for {
-		v = (c * uint32(cdf[symbol]>>6)) >> 1
-		v += 4 * uint32(nsymbs-1-symbol)
-		if sc.value >= v {
+		v = (r * (uint32(cdf[val]) >> 6)) >> 1
+		v += 4 * uint32(n-val)
+		if c >= v {
 			break
 		}
 		u = v
-		symbol++
-		if symbol >= nsymbs-1 {
+		val++
+		if val >= n {
 			v = 0
 			break
 		}
 	}
 
-	sc.value -= v
-	sc.range_ = u - v
+	sc.normalize(sc.dif-uint64(v)<<48, u-v)
 
-	if err := sc.renormalize(); err != nil {
-		return 0, err
+	if sc.allowUpdateCDF {
+		UpdateCDF(cdf, nsymbs, val)
 	}
-	UpdateCDF(cdf, nsymbs, symbol)
-	return symbol, nil
+	return val, nil
+}
+
+// ReadBoolEqui reads a boolean with 50/50 probability. Matches dav1d decode_bool_equi.
+func (sc *SymbolCodec) ReadBoolEqui() bool {
+	v := (sc.rng>>8)<<7 + 4
+	vw := uint64(v) << 48
+	ret := sc.dif >= vw
+	dif := sc.dif
+	if ret {
+		dif -= vw
+		v = sc.rng - v
+	}
+	sc.normalize(dif, v)
+	return !ret
 }
 
 // ReadBool reads a boolean with given probability (out of 256).
-// prob=128 gives 50/50.
 func (sc *SymbolCodec) ReadBool(prob int) (bool, error) {
-	if sc.padding > 4 {
-		return false, fmt.Errorf("symbol codec: data exhausted")
+	v := (sc.rng>>8)*uint32(prob) + 4
+	vw := uint64(v) << 48
+	ret := sc.dif >= vw
+	dif := sc.dif
+	if ret {
+		dif -= vw
+		v = sc.rng - v
 	}
+	sc.normalize(dif, v)
+	return !ret, nil
+}
 
-	split := 1 + (((sc.range_ - 1) * uint32(prob)) >> 8)
-
-	if sc.value < split {
-		sc.range_ = split
-		if err := sc.renormalize(); err != nil {
-			return false, err
-		}
-		// Complement convention: low complement (value < split) = high raw = true
-		return true, nil
-	}
-
-	sc.value -= split
-	sc.range_ -= split
-	if err := sc.renormalize(); err != nil {
-		return false, err
-	}
-	// Complement convention: high complement (value >= split) = low raw = false
-	return false, nil
+// ReadBoolAdapt reads an adaptive boolean from a 2-entry CDF.
+func (sc *SymbolCodec) ReadBoolAdapt(cdf []uint16) bool {
+	sym, _ := sc.ReadSymbol(cdf, 2)
+	return sym == 1
 }
 
 // ReadLiteral reads n bits using flat probability (each bit 50/50).
 func (sc *SymbolCodec) ReadLiteral(n int) (uint32, error) {
 	var val uint32
 	for i := 0; i < n; i++ {
-		bit, err := sc.ReadBool(128)
-		if err != nil {
-			return 0, err
-		}
 		val = val << 1
-		if bit {
+		if sc.ReadBoolEqui() {
 			val |= 1
 		}
 	}
 	return val, nil
 }
 
-// renormalize adjusts range and value, keeping range in [32768, 65535].
-func (sc *SymbolCodec) renormalize() error {
-	for sc.range_ < 32768 {
-		sc.range_ <<= 1
-		sc.value <<= 1
-
-		sc.cnt++
-		if sc.cnt >= 0 {
-			sc.cnt = -8
-			if sc.pos < len(sc.data) {
-				sc.value |= uint32(sc.data[sc.pos] ^ 0xFF)
-				sc.pos++
-			} else {
-				sc.padding++
-				if sc.padding > 4 {
-					return fmt.Errorf("symbol codec: data exhausted")
-				}
-			}
-		}
-	}
-	return nil
-}
-
 // UpdateCDF adapts the CDF after decoding a symbol.
-// Matches dav1d's update_cdf implementation.
-// cdf[nsymbs] stores the adaptation counter (0..32).
+// nsymbs is the number of symbols. CDF layout: nsymbs-1 CDF values, then counter.
 func UpdateCDF(cdf []uint16, nsymbs, symbol int) {
-	count := cdf[nsymbs]
-	rate := int((count>>4)|4)
-	if nsymbs > 2 {
+	n := nsymbs - 1 // dav1d's n_symbols
+	count := cdf[n]
+	rate := 4 + int(count>>4)
+	if n > 2 {
 		rate++
 	}
 
-	for i := 0; i < nsymbs-1; i++ {
+	for i := 0; i < n; i++ {
 		if i < symbol {
 			cdf[i] += (32768 - cdf[i]) >> uint(rate)
 		} else {
@@ -156,6 +152,6 @@ func UpdateCDF(cdf []uint16, nsymbs, symbol int) {
 	}
 
 	if count < 32 {
-		cdf[nsymbs] = count + 1
+		cdf[n] = count + 1
 	}
 }

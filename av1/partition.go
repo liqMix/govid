@@ -82,6 +82,9 @@ func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
 		subSize = SubSize[bSize][PartitionSplit]
 	}
 
+	// Log partition decision for diagnostics.
+	td.partitionLog = append(td.partitionLog, partition)
+
 	switch partition {
 	case PartitionNone:
 		if err := td.decodeBlock(miRow, miCol, subSize); err != nil {
@@ -208,10 +211,7 @@ func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
 // getPartitionCtx computes the partition CDF context index.
 // ctx = bsl * 4 + 2*left + above where bsl = BlockWidthLog2[bSize].
 func (td *tileDecoder) getPartitionCtx(miRow, miCol, bSize int) int {
-	bsl := BlockWidthLog2[bSize] - 1
-	if bsl < 0 {
-		bsl = 0
-	}
+	bsl := BlockWidthLog2[bSize]
 
 	above := 0
 	if miRow > td.miRowStart {
@@ -234,8 +234,8 @@ func (td *tileDecoder) getPartitionCtx(miRow, miCol, bSize int) int {
 	}
 
 	ctx := bsl*4 + 2*left + above
-	if ctx > 19 {
-		ctx = 19
+	if ctx > 23 {
+		ctx = 23
 	}
 	return ctx
 }

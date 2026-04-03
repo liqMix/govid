@@ -2,7 +2,7 @@ package av1
 
 // Default CDF tables from AV1 spec Section 9.3.
 // Each CDF array ends with a 0 counter (adaptation count).
-// Values are pre-scaled to the CDF range [0, 32768).
+// Values are pre-scaled to the CDF range [0).
 // Non-coefficient CDFs from libaom entropymode.c.
 // Coefficient CDFs from dav1d cdf.c Q1 set (base_q_idx 21-84).
 
@@ -22,13 +22,11 @@ func initDefaultCDFs(c *CDFTables, baseQIdx int) {
 	initPaletteCDFs(c)
 }
 
-// makeCDF creates a CDF slice for nsymbs = len(vals)+1 symbols.
-// Input vals are ascending cumulative frequencies from libaom/spec.
-// Storage is descending (32768 - v), matching dav1d's CDF1 macro.
-// Layout: [descending vals..., 0 (implicit last boundary), 0 (adaptation counter)]
-// Total length = len(vals) + 2 = nsymbs + 1.
+// makeCDF creates a CDF slice. Input vals are ascending cumulative frequencies.
+// Storage: [ICDF values..., 0 (adaptation counter)]
+// Total length = len(vals) + 1. nsymbs = len(vals) + 1.
 func makeCDF(vals ...uint16) []uint16 {
-	cdf := make([]uint16, len(vals)+2)
+	cdf := make([]uint16, len(vals)+1)
 	for i, v := range vals {
 		cdf[i] = 32768 - v
 	}
@@ -41,32 +39,32 @@ func makeCDF(vals ...uint16) []uint16 {
 // libaom uses bsl-1 offset so libaom ctx N = our ctx N+4.
 
 func initPartitionCDFs(c *CDFTables) {
-	// ctx = bsl*4 + 2*left + above, bsl = BlockWidthLog2 - 1.
-	// bsl=0 (8x8): ctx 0-3, 4 symbols.
-	c.Partition[0] = makeCDF(19132, 25510, 30392)
-	c.Partition[1] = makeCDF(13928, 19855, 28540)
-	c.Partition[2] = makeCDF(12522, 23679, 28629)
-	c.Partition[3] = makeCDF(9896, 18783, 25853)
-	// bsl=1 (16x16): ctx 4-7, 10 symbols.
-	c.Partition[4] = makeCDF(15597, 20929, 24571, 26706, 27664, 28821, 29601, 30571, 31902)
-	c.Partition[5] = makeCDF(7925, 11043, 16785, 22470, 23971, 25043, 26651, 28701, 29834)
-	c.Partition[6] = makeCDF(5414, 13269, 15111, 20488, 22360, 24500, 25537, 26336, 32117)
-	c.Partition[7] = makeCDF(2662, 6362, 8614, 20860, 23053, 24778, 26436, 27829, 31171)
-	// bsl=2 (32x32): ctx 8-11.
-	c.Partition[8] = makeCDF(18462, 20920, 23124, 27647, 28227, 29049, 29519, 30178, 31544)
-	c.Partition[9] = makeCDF(7689, 9060, 12056, 24992, 25660, 26182, 26951, 28041, 29052)
-	c.Partition[10] = makeCDF(6015, 9009, 10062, 24544, 25409, 26545, 27071, 27526, 32047)
-	c.Partition[11] = makeCDF(1394, 2208, 2796, 28614, 29061, 29466, 29840, 30185, 31899)
-	// bsl=3 (64x64): ctx 12-15.
-	c.Partition[12] = makeCDF(20137, 21547, 23078, 29566, 29837, 30261, 30524, 30892, 31724)
-	c.Partition[13] = makeCDF(6732, 7490, 9497, 27944, 28250, 28515, 28969, 29630, 30104)
-	c.Partition[14] = makeCDF(5945, 7663, 8348, 28683, 29117, 29749, 30064, 30298, 32238)
-	c.Partition[15] = makeCDF(870, 1212, 1487, 31198, 31394, 31574, 31743, 31881, 32332)
-	// bsl=4 (128x128): ctx 16-19, padded to 10 symbols.
-	c.Partition[16] = makeCDF(27899, 28219, 28529, 32484, 32539, 32619, 32639, 32700, 32730)
-	c.Partition[17] = makeCDF(6607, 6990, 8268, 32060, 32219, 32338, 32371, 32500, 32600)
-	c.Partition[18] = makeCDF(5429, 6676, 7122, 32027, 32227, 32531, 32582, 32650, 32700)
-	c.Partition[19] = makeCDF(711, 966, 1172, 32448, 32538, 32617, 32664, 32710, 32740)
+	// Indices 0-3 (bsl=0) left nil: Block4x4 never reads partition CDFs.
+	// bsl=1 (8x8): ctx 4-7, 4 symbols.
+	c.Partition[4] = makeCDF(19132, 25510, 30392)
+	c.Partition[5] = makeCDF(13928, 19855, 28540)
+	c.Partition[6] = makeCDF(12522, 23679, 28629)
+	c.Partition[7] = makeCDF(9896, 18783, 25853)
+	// bsl=2 (16x16): ctx 8-11, 10 symbols.
+	c.Partition[8] = makeCDF(15597, 20929, 24571, 26706, 27664, 28821, 29601, 30571, 31902)
+	c.Partition[9] = makeCDF(7925, 11043, 16785, 22470, 23971, 25043, 26651, 28701, 29834)
+	c.Partition[10] = makeCDF(5414, 13269, 15111, 20488, 22360, 24500, 25537, 26336, 32117)
+	c.Partition[11] = makeCDF(2662, 6362, 8614, 20860, 23053, 24778, 26436, 27829, 31171)
+	// bsl=3 (32x32): ctx 12-15.
+	c.Partition[12] = makeCDF(18462, 20920, 23124, 27647, 28227, 29049, 29519, 30178, 31544)
+	c.Partition[13] = makeCDF(7689, 9060, 12056, 24992, 25660, 26182, 26951, 28041, 29052)
+	c.Partition[14] = makeCDF(6015, 9009, 10062, 24544, 25409, 26545, 27071, 27526, 32047)
+	c.Partition[15] = makeCDF(1394, 2208, 2796, 28614, 29061, 29466, 29840, 30185, 31899)
+	// bsl=4 (64x64): ctx 16-19.
+	c.Partition[16] = makeCDF(20137, 21547, 23078, 29566, 29837, 30261, 30524, 30892, 31724)
+	c.Partition[17] = makeCDF(6732, 7490, 9497, 27944, 28250, 28515, 28969, 29630, 30104)
+	c.Partition[18] = makeCDF(5945, 7663, 8348, 28683, 29117, 29749, 30064, 30298, 32238)
+	c.Partition[19] = makeCDF(870, 1212, 1487, 31198, 31394, 31574, 31743, 31881, 32332)
+	// bsl=5 (128x128): ctx 20-23.
+	c.Partition[20] = makeCDF(27899, 28219, 28529, 32484, 32539, 32619, 32639, 32700, 32730)
+	c.Partition[21] = makeCDF(6607, 6990, 8268, 32060, 32219, 32338, 32371, 32500, 32600)
+	c.Partition[22] = makeCDF(5429, 6676, 7122, 32027, 32227, 32531, 32582, 32650, 32700)
+	c.Partition[23] = makeCDF(711, 966, 1172, 32448, 32538, 32617, 32664, 32710, 32740)
 }
 
 // ---- Intra Mode CDFs ----
@@ -156,15 +154,45 @@ func initTXSizeCDFs(c *CDFTables) {
 }
 
 // ---- TX Type CDFs ----
+// dav1d has two sets:
+// txtp_intra1[2][13]: 6-symbol CDF for TX4x4/TX8x8 non-reduced (our 7 nsymbs)
+// txtp_intra2[3][13]: 4-symbol CDF for reduced OR TX16x16 (our 5 nsymbs)
 
 func initTXTypeCDFs(c *CDFTables) {
-	for tsq := 0; tsq < 4; tsq++ {
-		for dir := 0; dir < 16; dir++ {
-			vals := make([]uint16, 15)
-			for i := 0; i < 15; i++ {
-				vals[i] = uint16((int(i+1) * 32768) / 16)
-			}
-			c.TXType[tsq][dir] = makeCDF(vals...)
+	// IntraTXType1: dav1d txtp_intra1 — non-reduced, TX4x4 (min=0) and TX8x8 (min=1)
+	// CDF6: 6 symbols (our nsymbs=7)
+	c.IntraTXType1[0][IntraDC] = makeCDF(1535, 8035, 9461, 12751, 23467, 27825)
+	c.IntraTXType1[0][IntraVertical] = makeCDF(564, 3335, 9709, 10870, 18143, 28094)
+	c.IntraTXType1[0][IntraHorizontal] = makeCDF(672, 3247, 3676, 11982, 19415, 23127)
+	c.IntraTXType1[0][IntraD45] = makeCDF(5279, 13885, 15487, 18044, 23527, 30252)
+	c.IntraTXType1[0][IntraD135] = makeCDF(4423, 6074, 7985, 10416, 25693, 29298)
+	c.IntraTXType1[0][IntraD113] = makeCDF(1486, 4241, 9460, 10662, 16456, 27694)
+	c.IntraTXType1[0][IntraD157] = makeCDF(439, 2838, 3522, 6737, 18058, 23754)
+	c.IntraTXType1[0][IntraD203] = makeCDF(1190, 4233, 4855, 11670, 20281, 24377)
+	c.IntraTXType1[0][IntraD67] = makeCDF(1045, 4312, 8647, 10159, 18644, 29335)
+	c.IntraTXType1[0][IntraSmooth] = makeCDF(202, 3734, 4747, 7298, 17127, 24016)
+	c.IntraTXType1[0][IntraSmoothV] = makeCDF(447, 4312, 6819, 8884, 16010, 23858)
+	c.IntraTXType1[0][IntraSmoothH] = makeCDF(277, 4369, 5255, 8905, 16465, 22271)
+	c.IntraTXType1[0][IntraPaeth] = makeCDF(3409, 5436, 10599, 15599, 19687, 24040)
+	c.IntraTXType1[1][IntraDC] = makeCDF(1870, 13742, 14530, 16498, 23770, 27698)
+	c.IntraTXType1[1][IntraVertical] = makeCDF(326, 8796, 14632, 15079, 19272, 27486)
+	c.IntraTXType1[1][IntraHorizontal] = makeCDF(484, 7576, 7712, 14443, 19159, 22591)
+	c.IntraTXType1[1][IntraD45] = makeCDF(1126, 15340, 15895, 17023, 20896, 30279)
+	c.IntraTXType1[1][IntraD135] = makeCDF(655, 4854, 5249, 5913, 22099, 27138)
+	c.IntraTXType1[1][IntraD113] = makeCDF(1299, 6458, 8885, 9290, 14851, 25497)
+	c.IntraTXType1[1][IntraD157] = makeCDF(311, 5295, 5552, 6885, 16107, 22672)
+	c.IntraTXType1[1][IntraD203] = makeCDF(883, 8059, 8270, 11258, 17289, 21549)
+	c.IntraTXType1[1][IntraD67] = makeCDF(741, 7580, 9318, 10345, 16688, 29046)
+	c.IntraTXType1[1][IntraSmooth] = makeCDF(110, 7406, 7915, 9195, 16041, 23329)
+	c.IntraTXType1[1][IntraSmoothV] = makeCDF(363, 7974, 9357, 10673, 15629, 24474)
+	c.IntraTXType1[1][IntraSmoothH] = makeCDF(153, 7647, 8112, 9936, 15307, 19996)
+	c.IntraTXType1[1][IntraPaeth] = makeCDF(3511, 6332, 11165, 15335, 19323, 23594)
+
+	// IntraTXType2: dav1d txtp_intra2 — reduced set or TX16x16
+	// CDF4: 4 symbols (our nsymbs=5). All uniform defaults.
+	for ctx := 0; ctx < 3; ctx++ {
+		for m := 0; m < NumIntraModes; m++ {
+			c.IntraTXType2[ctx][m] = makeCDF(6554, 13107, 19661, 26214)
 		}
 	}
 }
@@ -210,21 +238,21 @@ func initCoeffCDFsUniform(c *CDFTables) {
 			c.EOBExtra[ctx][pt] = makeCDF(16384)
 		}
 	}
-	for txs := 0; txs < 3; txs++ {
+	for txs := 0; txs < 5; txs++ {
 		for pt := 0; pt < 2; pt++ {
-			for ec := 0; ec < 3; ec++ {
+			for ec := 0; ec < 4; ec++ {
 				c.CoeffBaseEOB[txs][pt][ec] = makeCDF(17837, 29055)
 			}
 		}
 	}
-	for txs := 0; txs < 3; txs++ {
+	for txs := 0; txs < 5; txs++ {
 		for pt := 0; pt < 2; pt++ {
 			for ctx := 0; ctx < 41; ctx++ {
 				c.CoeffBase[txs][pt][ctx] = makeCDF(12160, 23040, 28928)
 			}
 		}
 	}
-	for txs := 0; txs < 3; txs++ {
+	for txs := 0; txs < 4; txs++ {
 		for pt := 0; pt < 2; pt++ {
 			for ctx := 0; ctx < 21; ctx++ {
 				c.CoeffBaseRange[txs][pt][ctx] = makeCDF(8192, 16384, 24576)
@@ -286,152 +314,635 @@ func initEOBCDFs(c *CDFTables) {
 	}
 }
 
+
+// eob_base_tok: 40 entries (expect 40)
 func initCoeffBaseEOBCDFs(c *CDFTables) {
-	// dav1d Q1 eob_base_tok: [5 txSzCtx][2 planeType][4 eobCtx], 3 symbols.
-	// Our [3 txSizeCtx][2 planeType][3 eobCtx]. Map txSzCtx 0→0, 1→1, 3→2.
-	// txSizeCtx=0 (4x4), planeType=0
 	c.CoeffBaseEOB[0][0][0] = makeCDF(17560, 29888)
 	c.CoeffBaseEOB[0][0][1] = makeCDF(29671, 31549)
 	c.CoeffBaseEOB[0][0][2] = makeCDF(31007, 32056)
-	// txSizeCtx=0 (4x4), planeType=1
+	c.CoeffBaseEOB[0][0][3] = makeCDF(27286, 30006)
 	c.CoeffBaseEOB[0][1][0] = makeCDF(26594, 31212)
 	c.CoeffBaseEOB[0][1][1] = makeCDF(31208, 32582)
 	c.CoeffBaseEOB[0][1][2] = makeCDF(31835, 32637)
-	// txSizeCtx=1 (8x8/16x16), planeType=0
+	c.CoeffBaseEOB[0][1][3] = makeCDF(30595, 32206)
 	c.CoeffBaseEOB[1][0][0] = makeCDF(15239, 29932)
 	c.CoeffBaseEOB[1][0][1] = makeCDF(31315, 32095)
 	c.CoeffBaseEOB[1][0][2] = makeCDF(32130, 32434)
-	// txSizeCtx=1, planeType=1
+	c.CoeffBaseEOB[1][0][3] = makeCDF(30864, 31996)
 	c.CoeffBaseEOB[1][1][0] = makeCDF(26279, 30968)
 	c.CoeffBaseEOB[1][1][1] = makeCDF(31142, 32495)
 	c.CoeffBaseEOB[1][1][2] = makeCDF(31713, 32540)
-	// txSizeCtx=2 (32x32+), planeType=0 — dav1d txSzCtx=3
-	c.CoeffBaseEOB[2][0][0] = makeCDF(1044, 2257)
-	c.CoeffBaseEOB[2][0][1] = makeCDF(30755, 31923)
-	c.CoeffBaseEOB[2][0][2] = makeCDF(32208, 32693)
-	// txSizeCtx=2, planeType=1
-	c.CoeffBaseEOB[2][1][0] = makeCDF(21317, 26207)
-	c.CoeffBaseEOB[2][1][1] = makeCDF(29133, 30868)
-	c.CoeffBaseEOB[2][1][2] = makeCDF(29311, 31231)
+	c.CoeffBaseEOB[1][1][3] = makeCDF(31929, 32594)
+	c.CoeffBaseEOB[2][0][0] = makeCDF(2644, 25198)
+	c.CoeffBaseEOB[2][0][1] = makeCDF(32038, 32451)
+	c.CoeffBaseEOB[2][0][2] = makeCDF(32639, 32695)
+	c.CoeffBaseEOB[2][0][3] = makeCDF(32166, 32518)
+	c.CoeffBaseEOB[2][1][0] = makeCDF(17187, 27668)
+	c.CoeffBaseEOB[2][1][1] = makeCDF(31714, 32550)
+	c.CoeffBaseEOB[2][1][2] = makeCDF(32283, 32678)
+	c.CoeffBaseEOB[2][1][3] = makeCDF(31930, 32563)
+	c.CoeffBaseEOB[3][0][0] = makeCDF(1044, 2257)
+	c.CoeffBaseEOB[3][0][1] = makeCDF(30755, 31923)
+	c.CoeffBaseEOB[3][0][2] = makeCDF(32208, 32693)
+	c.CoeffBaseEOB[3][0][3] = makeCDF(32244, 32615)
+	c.CoeffBaseEOB[3][1][0] = makeCDF(21317, 26207)
+	c.CoeffBaseEOB[3][1][1] = makeCDF(29133, 30868)
+	c.CoeffBaseEOB[3][1][2] = makeCDF(29311, 31231)
+	c.CoeffBaseEOB[3][1][3] = makeCDF(29657, 31087)
+	c.CoeffBaseEOB[4][0][0] = makeCDF(478, 1834)
+	c.CoeffBaseEOB[4][0][1] = makeCDF(31005, 31987)
+	c.CoeffBaseEOB[4][0][2] = makeCDF(32317, 32724)
+	c.CoeffBaseEOB[4][0][3] = makeCDF(30865, 32648)
+	c.CoeffBaseEOB[4][1][0] = makeCDF(10923, 21845)
+	c.CoeffBaseEOB[4][1][1] = makeCDF(10923, 21845)
+	c.CoeffBaseEOB[4][1][2] = makeCDF(10923, 21845)
+	c.CoeffBaseEOB[4][1][3] = makeCDF(10923, 21845)
 }
 
+// base_tok: 410 entries (expect 410)
 func initCoeffBaseCDFs(c *CDFTables) {
-	// dav1d Q1 base_tok: [5 txSzCtx][2 planeType][41 ctx], 4 symbols.
-	// Our [3 txSizeCtx][2 planeType][41 ctx].
-	// txSizeCtx=0 (4x4) — dav1d txSzCtx=0, pt=0
-	coeffBase0 := [41][3]uint16{
-		{6041, 11854, 15927}, {20326, 30905, 32251}, {14164, 26831, 30725},
-		{9760, 20647, 26585}, {6416, 14953, 21219}, {2966, 7151, 10891},
-		{23567, 31374, 32254}, {14978, 27416, 30946}, {9434, 20225, 26254},
-		{6658, 14558, 20535}, {3916, 8677, 12989}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576}, {8192, 16384, 24576},
-		{18088, 29545, 31587}, {13062, 25843, 30073}, {8940, 16827, 22251},
-		{7654, 13220, 17973}, {5733, 10316, 14456}, {22879, 31388, 32114},
-		{15215, 27993, 30955}, {9397, 19445, 24978}, {3442, 9813, 15344},
-		{1368, 3936, 6532}, {25494, 32033, 32406}, {16772, 27963, 30718},
-		{9419, 18165, 23260}, {2677, 7501, 11797}, {1516, 4344, 7170},
-		{26556, 31454, 32101}, {17128, 27035, 30108}, {8324, 15344, 20249},
-		{1903, 5696, 9469}, {8192, 16384, 24576},
-	}
-	for ctx := 0; ctx < 41; ctx++ {
-		c.CoeffBase[0][0][ctx] = makeCDF(coeffBase0[ctx][0], coeffBase0[ctx][1], coeffBase0[ctx][2])
-		c.CoeffBase[0][1][ctx] = makeCDF(12160, 23040, 28928) // chroma: uniform fallback
-	}
-
-	// txSizeCtx=1 (8x8/16x16) — dav1d txSzCtx=1, pt=0
-	coeffBase1 := [41][3]uint16{
-		{6779, 13743, 17678}, {24806, 31797, 32457}, {17616, 29047, 31372},
-		{11063, 23175, 28003}, {6521, 16110, 22324}, {2764, 7504, 11654},
-		{25266, 32367, 32637}, {19054, 30553, 32175}, {12139, 25212, 29807},
-		{7311, 18162, 24704}, {3397, 9164, 14074}, {25988, 32208, 32522},
-		{16253, 28912, 31526}, {9151, 21387, 27372}, {5688, 14915, 21496},
-		{2717, 7627, 12004}, {23144, 31855, 32443}, {16070, 28491, 31325},
-		{8702, 20467, 26517}, {5243, 13956, 20367}, {2621, 7335, 11567},
-		{26636, 32340, 32630}, {19990, 31050, 32341}, {13243, 26105, 30315},
-		{8588, 19521, 25918}, {4717, 11585, 17304}, {25844, 32292, 32582},
-		{19090, 30635, 32097}, {11963, 24546, 28939}, {6218, 16087, 22354},
-		{2340, 6608, 10426}, {28046, 32576, 32694}, {21178, 31313, 32296},
-		{13486, 26184, 29870}, {7149, 17871, 23723}, {2833, 7958, 12259},
-		{27710, 32528, 32686}, {20674, 31076, 32268}, {12413, 24955, 29243},
-		{6676, 16927, 23097}, {2966, 8333, 12919},
-	}
-	for ctx := 0; ctx < 41; ctx++ {
-		c.CoeffBase[1][0][ctx] = makeCDF(coeffBase1[ctx][0], coeffBase1[ctx][1], coeffBase1[ctx][2])
-		c.CoeffBase[1][1][ctx] = makeCDF(12160, 23040, 28928)
-	}
-
-	// txSizeCtx=2 (32x32+) — dav1d txSzCtx=3, pt=0
-	coeffBase2 := [41][3]uint16{
-		{3078, 6839, 9890}, {13837, 20450, 24479}, {5914, 14222, 19328},
-		{3866, 10267, 14762}, {2612, 7208, 11042}, {1067, 2991, 4776},
-		{25817, 31646, 32529}, {13708, 26338, 30385}, {7328, 18585, 24870},
-		{4691, 13080, 19276}, {1825, 5253, 8352}, {29386, 32315, 32624},
-		{17160, 29001, 31360}, {9602, 21862, 27396}, {5915, 15772, 22148},
-		{2786, 7779, 12047}, {29246, 32450, 32663}, {18696, 29929, 31818},
-		{10510, 23369, 28560}, {6229, 16499, 23125}, {2608, 7448, 11705},
-		{30753, 32710, 32748}, {21638, 31487, 32503}, {12937, 26854, 30870},
-		{8182, 20596, 26970}, {3637, 10269, 15497}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576}, {8192, 16384, 24576},
-		{8192, 16384, 24576}, {8192, 16384, 24576},
-	}
-	for ctx := 0; ctx < 41; ctx++ {
-		c.CoeffBase[2][0][ctx] = makeCDF(coeffBase2[ctx][0], coeffBase2[ctx][1], coeffBase2[ctx][2])
-		c.CoeffBase[2][1][ctx] = makeCDF(12160, 23040, 28928)
-	}
+	c.CoeffBase[0][0][0] = makeCDF(6041, 11854, 15927)
+	c.CoeffBase[0][0][1] = makeCDF(20326, 30905, 32251)
+	c.CoeffBase[0][0][2] = makeCDF(14164, 26831, 30725)
+	c.CoeffBase[0][0][3] = makeCDF(9760, 20647, 26585)
+	c.CoeffBase[0][0][4] = makeCDF(6416, 14953, 21219)
+	c.CoeffBase[0][0][5] = makeCDF(2966, 7151, 10891)
+	c.CoeffBase[0][0][6] = makeCDF(23567, 31374, 32254)
+	c.CoeffBase[0][0][7] = makeCDF(14978, 27416, 30946)
+	c.CoeffBase[0][0][8] = makeCDF(9434, 20225, 26254)
+	c.CoeffBase[0][0][9] = makeCDF(6658, 14558, 20535)
+	c.CoeffBase[0][0][10] = makeCDF(3916, 8677, 12989)
+	c.CoeffBase[0][0][11] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][12] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][13] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][14] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][15] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][16] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][17] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][18] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][19] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][20] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][0][21] = makeCDF(18088, 29545, 31587)
+	c.CoeffBase[0][0][22] = makeCDF(13062, 25843, 30073)
+	c.CoeffBase[0][0][23] = makeCDF(8940, 16827, 22251)
+	c.CoeffBase[0][0][24] = makeCDF(7654, 13220, 17973)
+	c.CoeffBase[0][0][25] = makeCDF(5733, 10316, 14456)
+	c.CoeffBase[0][0][26] = makeCDF(22879, 31388, 32114)
+	c.CoeffBase[0][0][27] = makeCDF(15215, 27993, 30955)
+	c.CoeffBase[0][0][28] = makeCDF(9397, 19445, 24978)
+	c.CoeffBase[0][0][29] = makeCDF(3442, 9813, 15344)
+	c.CoeffBase[0][0][30] = makeCDF(1368, 3936, 6532)
+	c.CoeffBase[0][0][31] = makeCDF(25494, 32033, 32406)
+	c.CoeffBase[0][0][32] = makeCDF(16772, 27963, 30718)
+	c.CoeffBase[0][0][33] = makeCDF(9419, 18165, 23260)
+	c.CoeffBase[0][0][34] = makeCDF(2677, 7501, 11797)
+	c.CoeffBase[0][0][35] = makeCDF(1516, 4344, 7170)
+	c.CoeffBase[0][0][36] = makeCDF(26556, 31454, 32101)
+	c.CoeffBase[0][0][37] = makeCDF(17128, 27035, 30108)
+	c.CoeffBase[0][0][38] = makeCDF(8324, 15344, 20249)
+	c.CoeffBase[0][0][39] = makeCDF(1903, 5696, 9469)
+	c.CoeffBase[0][0][40] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][0] = makeCDF(8455, 19003, 24368)
+	c.CoeffBase[0][1][1] = makeCDF(23563, 32021, 32604)
+	c.CoeffBase[0][1][2] = makeCDF(16237, 29446, 31935)
+	c.CoeffBase[0][1][3] = makeCDF(10724, 23999, 29358)
+	c.CoeffBase[0][1][4] = makeCDF(6725, 17528, 24416)
+	c.CoeffBase[0][1][5] = makeCDF(3927, 10927, 16825)
+	c.CoeffBase[0][1][6] = makeCDF(26313, 32288, 32634)
+	c.CoeffBase[0][1][7] = makeCDF(17430, 30095, 32095)
+	c.CoeffBase[0][1][8] = makeCDF(11116, 24606, 29679)
+	c.CoeffBase[0][1][9] = makeCDF(7195, 18384, 25269)
+	c.CoeffBase[0][1][10] = makeCDF(4726, 12852, 19315)
+	c.CoeffBase[0][1][11] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][12] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][13] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][14] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][15] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][16] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][17] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][18] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][19] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][20] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[0][1][21] = makeCDF(22822, 31648, 32483)
+	c.CoeffBase[0][1][22] = makeCDF(16724, 29633, 31929)
+	c.CoeffBase[0][1][23] = makeCDF(10261, 23033, 28725)
+	c.CoeffBase[0][1][24] = makeCDF(7029, 17840, 24528)
+	c.CoeffBase[0][1][25] = makeCDF(4867, 13886, 21502)
+	c.CoeffBase[0][1][26] = makeCDF(25298, 31892, 32491)
+	c.CoeffBase[0][1][27] = makeCDF(17809, 29330, 31512)
+	c.CoeffBase[0][1][28] = makeCDF(9668, 21329, 26579)
+	c.CoeffBase[0][1][29] = makeCDF(4774, 12956, 18976)
+	c.CoeffBase[0][1][30] = makeCDF(2322, 7030, 11540)
+	c.CoeffBase[0][1][31] = makeCDF(25472, 31920, 32543)
+	c.CoeffBase[0][1][32] = makeCDF(17957, 29387, 31632)
+	c.CoeffBase[0][1][33] = makeCDF(9196, 20593, 26400)
+	c.CoeffBase[0][1][34] = makeCDF(4680, 12705, 19202)
+	c.CoeffBase[0][1][35] = makeCDF(2917, 8456, 13436)
+	c.CoeffBase[0][1][36] = makeCDF(26471, 32059, 32574)
+	c.CoeffBase[0][1][37] = makeCDF(18458, 29783, 31909)
+	c.CoeffBase[0][1][38] = makeCDF(8400, 19464, 25956)
+	c.CoeffBase[0][1][39] = makeCDF(3812, 10973, 17206)
+	c.CoeffBase[0][1][40] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[1][0][0] = makeCDF(6779, 13743, 17678)
+	c.CoeffBase[1][0][1] = makeCDF(24806, 31797, 32457)
+	c.CoeffBase[1][0][2] = makeCDF(17616, 29047, 31372)
+	c.CoeffBase[1][0][3] = makeCDF(11063, 23175, 28003)
+	c.CoeffBase[1][0][4] = makeCDF(6521, 16110, 22324)
+	c.CoeffBase[1][0][5] = makeCDF(2764, 7504, 11654)
+	c.CoeffBase[1][0][6] = makeCDF(25266, 32367, 32637)
+	c.CoeffBase[1][0][7] = makeCDF(19054, 30553, 32175)
+	c.CoeffBase[1][0][8] = makeCDF(12139, 25212, 29807)
+	c.CoeffBase[1][0][9] = makeCDF(7311, 18162, 24704)
+	c.CoeffBase[1][0][10] = makeCDF(3397, 9164, 14074)
+	c.CoeffBase[1][0][11] = makeCDF(25988, 32208, 32522)
+	c.CoeffBase[1][0][12] = makeCDF(16253, 28912, 31526)
+	c.CoeffBase[1][0][13] = makeCDF(9151, 21387, 27372)
+	c.CoeffBase[1][0][14] = makeCDF(5688, 14915, 21496)
+	c.CoeffBase[1][0][15] = makeCDF(2717, 7627, 12004)
+	c.CoeffBase[1][0][16] = makeCDF(23144, 31855, 32443)
+	c.CoeffBase[1][0][17] = makeCDF(16070, 28491, 31325)
+	c.CoeffBase[1][0][18] = makeCDF(8702, 20467, 26517)
+	c.CoeffBase[1][0][19] = makeCDF(5243, 13956, 20367)
+	c.CoeffBase[1][0][20] = makeCDF(2621, 7335, 11567)
+	c.CoeffBase[1][0][21] = makeCDF(26636, 32340, 32630)
+	c.CoeffBase[1][0][22] = makeCDF(19990, 31050, 32341)
+	c.CoeffBase[1][0][23] = makeCDF(13243, 26105, 30315)
+	c.CoeffBase[1][0][24] = makeCDF(8588, 19521, 25918)
+	c.CoeffBase[1][0][25] = makeCDF(4717, 11585, 17304)
+	c.CoeffBase[1][0][26] = makeCDF(25844, 32292, 32582)
+	c.CoeffBase[1][0][27] = makeCDF(19090, 30635, 32097)
+	c.CoeffBase[1][0][28] = makeCDF(11963, 24546, 28939)
+	c.CoeffBase[1][0][29] = makeCDF(6218, 16087, 22354)
+	c.CoeffBase[1][0][30] = makeCDF(2340, 6608, 10426)
+	c.CoeffBase[1][0][31] = makeCDF(28046, 32576, 32694)
+	c.CoeffBase[1][0][32] = makeCDF(21178, 31313, 32296)
+	c.CoeffBase[1][0][33] = makeCDF(13486, 26184, 29870)
+	c.CoeffBase[1][0][34] = makeCDF(7149, 17871, 23723)
+	c.CoeffBase[1][0][35] = makeCDF(2833, 7958, 12259)
+	c.CoeffBase[1][0][36] = makeCDF(27710, 32528, 32686)
+	c.CoeffBase[1][0][37] = makeCDF(20674, 31076, 32268)
+	c.CoeffBase[1][0][38] = makeCDF(12413, 24955, 29243)
+	c.CoeffBase[1][0][39] = makeCDF(6676, 16927, 23097)
+	c.CoeffBase[1][0][40] = makeCDF(2966, 8333, 12919)
+	c.CoeffBase[1][1][0] = makeCDF(8639, 19339, 24429)
+	c.CoeffBase[1][1][1] = makeCDF(24404, 31837, 32525)
+	c.CoeffBase[1][1][2] = makeCDF(16997, 29425, 31784)
+	c.CoeffBase[1][1][3] = makeCDF(11253, 24234, 29149)
+	c.CoeffBase[1][1][4] = makeCDF(6751, 17394, 24028)
+	c.CoeffBase[1][1][5] = makeCDF(3490, 9830, 15191)
+	c.CoeffBase[1][1][6] = makeCDF(26283, 32471, 32714)
+	c.CoeffBase[1][1][7] = makeCDF(19599, 31168, 32442)
+	c.CoeffBase[1][1][8] = makeCDF(13146, 26954, 30893)
+	c.CoeffBase[1][1][9] = makeCDF(8214, 20588, 26890)
+	c.CoeffBase[1][1][10] = makeCDF(4699, 13081, 19300)
+	c.CoeffBase[1][1][11] = makeCDF(28212, 32458, 32669)
+	c.CoeffBase[1][1][12] = makeCDF(18594, 30316, 32100)
+	c.CoeffBase[1][1][13] = makeCDF(11219, 24408, 29234)
+	c.CoeffBase[1][1][14] = makeCDF(6865, 17656, 24149)
+	c.CoeffBase[1][1][15] = makeCDF(3678, 10362, 16006)
+	c.CoeffBase[1][1][16] = makeCDF(25825, 32136, 32616)
+	c.CoeffBase[1][1][17] = makeCDF(17313, 29853, 32021)
+	c.CoeffBase[1][1][18] = makeCDF(11197, 24471, 29472)
+	c.CoeffBase[1][1][19] = makeCDF(6947, 17781, 24405)
+	c.CoeffBase[1][1][20] = makeCDF(3768, 10660, 16261)
+	c.CoeffBase[1][1][21] = makeCDF(27352, 32500, 32706)
+	c.CoeffBase[1][1][22] = makeCDF(20850, 31468, 32469)
+	c.CoeffBase[1][1][23] = makeCDF(14021, 27707, 31133)
+	c.CoeffBase[1][1][24] = makeCDF(8964, 21748, 27838)
+	c.CoeffBase[1][1][25] = makeCDF(5437, 14665, 21187)
+	c.CoeffBase[1][1][26] = makeCDF(26304, 32492, 32698)
+	c.CoeffBase[1][1][27] = makeCDF(20409, 31380, 32385)
+	c.CoeffBase[1][1][28] = makeCDF(13682, 27222, 30632)
+	c.CoeffBase[1][1][29] = makeCDF(8974, 21236, 26685)
+	c.CoeffBase[1][1][30] = makeCDF(4234, 11665, 16934)
+	c.CoeffBase[1][1][31] = makeCDF(26273, 32357, 32711)
+	c.CoeffBase[1][1][32] = makeCDF(20672, 31242, 32441)
+	c.CoeffBase[1][1][33] = makeCDF(14172, 27254, 30902)
+	c.CoeffBase[1][1][34] = makeCDF(9870, 21898, 27275)
+	c.CoeffBase[1][1][35] = makeCDF(5164, 13506, 19270)
+	c.CoeffBase[1][1][36] = makeCDF(26725, 32459, 32728)
+	c.CoeffBase[1][1][37] = makeCDF(20991, 31442, 32527)
+	c.CoeffBase[1][1][38] = makeCDF(13071, 26434, 30811)
+	c.CoeffBase[1][1][39] = makeCDF(8184, 20090, 26742)
+	c.CoeffBase[1][1][40] = makeCDF(4803, 13255, 19895)
+	c.CoeffBase[2][0][0] = makeCDF(7555, 14942, 18501)
+	c.CoeffBase[2][0][1] = makeCDF(24410, 31178, 32287)
+	c.CoeffBase[2][0][2] = makeCDF(14394, 26738, 30253)
+	c.CoeffBase[2][0][3] = makeCDF(8413, 19554, 25195)
+	c.CoeffBase[2][0][4] = makeCDF(4766, 12924, 18785)
+	c.CoeffBase[2][0][5] = makeCDF(2029, 5806, 9207)
+	c.CoeffBase[2][0][6] = makeCDF(26776, 32364, 32663)
+	c.CoeffBase[2][0][7] = makeCDF(18732, 29967, 31931)
+	c.CoeffBase[2][0][8] = makeCDF(11005, 23786, 28852)
+	c.CoeffBase[2][0][9] = makeCDF(6466, 16909, 23510)
+	c.CoeffBase[2][0][10] = makeCDF(3044, 8638, 13419)
+	c.CoeffBase[2][0][11] = makeCDF(29208, 32582, 32704)
+	c.CoeffBase[2][0][12] = makeCDF(20068, 30857, 32208)
+	c.CoeffBase[2][0][13] = makeCDF(12003, 25085, 29595)
+	c.CoeffBase[2][0][14] = makeCDF(6947, 17750, 24189)
+	c.CoeffBase[2][0][15] = makeCDF(3245, 9103, 14007)
+	c.CoeffBase[2][0][16] = makeCDF(27359, 32465, 32669)
+	c.CoeffBase[2][0][17] = makeCDF(19421, 30614, 32174)
+	c.CoeffBase[2][0][18] = makeCDF(11915, 25010, 29579)
+	c.CoeffBase[2][0][19] = makeCDF(6950, 17676, 24074)
+	c.CoeffBase[2][0][20] = makeCDF(3007, 8473, 13096)
+	c.CoeffBase[2][0][21] = makeCDF(29002, 32676, 32735)
+	c.CoeffBase[2][0][22] = makeCDF(22102, 31849, 32576)
+	c.CoeffBase[2][0][23] = makeCDF(14408, 28009, 31405)
+	c.CoeffBase[2][0][24] = makeCDF(9027, 21679, 27931)
+	c.CoeffBase[2][0][25] = makeCDF(4694, 12678, 18748)
+	c.CoeffBase[2][0][26] = makeCDF(28216, 32528, 32682)
+	c.CoeffBase[2][0][27] = makeCDF(20849, 31264, 32318)
+	c.CoeffBase[2][0][28] = makeCDF(12756, 25815, 29751)
+	c.CoeffBase[2][0][29] = makeCDF(7565, 18801, 24923)
+	c.CoeffBase[2][0][30] = makeCDF(3509, 9533, 14477)
+	c.CoeffBase[2][0][31] = makeCDF(30133, 32687, 32739)
+	c.CoeffBase[2][0][32] = makeCDF(23063, 31910, 32515)
+	c.CoeffBase[2][0][33] = makeCDF(14588, 28051, 31132)
+	c.CoeffBase[2][0][34] = makeCDF(9085, 21649, 27457)
+	c.CoeffBase[2][0][35] = makeCDF(4261, 11654, 17264)
+	c.CoeffBase[2][0][36] = makeCDF(29518, 32691, 32748)
+	c.CoeffBase[2][0][37] = makeCDF(22451, 31959, 32613)
+	c.CoeffBase[2][0][38] = makeCDF(14864, 28722, 31700)
+	c.CoeffBase[2][0][39] = makeCDF(9695, 22964, 28716)
+	c.CoeffBase[2][0][40] = makeCDF(4932, 13358, 19502)
+	c.CoeffBase[2][1][0] = makeCDF(6465, 16958, 21688)
+	c.CoeffBase[2][1][1] = makeCDF(25199, 31514, 32360)
+	c.CoeffBase[2][1][2] = makeCDF(14774, 27149, 30607)
+	c.CoeffBase[2][1][3] = makeCDF(9257, 21438, 26972)
+	c.CoeffBase[2][1][4] = makeCDF(5723, 15183, 21882)
+	c.CoeffBase[2][1][5] = makeCDF(3150, 8879, 13731)
+	c.CoeffBase[2][1][6] = makeCDF(26989, 32262, 32682)
+	c.CoeffBase[2][1][7] = makeCDF(17396, 29937, 32085)
+	c.CoeffBase[2][1][8] = makeCDF(11387, 24901, 29784)
+	c.CoeffBase[2][1][9] = makeCDF(7289, 18821, 25548)
+	c.CoeffBase[2][1][10] = makeCDF(3734, 10577, 16086)
+	c.CoeffBase[2][1][11] = makeCDF(29728, 32501, 32695)
+	c.CoeffBase[2][1][12] = makeCDF(17431, 29701, 31903)
+	c.CoeffBase[2][1][13] = makeCDF(9921, 22826, 28300)
+	c.CoeffBase[2][1][14] = makeCDF(5896, 15434, 22068)
+	c.CoeffBase[2][1][15] = makeCDF(3430, 9646, 14757)
+	c.CoeffBase[2][1][16] = makeCDF(28614, 32511, 32705)
+	c.CoeffBase[2][1][17] = makeCDF(19364, 30638, 32263)
+	c.CoeffBase[2][1][18] = makeCDF(13129, 26254, 30402)
+	c.CoeffBase[2][1][19] = makeCDF(8754, 20484, 26440)
+	c.CoeffBase[2][1][20] = makeCDF(4378, 11607, 17110)
+	c.CoeffBase[2][1][21] = makeCDF(30292, 32671, 32744)
+	c.CoeffBase[2][1][22] = makeCDF(21780, 31603, 32501)
+	c.CoeffBase[2][1][23] = makeCDF(14314, 27829, 31291)
+	c.CoeffBase[2][1][24] = makeCDF(9611, 22327, 28263)
+	c.CoeffBase[2][1][25] = makeCDF(4890, 13087, 19065)
+	c.CoeffBase[2][1][26] = makeCDF(25862, 32567, 32733)
+	c.CoeffBase[2][1][27] = makeCDF(20794, 32050, 32567)
+	c.CoeffBase[2][1][28] = makeCDF(17243, 30625, 32254)
+	c.CoeffBase[2][1][29] = makeCDF(13283, 27628, 31474)
+	c.CoeffBase[2][1][30] = makeCDF(9669, 22532, 28918)
+	c.CoeffBase[2][1][31] = makeCDF(27435, 32697, 32748)
+	c.CoeffBase[2][1][32] = makeCDF(24922, 32390, 32714)
+	c.CoeffBase[2][1][33] = makeCDF(21449, 31504, 32536)
+	c.CoeffBase[2][1][34] = makeCDF(16392, 29729, 31832)
+	c.CoeffBase[2][1][35] = makeCDF(11692, 24884, 29076)
+	c.CoeffBase[2][1][36] = makeCDF(24193, 32290, 32735)
+	c.CoeffBase[2][1][37] = makeCDF(18909, 31104, 32563)
+	c.CoeffBase[2][1][38] = makeCDF(12236, 26841, 31403)
+	c.CoeffBase[2][1][39] = makeCDF(8171, 21840, 29082)
+	c.CoeffBase[2][1][40] = makeCDF(7224, 17280, 25275)
+	c.CoeffBase[3][0][0] = makeCDF(3078, 6839, 9890)
+	c.CoeffBase[3][0][1] = makeCDF(13837, 20450, 24479)
+	c.CoeffBase[3][0][2] = makeCDF(5914, 14222, 19328)
+	c.CoeffBase[3][0][3] = makeCDF(3866, 10267, 14762)
+	c.CoeffBase[3][0][4] = makeCDF(2612, 7208, 11042)
+	c.CoeffBase[3][0][5] = makeCDF(1067, 2991, 4776)
+	c.CoeffBase[3][0][6] = makeCDF(25817, 31646, 32529)
+	c.CoeffBase[3][0][7] = makeCDF(13708, 26338, 30385)
+	c.CoeffBase[3][0][8] = makeCDF(7328, 18585, 24870)
+	c.CoeffBase[3][0][9] = makeCDF(4691, 13080, 19276)
+	c.CoeffBase[3][0][10] = makeCDF(1825, 5253, 8352)
+	c.CoeffBase[3][0][11] = makeCDF(29386, 32315, 32624)
+	c.CoeffBase[3][0][12] = makeCDF(17160, 29001, 31360)
+	c.CoeffBase[3][0][13] = makeCDF(9602, 21862, 27396)
+	c.CoeffBase[3][0][14] = makeCDF(5915, 15772, 22148)
+	c.CoeffBase[3][0][15] = makeCDF(2786, 7779, 12047)
+	c.CoeffBase[3][0][16] = makeCDF(29246, 32450, 32663)
+	c.CoeffBase[3][0][17] = makeCDF(18696, 29929, 31818)
+	c.CoeffBase[3][0][18] = makeCDF(10510, 23369, 28560)
+	c.CoeffBase[3][0][19] = makeCDF(6229, 16499, 23125)
+	c.CoeffBase[3][0][20] = makeCDF(2608, 7448, 11705)
+	c.CoeffBase[3][0][21] = makeCDF(30753, 32710, 32748)
+	c.CoeffBase[3][0][22] = makeCDF(21638, 31487, 32503)
+	c.CoeffBase[3][0][23] = makeCDF(12937, 26854, 30870)
+	c.CoeffBase[3][0][24] = makeCDF(8182, 20596, 26970)
+	c.CoeffBase[3][0][25] = makeCDF(3637, 10269, 15497)
+	c.CoeffBase[3][0][26] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][27] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][28] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][29] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][30] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][31] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][32] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][33] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][34] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][35] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][36] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][37] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][38] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][39] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][0][40] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][0] = makeCDF(5244, 12150, 16906)
+	c.CoeffBase[3][1][1] = makeCDF(20486, 26858, 29701)
+	c.CoeffBase[3][1][2] = makeCDF(7756, 18317, 23735)
+	c.CoeffBase[3][1][3] = makeCDF(3452, 9256, 13146)
+	c.CoeffBase[3][1][4] = makeCDF(2020, 5206, 8229)
+	c.CoeffBase[3][1][5] = makeCDF(1801, 4993, 7903)
+	c.CoeffBase[3][1][6] = makeCDF(27051, 31858, 32531)
+	c.CoeffBase[3][1][7] = makeCDF(15988, 27531, 30619)
+	c.CoeffBase[3][1][8] = makeCDF(9188, 21484, 26719)
+	c.CoeffBase[3][1][9] = makeCDF(6273, 17186, 23800)
+	c.CoeffBase[3][1][10] = makeCDF(3108, 9355, 14764)
+	c.CoeffBase[3][1][11] = makeCDF(31076, 32520, 32680)
+	c.CoeffBase[3][1][12] = makeCDF(18119, 30037, 31850)
+	c.CoeffBase[3][1][13] = makeCDF(10244, 22969, 27472)
+	c.CoeffBase[3][1][14] = makeCDF(4692, 14077, 19273)
+	c.CoeffBase[3][1][15] = makeCDF(3694, 11677, 17556)
+	c.CoeffBase[3][1][16] = makeCDF(30060, 32581, 32720)
+	c.CoeffBase[3][1][17] = makeCDF(21011, 30775, 32120)
+	c.CoeffBase[3][1][18] = makeCDF(11931, 24820, 29289)
+	c.CoeffBase[3][1][19] = makeCDF(7119, 17662, 24356)
+	c.CoeffBase[3][1][20] = makeCDF(3833, 10706, 16304)
+	c.CoeffBase[3][1][21] = makeCDF(31954, 32731, 32748)
+	c.CoeffBase[3][1][22] = makeCDF(23913, 31724, 32489)
+	c.CoeffBase[3][1][23] = makeCDF(15520, 28060, 31286)
+	c.CoeffBase[3][1][24] = makeCDF(11517, 23008, 28571)
+	c.CoeffBase[3][1][25] = makeCDF(6193, 14508, 20629)
+	c.CoeffBase[3][1][26] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][27] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][28] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][29] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][30] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][31] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][32] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][33] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][34] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][35] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][36] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][37] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][38] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][39] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[3][1][40] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][0] = makeCDF(1035, 2807, 4156)
+	c.CoeffBase[4][0][1] = makeCDF(13162, 18138, 20939)
+	c.CoeffBase[4][0][2] = makeCDF(2696, 6633, 8755)
+	c.CoeffBase[4][0][3] = makeCDF(1373, 4161, 6853)
+	c.CoeffBase[4][0][4] = makeCDF(1099, 2746, 4716)
+	c.CoeffBase[4][0][5] = makeCDF(340, 1021, 1599)
+	c.CoeffBase[4][0][6] = makeCDF(22826, 30419, 32135)
+	c.CoeffBase[4][0][7] = makeCDF(10395, 21762, 26942)
+	c.CoeffBase[4][0][8] = makeCDF(4726, 12407, 17361)
+	c.CoeffBase[4][0][9] = makeCDF(2447, 7080, 10593)
+	c.CoeffBase[4][0][10] = makeCDF(1227, 3717, 6011)
+	c.CoeffBase[4][0][11] = makeCDF(28156, 31424, 31934)
+	c.CoeffBase[4][0][12] = makeCDF(16915, 27754, 30373)
+	c.CoeffBase[4][0][13] = makeCDF(9148, 20990, 26431)
+	c.CoeffBase[4][0][14] = makeCDF(5950, 15515, 21148)
+	c.CoeffBase[4][0][15] = makeCDF(2492, 7327, 11526)
+	c.CoeffBase[4][0][16] = makeCDF(30602, 32477, 32670)
+	c.CoeffBase[4][0][17] = makeCDF(20026, 29955, 31568)
+	c.CoeffBase[4][0][18] = makeCDF(11220, 23628, 28105)
+	c.CoeffBase[4][0][19] = makeCDF(6652, 17019, 22973)
+	c.CoeffBase[4][0][20] = makeCDF(3064, 8536, 13043)
+	c.CoeffBase[4][0][21] = makeCDF(31769, 32724, 32748)
+	c.CoeffBase[4][0][22] = makeCDF(22230, 30887, 32373)
+	c.CoeffBase[4][0][23] = makeCDF(12234, 25079, 29731)
+	c.CoeffBase[4][0][24] = makeCDF(7326, 18816, 25353)
+	c.CoeffBase[4][0][25] = makeCDF(3933, 10907, 16616)
+	c.CoeffBase[4][0][26] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][27] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][28] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][29] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][30] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][31] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][32] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][33] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][34] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][35] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][36] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][37] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][38] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][39] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][0][40] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][0] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][1] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][2] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][3] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][4] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][5] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][6] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][7] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][8] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][9] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][10] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][11] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][12] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][13] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][14] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][15] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][16] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][17] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][18] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][19] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][20] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][21] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][22] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][23] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][24] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][25] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][26] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][27] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][28] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][29] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][30] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][31] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][32] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][33] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][34] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][35] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][36] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][37] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][38] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][39] = makeCDF(8192, 16384, 24576)
+	c.CoeffBase[4][1][40] = makeCDF(8192, 16384, 24576)
 }
 
+// br_tok: 168 entries (expect 168)
 func initCoeffBaseRangeCDFs(c *CDFTables) {
-	// dav1d Q1 br_tok: [4 txSzCtx][2 planeType][21 ctx], 4 symbols.
-	// Our [3 txSizeCtx][21 ctx] uses planeType=0 (luma).
-	// txSizeCtx=0 (4x4) — dav1d txSzCtx=0, pt=0, idx 0-20
-	br0 := [21][3]uint16{
-		{14995, 21341, 24749}, {13158, 20289, 24601}, {8941, 15326, 19876},
-		{6297, 11541, 15807}, {4817, 9029, 12776}, {3731, 7273, 10627},
-		{1847, 3617, 5354}, {14472, 19659, 22343}, {16806, 24162, 27533},
-		{12900, 20404, 24713}, {9411, 16112, 20797}, {7056, 12697, 17148},
-		{5544, 10339, 14460}, {2954, 5704, 8319}, {12464, 18071, 21354},
-		{15482, 22528, 26034}, {12070, 19269, 23624}, {8953, 15406, 20106},
-		{7027, 12730, 17220}, {5887, 10913, 15140}, {3793, 7278, 10447},
-	}
-	for ctx := 0; ctx < 21; ctx++ {
-		c.CoeffBaseRange[0][0][ctx] = makeCDF(br0[ctx][0], br0[ctx][1], br0[ctx][2])
-		c.CoeffBaseRange[0][1][ctx] = makeCDF(8192, 16384, 24576)
-	}
-
-	// txSizeCtx=1 (8x8/16x16) — dav1d txSzCtx=1, pt=0, idx 42-62
-	br1 := [21][3]uint16{
-		{15571, 22232, 25749}, {14506, 21575, 25374}, {10189, 17089, 21569},
-		{7316, 13301, 17915}, {5783, 10912, 15190}, {4760, 9155, 13088},
-		{2993, 5966, 8774}, {23424, 28903, 30778}, {20775, 27666, 30290},
-		{16474, 24410, 28299}, {12471, 20180, 24987}, {9410, 16487, 21439},
-		{7536, 13614, 18529}, {5048, 9586, 13549}, {21090, 27290, 29756},
-		{20796, 27402, 30026}, {17819, 25485, 28969}, {13860, 21909, 26462},
-		{11002, 18494, 23529}, {8953, 15929, 20897}, {6448, 11918, 16454},
-	}
-	for ctx := 0; ctx < 21; ctx++ {
-		c.CoeffBaseRange[1][0][ctx] = makeCDF(br1[ctx][0], br1[ctx][1], br1[ctx][2])
-		c.CoeffBaseRange[1][1][ctx] = makeCDF(8192, 16384, 24576)
-	}
-
-	// txSizeCtx=2 (32x32+) — dav1d txSzCtx=3, pt=0, idx 126-146
-	br2 := [21][3]uint16{
-		{5705, 10930, 15725}, {7946, 12765, 16115}, {6801, 12123, 16226},
-		{5462, 10135, 14200}, {4189, 8011, 11507}, {3191, 6229, 9408},
-		{1057, 2137, 3212}, {10018, 17067, 21491}, {7380, 12582, 16453},
-		{6068, 10845, 14339}, {5098, 9198, 12555}, {4312, 8010, 11119},
-		{3700, 6966, 9781}, {1693, 3326, 4887}, {18757, 24930, 27774},
-		{17648, 24596, 27817}, {14707, 22052, 26026}, {11720, 18852, 23292},
-		{9357, 15952, 20525}, {7810, 13753, 18210}, {3879, 7333, 10328},
-	}
-	for ctx := 0; ctx < 21; ctx++ {
-		c.CoeffBaseRange[2][0][ctx] = makeCDF(br2[ctx][0], br2[ctx][1], br2[ctx][2])
-		c.CoeffBaseRange[2][1][ctx] = makeCDF(8192, 16384, 24576)
-	}
+	c.CoeffBaseRange[0][0][0] = makeCDF(14995, 21341, 24749)
+	c.CoeffBaseRange[0][0][1] = makeCDF(13158, 20289, 24601)
+	c.CoeffBaseRange[0][0][2] = makeCDF(8941, 15326, 19876)
+	c.CoeffBaseRange[0][0][3] = makeCDF(6297, 11541, 15807)
+	c.CoeffBaseRange[0][0][4] = makeCDF(4817, 9029, 12776)
+	c.CoeffBaseRange[0][0][5] = makeCDF(3731, 7273, 10627)
+	c.CoeffBaseRange[0][0][6] = makeCDF(1847, 3617, 5354)
+	c.CoeffBaseRange[0][0][7] = makeCDF(14472, 19659, 22343)
+	c.CoeffBaseRange[0][0][8] = makeCDF(16806, 24162, 27533)
+	c.CoeffBaseRange[0][0][9] = makeCDF(12900, 20404, 24713)
+	c.CoeffBaseRange[0][0][10] = makeCDF(9411, 16112, 20797)
+	c.CoeffBaseRange[0][0][11] = makeCDF(7056, 12697, 17148)
+	c.CoeffBaseRange[0][0][12] = makeCDF(5544, 10339, 14460)
+	c.CoeffBaseRange[0][0][13] = makeCDF(2954, 5704, 8319)
+	c.CoeffBaseRange[0][0][14] = makeCDF(12464, 18071, 21354)
+	c.CoeffBaseRange[0][0][15] = makeCDF(15482, 22528, 26034)
+	c.CoeffBaseRange[0][0][16] = makeCDF(12070, 19269, 23624)
+	c.CoeffBaseRange[0][0][17] = makeCDF(8953, 15406, 20106)
+	c.CoeffBaseRange[0][0][18] = makeCDF(7027, 12730, 17220)
+	c.CoeffBaseRange[0][0][19] = makeCDF(5887, 10913, 15140)
+	c.CoeffBaseRange[0][0][20] = makeCDF(3793, 7278, 10447)
+	c.CoeffBaseRange[0][1][0] = makeCDF(15571, 22232, 25749)
+	c.CoeffBaseRange[0][1][1] = makeCDF(14506, 21575, 25374)
+	c.CoeffBaseRange[0][1][2] = makeCDF(10189, 17089, 21569)
+	c.CoeffBaseRange[0][1][3] = makeCDF(7316, 13301, 17915)
+	c.CoeffBaseRange[0][1][4] = makeCDF(5783, 10912, 15190)
+	c.CoeffBaseRange[0][1][5] = makeCDF(4760, 9155, 13088)
+	c.CoeffBaseRange[0][1][6] = makeCDF(2993, 5966, 8774)
+	c.CoeffBaseRange[0][1][7] = makeCDF(23424, 28903, 30778)
+	c.CoeffBaseRange[0][1][8] = makeCDF(20775, 27666, 30290)
+	c.CoeffBaseRange[0][1][9] = makeCDF(16474, 24410, 28299)
+	c.CoeffBaseRange[0][1][10] = makeCDF(12471, 20180, 24987)
+	c.CoeffBaseRange[0][1][11] = makeCDF(9410, 16487, 21439)
+	c.CoeffBaseRange[0][1][12] = makeCDF(7536, 13614, 18529)
+	c.CoeffBaseRange[0][1][13] = makeCDF(5048, 9586, 13549)
+	c.CoeffBaseRange[0][1][14] = makeCDF(21090, 27290, 29756)
+	c.CoeffBaseRange[0][1][15] = makeCDF(20796, 27402, 30026)
+	c.CoeffBaseRange[0][1][16] = makeCDF(17819, 25485, 28969)
+	c.CoeffBaseRange[0][1][17] = makeCDF(13860, 21909, 26462)
+	c.CoeffBaseRange[0][1][18] = makeCDF(11002, 18494, 23529)
+	c.CoeffBaseRange[0][1][19] = makeCDF(8953, 15929, 20897)
+	c.CoeffBaseRange[0][1][20] = makeCDF(6448, 11918, 16454)
+	c.CoeffBaseRange[1][0][0] = makeCDF(15999, 22208, 25449)
+	c.CoeffBaseRange[1][0][1] = makeCDF(13050, 19988, 24122)
+	c.CoeffBaseRange[1][0][2] = makeCDF(8594, 14864, 19378)
+	c.CoeffBaseRange[1][0][3] = makeCDF(6033, 11079, 15238)
+	c.CoeffBaseRange[1][0][4] = makeCDF(4554, 8683, 12347)
+	c.CoeffBaseRange[1][0][5] = makeCDF(3672, 7139, 10337)
+	c.CoeffBaseRange[1][0][6] = makeCDF(1900, 3771, 5576)
+	c.CoeffBaseRange[1][0][7] = makeCDF(15788, 21340, 23949)
+	c.CoeffBaseRange[1][0][8] = makeCDF(16825, 24235, 27758)
+	c.CoeffBaseRange[1][0][9] = makeCDF(12873, 20402, 24810)
+	c.CoeffBaseRange[1][0][10] = makeCDF(9590, 16363, 21094)
+	c.CoeffBaseRange[1][0][11] = makeCDF(7352, 13209, 17733)
+	c.CoeffBaseRange[1][0][12] = makeCDF(5960, 10989, 15184)
+	c.CoeffBaseRange[1][0][13] = makeCDF(3232, 6234, 9007)
+	c.CoeffBaseRange[1][0][14] = makeCDF(15761, 20716, 23224)
+	c.CoeffBaseRange[1][0][15] = makeCDF(19318, 25989, 28759)
+	c.CoeffBaseRange[1][0][16] = makeCDF(15529, 23094, 26929)
+	c.CoeffBaseRange[1][0][17] = makeCDF(11662, 18989, 23641)
+	c.CoeffBaseRange[1][0][18] = makeCDF(8955, 15568, 20366)
+	c.CoeffBaseRange[1][0][19] = makeCDF(7281, 13106, 17708)
+	c.CoeffBaseRange[1][0][20] = makeCDF(4248, 8059, 11440)
+	c.CoeffBaseRange[1][1][0] = makeCDF(14899, 21217, 24503)
+	c.CoeffBaseRange[1][1][1] = makeCDF(13519, 20283, 24047)
+	c.CoeffBaseRange[1][1][2] = makeCDF(9429, 15966, 20365)
+	c.CoeffBaseRange[1][1][3] = makeCDF(6700, 12355, 16652)
+	c.CoeffBaseRange[1][1][4] = makeCDF(5088, 9704, 13716)
+	c.CoeffBaseRange[1][1][5] = makeCDF(4243, 8154, 11731)
+	c.CoeffBaseRange[1][1][6] = makeCDF(2702, 5364, 7861)
+	c.CoeffBaseRange[1][1][7] = makeCDF(22745, 28388, 30454)
+	c.CoeffBaseRange[1][1][8] = makeCDF(20235, 27146, 29922)
+	c.CoeffBaseRange[1][1][9] = makeCDF(15896, 23715, 27637)
+	c.CoeffBaseRange[1][1][10] = makeCDF(11840, 19350, 24131)
+	c.CoeffBaseRange[1][1][11] = makeCDF(9122, 15932, 20880)
+	c.CoeffBaseRange[1][1][12] = makeCDF(7488, 13581, 18362)
+	c.CoeffBaseRange[1][1][13] = makeCDF(5114, 9568, 13370)
+	c.CoeffBaseRange[1][1][14] = makeCDF(20845, 26553, 28932)
+	c.CoeffBaseRange[1][1][15] = makeCDF(20981, 27372, 29884)
+	c.CoeffBaseRange[1][1][16] = makeCDF(17781, 25335, 28785)
+	c.CoeffBaseRange[1][1][17] = makeCDF(13760, 21708, 26297)
+	c.CoeffBaseRange[1][1][18] = makeCDF(10975, 18415, 23365)
+	c.CoeffBaseRange[1][1][19] = makeCDF(9045, 15789, 20686)
+	c.CoeffBaseRange[1][1][20] = makeCDF(6130, 11199, 15423)
+	c.CoeffBaseRange[2][0][0] = makeCDF(13549, 19724, 23158)
+	c.CoeffBaseRange[2][0][1] = makeCDF(11844, 18382, 22246)
+	c.CoeffBaseRange[2][0][2] = makeCDF(7919, 13619, 17773)
+	c.CoeffBaseRange[2][0][3] = makeCDF(5486, 10143, 13946)
+	c.CoeffBaseRange[2][0][4] = makeCDF(4166, 7983, 11324)
+	c.CoeffBaseRange[2][0][5] = makeCDF(3364, 6506, 9427)
+	c.CoeffBaseRange[2][0][6] = makeCDF(1598, 3160, 4674)
+	c.CoeffBaseRange[2][0][7] = makeCDF(15281, 20979, 23781)
+	c.CoeffBaseRange[2][0][8] = makeCDF(14939, 22119, 25952)
+	c.CoeffBaseRange[2][0][9] = makeCDF(11363, 18407, 22812)
+	c.CoeffBaseRange[2][0][10] = makeCDF(8609, 14857, 19370)
+	c.CoeffBaseRange[2][0][11] = makeCDF(6737, 12184, 16480)
+	c.CoeffBaseRange[2][0][12] = makeCDF(5506, 10263, 14262)
+	c.CoeffBaseRange[2][0][13] = makeCDF(2990, 5786, 8380)
+	c.CoeffBaseRange[2][0][14] = makeCDF(20249, 25253, 27417)
+	c.CoeffBaseRange[2][0][15] = makeCDF(21070, 27518, 30001)
+	c.CoeffBaseRange[2][0][16] = makeCDF(16854, 24469, 28074)
+	c.CoeffBaseRange[2][0][17] = makeCDF(12864, 20486, 25000)
+	c.CoeffBaseRange[2][0][18] = makeCDF(9962, 16978, 21778)
+	c.CoeffBaseRange[2][0][19] = makeCDF(8074, 14338, 19048)
+	c.CoeffBaseRange[2][0][20] = makeCDF(4494, 8479, 11906)
+	c.CoeffBaseRange[2][1][0] = makeCDF(13960, 19617, 22829)
+	c.CoeffBaseRange[2][1][1] = makeCDF(11150, 17341, 21228)
+	c.CoeffBaseRange[2][1][2] = makeCDF(7150, 12964, 17190)
+	c.CoeffBaseRange[2][1][3] = makeCDF(5331, 10002, 13867)
+	c.CoeffBaseRange[2][1][4] = makeCDF(4167, 7744, 11057)
+	c.CoeffBaseRange[2][1][5] = makeCDF(3480, 6629, 9646)
+	c.CoeffBaseRange[2][1][6] = makeCDF(1883, 3784, 5686)
+	c.CoeffBaseRange[2][1][7] = makeCDF(18752, 25660, 28912)
+	c.CoeffBaseRange[2][1][8] = makeCDF(16968, 24586, 28030)
+	c.CoeffBaseRange[2][1][9] = makeCDF(13520, 21055, 25313)
+	c.CoeffBaseRange[2][1][10] = makeCDF(10453, 17626, 22280)
+	c.CoeffBaseRange[2][1][11] = makeCDF(8386, 14505, 19116)
+	c.CoeffBaseRange[2][1][12] = makeCDF(6742, 12595, 17008)
+	c.CoeffBaseRange[2][1][13] = makeCDF(4273, 8140, 11499)
+	c.CoeffBaseRange[2][1][14] = makeCDF(22120, 27827, 30233)
+	c.CoeffBaseRange[2][1][15] = makeCDF(20563, 27358, 29895)
+	c.CoeffBaseRange[2][1][16] = makeCDF(17076, 24644, 28153)
+	c.CoeffBaseRange[2][1][17] = makeCDF(13362, 20942, 25309)
+	c.CoeffBaseRange[2][1][18] = makeCDF(10794, 17965, 22695)
+	c.CoeffBaseRange[2][1][19] = makeCDF(9014, 15652, 20319)
+	c.CoeffBaseRange[2][1][20] = makeCDF(5708, 10512, 14497)
+	c.CoeffBaseRange[3][0][0] = makeCDF(5705, 10930, 15725)
+	c.CoeffBaseRange[3][0][1] = makeCDF(7946, 12765, 16115)
+	c.CoeffBaseRange[3][0][2] = makeCDF(6801, 12123, 16226)
+	c.CoeffBaseRange[3][0][3] = makeCDF(5462, 10135, 14200)
+	c.CoeffBaseRange[3][0][4] = makeCDF(4189, 8011, 11507)
+	c.CoeffBaseRange[3][0][5] = makeCDF(3191, 6229, 9408)
+	c.CoeffBaseRange[3][0][6] = makeCDF(1057, 2137, 3212)
+	c.CoeffBaseRange[3][0][7] = makeCDF(10018, 17067, 21491)
+	c.CoeffBaseRange[3][0][8] = makeCDF(7380, 12582, 16453)
+	c.CoeffBaseRange[3][0][9] = makeCDF(6068, 10845, 14339)
+	c.CoeffBaseRange[3][0][10] = makeCDF(5098, 9198, 12555)
+	c.CoeffBaseRange[3][0][11] = makeCDF(4312, 8010, 11119)
+	c.CoeffBaseRange[3][0][12] = makeCDF(3700, 6966, 9781)
+	c.CoeffBaseRange[3][0][13] = makeCDF(1693, 3326, 4887)
+	c.CoeffBaseRange[3][0][14] = makeCDF(18757, 24930, 27774)
+	c.CoeffBaseRange[3][0][15] = makeCDF(17648, 24596, 27817)
+	c.CoeffBaseRange[3][0][16] = makeCDF(14707, 22052, 26026)
+	c.CoeffBaseRange[3][0][17] = makeCDF(11720, 18852, 23292)
+	c.CoeffBaseRange[3][0][18] = makeCDF(9357, 15952, 20525)
+	c.CoeffBaseRange[3][0][19] = makeCDF(7810, 13753, 18210)
+	c.CoeffBaseRange[3][0][20] = makeCDF(3879, 7333, 10328)
+	c.CoeffBaseRange[3][1][0] = makeCDF(8278, 13242, 15922)
+	c.CoeffBaseRange[3][1][1] = makeCDF(10547, 15867, 18919)
+	c.CoeffBaseRange[3][1][2] = makeCDF(9106, 15842, 20609)
+	c.CoeffBaseRange[3][1][3] = makeCDF(6833, 13007, 17218)
+	c.CoeffBaseRange[3][1][4] = makeCDF(4811, 9712, 13923)
+	c.CoeffBaseRange[3][1][5] = makeCDF(3985, 7352, 11128)
+	c.CoeffBaseRange[3][1][6] = makeCDF(1688, 3458, 5262)
+	c.CoeffBaseRange[3][1][7] = makeCDF(12951, 21861, 26510)
+	c.CoeffBaseRange[3][1][8] = makeCDF(9788, 16044, 20276)
+	c.CoeffBaseRange[3][1][9] = makeCDF(6309, 11244, 14870)
+	c.CoeffBaseRange[3][1][10] = makeCDF(5183, 9349, 12566)
+	c.CoeffBaseRange[3][1][11] = makeCDF(4389, 8229, 11492)
+	c.CoeffBaseRange[3][1][12] = makeCDF(3633, 6945, 10620)
+	c.CoeffBaseRange[3][1][13] = makeCDF(3600, 6847, 9907)
+	c.CoeffBaseRange[3][1][14] = makeCDF(21748, 28137, 30255)
+	c.CoeffBaseRange[3][1][15] = makeCDF(19436, 26581, 29560)
+	c.CoeffBaseRange[3][1][16] = makeCDF(16359, 24201, 27953)
+	c.CoeffBaseRange[3][1][17] = makeCDF(13961, 21693, 25871)
+	c.CoeffBaseRange[3][1][18] = makeCDF(11544, 18686, 23322)
+	c.CoeffBaseRange[3][1][19] = makeCDF(9372, 16462, 20952)
+	c.CoeffBaseRange[3][1][20] = makeCDF(6138, 11210, 15390)
 }
 
 func initDCSignCDFs(c *CDFTables) {

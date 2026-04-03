@@ -60,7 +60,7 @@ func TestMotionTestMBTrace(t *testing.T) {
 					dec.curMV[0], dec.curMV[1], skip, bits, eof0, dec.fp.unexpectedEOF)
 			}
 
-			fs := dec.computeInterFilterParam(mbx, mby)
+			fs := dec.lookupFilterParam()
 			fs.inner = fs.inner || !skip
 			dec.perMBFilterParams[dec.mbw*mby+mbx] = fs
 		}

@@ -6,7 +6,7 @@ package av1
 type CDFTables struct {
 	// Partition type CDFs, indexed by [ctx].
 	// ctx depends on block size and neighbor availability.
-	Partition [20][]uint16
+	Partition [24][]uint16
 
 	// Intra mode CDFs.
 	KFIntraMode  [5][5][]uint16 // Keyframe Y mode, indexed by [above_mode_ctx][left_mode_ctx]
@@ -20,8 +20,13 @@ type CDFTables struct {
 	// TX size CDFs.
 	TXSize [6][3][]uint16 // [tx_depth][ctx]
 
-	// TX type CDFs.
-	TXType [4][16][]uint16 // [txSizeSquare][intraDir]
+	// TX type CDFs matching dav1d:
+	// IntraTXType1: non-reduced set for TX4x4/TX8x8 — 7 symbols (dav1d n_symbols=6).
+	// [min(txSz,1)][yMode]
+	IntraTXType1 [2][NumIntraModes][]uint16
+	// IntraTXType2: reduced set or TX16x16 — 5 symbols (dav1d n_symbols=4).
+	// [min(txSz,2)][yMode]
+	IntraTXType2 [3][NumIntraModes][]uint16
 
 	// Skip flag CDF.
 	Skip [3][]uint16 // [ctx]
@@ -39,9 +44,9 @@ type CDFTables struct {
 	EOBMulti512     [2][]uint16
 	EOBMulti1024    [2][]uint16
 	EOBExtra        [9][2][]uint16 // [eob_multi_ctx][plane_type]
-	CoeffBaseEOB    [3][2][3][]uint16 // [txSizeCtx][planeType][eobCtx]
-	CoeffBase       [3][2][41][]uint16 // [txSizeCtx][planeType][ctx]
-	CoeffBaseRange  [3][2][21][]uint16 // [txSizeCtx][planeType][ctx]
+	CoeffBaseEOB    [5][2][4][]uint16 // [txSizeCtx][planeType][eobCtx]
+	CoeffBase       [5][2][41][]uint16 // [txSizeCtx][planeType][ctx]
+	CoeffBaseRange  [4][2][21][]uint16 // [brTxCtx][planeType][ctx] — dav1d caps br_tok ctx at imin(ctx,3)
 	DCSign          [2][3][]uint16 // [planeType][ctx]
 
 	// Inter mode CDFs (Phase 5).

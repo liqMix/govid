@@ -66,6 +66,52 @@ func TestIDCT8x8DCOnly(t *testing.T) {
 	}
 }
 
+func TestIDCT16x16DCOnly(t *testing.T) {
+	coeffs := make([]int32, 256)
+	coeffs[0] = 8000
+
+	InverseTransform2D(coeffs, 16, 16, TxTypeDCT_DCT)
+
+	first := coeffs[0]
+	maxDiff := int32(0)
+	for i := 1; i < 256; i++ {
+		diff := abs32(coeffs[i] - first)
+		if diff > maxDiff {
+			maxDiff = diff
+		}
+	}
+	t.Logf("IDCT16x16 DC-only: first=%d, maxDiff=%d", first, maxDiff)
+	if maxDiff > 2 {
+		t.Errorf("DC-only IDCT16x16 max diff = %d, want <= 2", maxDiff)
+	}
+	if first == 0 {
+		t.Error("IDCT16x16 DC output is zero")
+	}
+}
+
+func TestIDCT32x32DCOnly(t *testing.T) {
+	coeffs := make([]int32, 1024)
+	coeffs[0] = 16000
+
+	InverseTransform2D(coeffs, 32, 32, TxTypeDCT_DCT)
+
+	first := coeffs[0]
+	maxDiff := int32(0)
+	for i := 1; i < 1024; i++ {
+		diff := abs32(coeffs[i] - first)
+		if diff > maxDiff {
+			maxDiff = diff
+		}
+	}
+	t.Logf("IDCT32x32 DC-only: first=%d, maxDiff=%d", first, maxDiff)
+	if maxDiff > 2 {
+		t.Errorf("DC-only IDCT32x32 max diff = %d, want <= 2", maxDiff)
+	}
+	if first == 0 {
+		t.Error("IDCT32x32 DC output is zero")
+	}
+}
+
 func TestIdentityTransform(t *testing.T) {
 	coeffs := make([]int32, 16)
 	coeffs[0] = 100

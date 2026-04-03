@@ -51,11 +51,11 @@ func TestInterframe64NoFilter(t *testing.T) {
 				prevAbove = dec.upInterMB[mbx]
 				skip := dec.reconstruct(mbx, mby)
 				if !dec.frameHeader.KeyFrame {
-					fs := dec.computeInterFilterParam(mbx, mby)
+					fs := dec.lookupFilterParam()
 					fs.inner = fs.inner || !skip
 					dec.perMBFilterParams[dec.mbw*mby+mbx] = fs
 				} else {
-					fs := dec.filterParams[dec.segment][btou(!dec.usePredY16)]
+					fs := dec.lookupFilterParam()
 					fs.inner = fs.inner || !skip
 					dec.perMBFilterParams[dec.mbw*mby+mbx] = fs
 				}
