@@ -7,7 +7,7 @@ func TestPredDC(t *testing.T) {
 	above := []uint8{100, 100, 100, 100}
 	left := []uint8{200, 200, 200, 200}
 
-	PredictIntra(dst, 4, IntraDC, 4, 4, above, left, 0, true, true)
+	PredictIntra(dst, 4, IntraDC, 4, 4, above, left, 0, true, true, 0)
 
 	// Average of above (100) and left (200) = 150.
 	for i := 0; i < 16; i++ {
@@ -20,7 +20,7 @@ func TestPredDC(t *testing.T) {
 
 func TestPredDCNoRef(t *testing.T) {
 	dst := make([]uint8, 16)
-	PredictIntra(dst, 4, IntraDC, 4, 4, nil, nil, 0, false, false)
+	PredictIntra(dst, 4, IntraDC, 4, 4, nil, nil, 0, false, false, 0)
 
 	// No references: default to 128.
 	for i := 0; i < 16; i++ {
@@ -35,7 +35,7 @@ func TestPredVertical(t *testing.T) {
 	dst := make([]uint8, 16)
 	above := []uint8{10, 20, 30, 40}
 
-	PredictIntra(dst, 4, IntraVertical, 4, 4, above, nil, 0, true, false)
+	PredictIntra(dst, 4, IntraVertical, 4, 4, above, nil, 0, true, false, 0)
 
 	// Each row should copy the above samples.
 	for r := 0; r < 4; r++ {
@@ -53,7 +53,7 @@ func TestPredHorizontal(t *testing.T) {
 	dst := make([]uint8, 16)
 	left := []uint8{10, 20, 30, 40}
 
-	PredictIntra(dst, 4, IntraHorizontal, 4, 4, nil, left, 0, false, true)
+	PredictIntra(dst, 4, IntraHorizontal, 4, 4, nil, left, 0, false, true, 0)
 
 	for r := 0; r < 4; r++ {
 		for c := 0; c < 4; c++ {
@@ -72,7 +72,7 @@ func TestPredPaeth(t *testing.T) {
 	left := []uint8{100, 100, 100, 100}
 	topLeft := uint8(100)
 
-	PredictIntra(dst, 4, IntraPaeth, 4, 4, above, left, topLeft, true, true)
+	PredictIntra(dst, 4, IntraPaeth, 4, 4, above, left, topLeft, true, true, 0)
 
 	// When all references are equal, Paeth should output that value.
 	for i := 0; i < 16; i++ {
@@ -88,7 +88,7 @@ func TestPredSmooth(t *testing.T) {
 	above := []uint8{200, 200, 200, 200}
 	left := []uint8{100, 100, 100, 100}
 
-	PredictIntra(dst, 4, IntraSmooth, 4, 4, above, left, 0, true, true)
+	PredictIntra(dst, 4, IntraSmooth, 4, 4, above, left, 0, true, true, 0)
 
 	// Values should be in between above and left.
 	for i := 0; i < 16; i++ {
@@ -103,7 +103,7 @@ func TestPredSmoothV(t *testing.T) {
 	above := []uint8{200, 200, 200, 200}
 	left := []uint8{100, 100, 100, 100}
 
-	PredictIntra(dst, 4, IntraSmoothV, 4, 4, above, left, 0, true, true)
+	PredictIntra(dst, 4, IntraSmoothV, 4, 4, above, left, 0, true, true, 0)
 
 	// Top row should be close to above (200), bottom closer to below pred (left[3]=100).
 	if dst[0] < 150 {
@@ -118,7 +118,7 @@ func TestPredDirectionalV(t *testing.T) {
 	dst := make([]uint8, 16)
 	above := []uint8{10, 20, 30, 40, 50, 60, 70, 80}
 
-	PredictIntra(dst, 4, IntraD67, 4, 4, above, nil, 0, true, false)
+	PredictIntra(dst, 4, IntraD67, 4, 4, above, nil, 0, true, false, 0)
 
 	// D67 is a near-vertical angle. Top-left values should be close to above values.
 	// Just verify no panic and values are in reasonable range.

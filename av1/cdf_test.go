@@ -20,9 +20,11 @@ func TestDefaultCDFsMonotonic(t *testing.T) {
 		}
 	}
 
-	for ctx, p := range cdf.Partition {
-		if p != nil {
-			checkMono("Partition", ctx, p)
+	for bl := range cdf.Partition {
+		for ctx, p := range cdf.Partition[bl] {
+			if p != nil {
+				checkMono("Partition", bl*4+ctx, p)
+			}
 		}
 	}
 	for ctx, p := range cdf.IntraMode {
@@ -49,9 +51,10 @@ func TestDefaultCDFsRange(t *testing.T) {
 		}
 	}
 
-	for i, p := range cdf.Partition {
-		checkRange("Partition", p)
-		_ = i
+	for bl := range cdf.Partition {
+		for _, p := range cdf.Partition[bl] {
+			checkRange("Partition", p)
+		}
 	}
 	for i, p := range cdf.IntraMode {
 		checkRange("IntraMode", p)
@@ -89,13 +92,15 @@ func TestCDFCounterInitZero(t *testing.T) {
 	cdf := NewCDFTables()
 
 	// All CDF counters (last element) should be 0.
-	for ctx, p := range cdf.Partition {
-		if p == nil {
-			continue
-		}
-		counter := p[len(p)-1]
-		if counter != 0 {
-			t.Errorf("Partition[%d] counter = %d, want 0", ctx, counter)
+	for bl := range cdf.Partition {
+		for ctx, p := range cdf.Partition[bl] {
+			if p == nil {
+				continue
+			}
+			counter := p[len(p)-1]
+			if counter != 0 {
+				t.Errorf("Partition[%d][%d] counter = %d, want 0", bl, ctx, counter)
+			}
 		}
 	}
 }

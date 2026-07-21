@@ -1,0 +1,49 @@
+# Your global ignore file (~/.gitignore) starts with `.*`, which hides every
+# dotfile — including this one. Re-allow the repo dotfiles worth tracking.
+!.gitignore
+!.gitattributes
+!.github/
+
+# Compiled binaries and Go test executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.test.exe
+*.out
+
+# Go tooling
+go.work
+go.work.sum
+vendor/
+
+# Profiling and coverage output
+*.prof
+*.pprof
+coverage.txt
+coverage.out
+coverage.html
+cpu.out
+mem.out
+*.trace
+
+# Large local-only media (test fixtures under */testdata are tracked on purpose)
+examples/videos/bg*
+h264/testdata/bg_*
+*/testdata/_*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code local settings
+.claude/settings.local.json

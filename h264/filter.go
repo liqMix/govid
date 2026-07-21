@@ -52,6 +52,8 @@ func (d *Decoder) deblockMB(mbx, mby int, sh *sliceHeader) {
 	qpCur := d.mbInfo[mbIdx].qp
 
 	// Vertical edges first, then horizontal.
+	// Hoist invariants: bS and alpha/beta/tc0 only change per 4x4 block along
+	// the edge, not per pixel. Prior code recomputed these 16× per edge.
 	for edge := 0; edge < 4; edge++ {
 		x := mbx*16 + edge*4
 		if edge == 0 && mbx == 0 {
@@ -67,24 +69,29 @@ func (d *Decoder) deblockMB(mbx, mby int, sh *sliceHeader) {
 			qp = qpCur
 		}
 
-		for j := 0; j < 16; j++ {
-			y := mby*16 + j
+		// alpha/beta are edge-level invariants (depend only on qp + slice offsets).
+		indexA := clampInt(qp+int(sh.sliceAlphaC0Offset), 0, 51)
+		indexB := clampInt(qp+int(sh.sliceBetaOffset), 0, 51)
+		alpha := alphaTable[indexA]
+		beta := betaTable[indexB]
 
-			bS := d.computeBSVertical(mbx, mby, edge, j/4)
+		for blkJ := 0; blkJ < 4; blkJ++ {
+			bS := d.computeBSVertical(mbx, mby, edge, blkJ)
 			if bS == 0 {
 				continue
 			}
-
-			indexA := clampInt(qp+int(sh.sliceAlphaC0Offset), 0, 51)
-			indexB := clampInt(qp+int(sh.sliceBetaOffset), 0, 51)
-			alpha := alphaTable[indexA]
-			beta := betaTable[indexB]
-
+			var tc0 int
 			if bS < 4 {
-				tc0 := tc0Table[indexA][bS-1]
-				filterLumaEdgeSample(d.img.Y, d.img.YStride, x, y, true, alpha, beta, tc0)
-			} else {
-				filterLumaStrongSample(d.img.Y, d.img.YStride, x, y, true, alpha, beta)
+				tc0 = int(tc0Table[indexA][bS-1])
+			}
+			// Filter 4 pixels along this 4x4 block edge.
+			for j := 0; j < 4; j++ {
+				y := mby*16 + blkJ*4 + j
+				if bS < 4 {
+					filterLumaEdgeSample(d.img.Y, d.img.YStride, x, y, true, alpha, beta, tc0)
+				} else {
+					filterLumaStrongSample(d.img.Y, d.img.YStride, x, y, true, alpha, beta)
+				}
 			}
 		}
 	}
@@ -104,24 +111,27 @@ func (d *Decoder) deblockMB(mbx, mby int, sh *sliceHeader) {
 			qp = qpCur
 		}
 
-		for i := 0; i < 16; i++ {
-			x := mbx*16 + i
+		indexA := clampInt(qp+int(sh.sliceAlphaC0Offset), 0, 51)
+		indexB := clampInt(qp+int(sh.sliceBetaOffset), 0, 51)
+		alpha := alphaTable[indexA]
+		beta := betaTable[indexB]
 
-			bS := d.computeBSHorizontal(mbx, mby, edge, i/4)
+		for blkI := 0; blkI < 4; blkI++ {
+			bS := d.computeBSHorizontal(mbx, mby, edge, blkI)
 			if bS == 0 {
 				continue
 			}
-
-			indexA := clampInt(qp+int(sh.sliceAlphaC0Offset), 0, 51)
-			indexB := clampInt(qp+int(sh.sliceBetaOffset), 0, 51)
-			alpha := alphaTable[indexA]
-			beta := betaTable[indexB]
-
+			var tc0 int
 			if bS < 4 {
-				tc0 := tc0Table[indexA][bS-1]
-				filterLumaEdgeSample(d.img.Y, d.img.YStride, x, y, false, alpha, beta, tc0)
-			} else {
-				filterLumaStrongSample(d.img.Y, d.img.YStride, x, y, false, alpha, beta)
+				tc0 = int(tc0Table[indexA][bS-1])
+			}
+			for i := 0; i < 4; i++ {
+				x := mbx*16 + blkI*4 + i
+				if bS < 4 {
+					filterLumaEdgeSample(d.img.Y, d.img.YStride, x, y, false, alpha, beta, tc0)
+				} else {
+					filterLumaStrongSample(d.img.Y, d.img.YStride, x, y, false, alpha, beta)
+				}
 			}
 		}
 	}

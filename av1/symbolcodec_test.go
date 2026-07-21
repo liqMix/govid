@@ -6,10 +6,7 @@ import (
 
 func TestReadLiteralSymbolCodec(t *testing.T) {
 	sc := NewSymbolCodec([]byte{0x00, 0x00, 0x00, 0x00})
-	val, err := sc.ReadLiteral(8)
-	if err != nil {
-		t.Fatal(err)
-	}
+	val := sc.ReadLiteral(8)
 	if val != 0 {
 		t.Errorf("ReadLiteral(8) with zeros = %d, want 0", val)
 	}
@@ -17,10 +14,7 @@ func TestReadLiteralSymbolCodec(t *testing.T) {
 
 func TestReadLiteralAllOnes(t *testing.T) {
 	sc := NewSymbolCodec([]byte{0xFF, 0xFF, 0xFF, 0xFF})
-	val, err := sc.ReadLiteral(8)
-	if err != nil {
-		t.Fatal(err)
-	}
+	val := sc.ReadLiteral(8)
 	if val != 255 {
 		t.Errorf("ReadLiteral(8) with 0xFF = %d, want 255", val)
 	}
@@ -28,10 +22,7 @@ func TestReadLiteralAllOnes(t *testing.T) {
 
 func TestReadBoolProbability(t *testing.T) {
 	sc := NewSymbolCodec([]byte{0x80, 0x00, 0x00, 0x00})
-	b, err := sc.ReadBool(128)
-	if err != nil {
-		t.Fatal(err)
-	}
+	b := sc.ReadBool(128)
 	if !b {
 		t.Error("ReadBool(128) with 0x8000 = false, want true")
 	}
@@ -78,20 +69,14 @@ func TestCDFCountCap(t *testing.T) {
 func TestReadSymbolTwoSymbols(t *testing.T) {
 	cdf := []uint16{4768, 0}
 	sc := NewSymbolCodec([]byte{0x00, 0x00, 0x00, 0x00})
-	sym, err := sc.ReadSymbol(cdf[:], 2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sym := sc.ReadSymbol(cdf[:], 2)
 	if sym != 0 {
 		t.Errorf("ReadSymbol with low raw value = %d, want 0", sym)
 	}
 
 	cdf2 := []uint16{4768, 0}
 	sc2 := NewSymbolCodec([]byte{0xFF, 0xFF, 0xFF, 0xFF})
-	sym2, err := sc2.ReadSymbol(cdf2[:], 2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sym2 := sc2.ReadSymbol(cdf2[:], 2)
 	if sym2 != 1 {
 		t.Errorf("ReadSymbol with high raw value = %d, want 1", sym2)
 	}
@@ -101,10 +86,7 @@ func TestReadSymbolMultiple(t *testing.T) {
 	cdf := []uint16{8768, 16768, 24768, 0}
 	sc := NewSymbolCodec([]byte{0x40, 0x80, 0xC0, 0x20, 0x60, 0xA0})
 	for i := 0; i < 4; i++ {
-		_, err := sc.ReadSymbol(cdf[:], 4)
-		if err != nil {
-			t.Fatalf("ReadSymbol %d: %v", i, err)
-		}
+		sc.ReadSymbol(cdf[:], 4)
 	}
 }
 

@@ -1,7 +1,5 @@
 package av1
 
-// reconstruct.go
-
 // decodeBlock decodes a single coding block and reconstructs pixels.
 func (td *tileDecoder) decodeBlock(miRow, miCol, bSize int) error {
 	if miRow >= td.miRowEnd || miCol >= td.miColEnd {
@@ -13,13 +11,11 @@ func (td *tileDecoder) decodeBlock(miRow, miCol, bSize int) error {
 
 	td.blockCount++
 
-	// Decode mode info (intra mode, TX info, skip).
 	bi, err := td.decodeModeInfo(miRow, miCol, bSize)
 	if err != nil {
 		return err
 	}
 
-	// Capture first block diagnostics.
 	if td.blockCount == 1 && td.dec.diagFirstBlock == nil {
 		td.dec.diagFirstBlock = bi
 	}
@@ -30,16 +26,13 @@ func (td *tileDecoder) decodeBlock(miRow, miCol, bSize int) error {
 	txW := TXWidth[txSize]
 	txH := TXHeight[txSize]
 
-	// Pixel coordinates of block origin.
 	pixX := miCol * 4
 	pixY := miRow * 4
 
-	// Handle palette mode: read palette indices from bitstream and fill pixels.
-	// Per spec: skip=true means no palette tokens AND no coefficients.
+	// Handle palette mode.
 	if bi.paletteSizeY > 0 {
 		td.decodePaletteTokens(0, pixX, pixY, bw, bh, bi.paletteSizeY, bi.paletteColorsY)
 	} else {
-		// Reconstruct Y plane (plane 0) with prediction + coefficients.
 		for ty := 0; ty < bh; ty += txH {
 			for tx := 0; tx < bw; tx += txW {
 				py := pixY + ty
@@ -51,11 +44,8 @@ func (td *tileDecoder) decodeBlock(miRow, miCol, bSize int) error {
 		}
 	}
 
-	// Reconstruct chroma planes (Cb=1, Cr=2) with 4:2:0 subsampling.
-	chromaTXSize := txSize
-	if chromaTXSize > TX4x4 {
-		chromaTXSize--
-	}
+	// Chroma planes with 4:2:0 subsampling.
+	chromaTXSize := getChromaTXSize(txSize, bSize)
 	chromaTXW := TXWidth[chromaTXSize]
 	chromaTXH := TXHeight[chromaTXSize]
 	chromaBW := bw / 2
@@ -92,8 +82,40 @@ func (td *tileDecoder) decodeBlock(miRow, miCol, bSize int) error {
 	return nil
 }
 
-// decodePaletteTokens reads palette color indices from the bitstream using
-// diagonal wave-front scan with color_order reordering per the AV1 spec.
+// getChromaTXSize maps luma TX size to chroma TX size for 4:2:0.
+func getChromaTXSize(lumaTXSize, bSize int) int {
+	chromaW := BlockWidth[bSize] / 2
+	chromaH := BlockHeight[bSize] / 2
+	if chromaW < 4 {
+		chromaW = 4
+	}
+	if chromaH < 4 {
+		chromaH = 4
+	}
+	minDim := chromaW
+	if chromaH < minDim {
+		minDim = chromaH
+	}
+
+	maxChromaTX := TX4x4
+	switch {
+	case minDim >= 64:
+		maxChromaTX = TX64x64
+	case minDim >= 32:
+		maxChromaTX = TX32x32
+	case minDim >= 16:
+		maxChromaTX = TX16x16
+	case minDim >= 8:
+		maxChromaTX = TX8x8
+	}
+
+	if lumaTXSize <= maxChromaTX {
+		return lumaTXSize
+	}
+	return maxChromaTX
+}
+
+// decodePaletteTokens reads palette color indices and fills pixels.
 func (td *tileDecoder) decodePaletteTokens(plane, pixX, pixY, blockW, blockH, palSize int, palColors []uint8) {
 	d := td.dec
 	img := d.img
@@ -121,23 +143,19 @@ func (td *tileDecoder) decodePaletteTokens(plane, pixX, pixY, blockW, blockH, pa
 		return
 	}
 
-	// Palette index map (blockW x blockH).
 	palIdx := make([]uint8, blockW*blockH)
 
-	// First pixel: read uniform(palSize) per spec.
-	// Use a uniform CDF with palSize symbols for exact bit consumption match.
 	if palSize > 1 {
 		uniformCDF := make([]uint16, palSize)
 		for i := 0; i < palSize-1; i++ {
 			uniformCDF[i] = 32768 - uint16((i+1)*32768/palSize)
 		}
-		v, err := td.sc.ReadSymbol(uniformCDF, palSize)
-		if err == nil && v < palSize {
+		v := td.sc.ReadSymbol(uniformCDF, palSize)
+		if v < palSize {
 			palIdx[0] = uint8(v)
 		}
 	}
 
-	// Palette color index CDF: palSize-1 symbols (color_order puts most likely first).
 	palSizeIdx := palSize - 2
 	if palSizeIdx < 0 {
 		palSizeIdx = 0
@@ -149,7 +167,7 @@ func (td *tileDecoder) decodePaletteTokens(plane, pixX, pixY, blockW, blockH, pa
 	if nSyms < 1 {
 		nSyms = 1
 	}
-	// Fresh CDF copies per context for adaptive palette index reading.
+
 	var localCDFs [5][]uint16
 	for ctx := 0; ctx < 5; ctx++ {
 		src := td.cdf.PaletteColorIdx[palSizeIdx][ctx]
@@ -160,7 +178,6 @@ func (td *tileDecoder) decodePaletteTokens(plane, pixX, pixY, blockW, blockH, pa
 		localCDFs[ctx] = cdf
 	}
 
-	// Diagonal wave-front scan per spec with adaptive CDF reading.
 	for diag := 1; diag < blockW+blockH-1; diag++ {
 		jStart := diag
 		if jStart >= blockW {
@@ -175,10 +192,7 @@ func (td *tileDecoder) decodePaletteTokens(plane, pixX, pixY, blockW, blockH, pa
 			var order [8]uint8
 			ctx := td.palOrderCtx(palIdx, blockW, i, j, &order, palSize)
 
-			colorIdx, err := td.sc.ReadSymbol(localCDFs[ctx], nSyms)
-			if err != nil {
-				return
-			}
+			colorIdx := td.sc.ReadSymbol(localCDFs[ctx], nSyms)
 			if colorIdx >= palSize {
 				colorIdx = palSize - 1
 			}
@@ -186,7 +200,6 @@ func (td *tileDecoder) decodePaletteTokens(plane, pixX, pixY, blockW, blockH, pa
 		}
 	}
 
-	// Write palette colors to plane buffer.
 	for r := 0; r < effH; r++ {
 		for c := 0; c < effW; c++ {
 			idx := int(palIdx[r*blockW+c])
@@ -199,8 +212,7 @@ func (td *tileDecoder) decodePaletteTokens(plane, pixX, pixY, blockW, blockH, pa
 	}
 }
 
-// palOrderCtx builds the color_order array and returns the CDF context
-// for a palette pixel at position (i, j), based on its neighbors.
+// palOrderCtx builds the color_order array and returns the CDF context.
 func (td *tileDecoder) palOrderCtx(palIdx []uint8, stride, i, j int, order *[8]uint8, palSize int) int {
 	haveTop := i > 0
 	haveLeft := j > 0
@@ -217,7 +229,6 @@ func (td *tileDecoder) palOrderCtx(palIdx []uint8, stride, i, j int, order *[8]u
 
 	if !haveLeft && !haveTop {
 		ctx = 0
-		// shouldn't happen (first pixel is handled separately)
 	} else if !haveLeft {
 		ctx = 0
 		add(palIdx[(i-1)*stride+j])
@@ -261,7 +272,6 @@ func (td *tileDecoder) palOrderCtx(palIdx []uint8, stride, i, j int, order *[8]u
 		}
 	}
 
-	// Fill remaining order entries with colors not yet in order.
 	for bit := 0; bit < palSize && oIdx < 8; bit++ {
 		if mask&(1<<bit) == 0 {
 			order[oIdx] = uint8(bit)
@@ -279,7 +289,6 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 	d := td.dec
 	img := d.img
 
-	// Determine plane dimensions and data slice.
 	var planeW, planeH, stride int
 	var planeBuf []uint8
 
@@ -301,7 +310,6 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 		planeBuf = img.Cr
 	}
 
-	// Bounds check: ensure the block fits in the plane.
 	if pixX >= planeW || pixY >= planeH {
 		return nil
 	}
@@ -314,20 +322,22 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 		effH = planeH - pixY
 	}
 
-	// Gather reference samples for intra prediction.
-	above := make([]uint8, txW)
-	left := make([]uint8, txH)
+	// Gather reference samples (extended for directional prediction).
+	above := make([]uint8, txW*2)
+	left := make([]uint8, txH*2)
 	var topLeft uint8 = 128
 	haveAbove := pixY > 0
 	haveLeft := pixX > 0
 
 	if haveAbove {
-		for i := 0; i < txW; i++ {
+		for i := 0; i < txW*2; i++ {
 			x := pixX + i
 			if x < planeW {
 				above[i] = planeBuf[(pixY-1)*stride+x]
+			} else if i > 0 {
+				above[i] = above[i-1]
 			} else {
-				above[i] = above[0]
+				above[i] = 128
 			}
 		}
 	} else {
@@ -337,12 +347,14 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 	}
 
 	if haveLeft {
-		for i := 0; i < txH; i++ {
+		for i := 0; i < txH*2; i++ {
 			y := pixY + i
 			if y < planeH {
 				left[i] = planeBuf[y*stride+(pixX-1)]
+			} else if i > 0 {
+				left[i] = left[i-1]
 			} else {
-				left[i] = left[0]
+				left[i] = 128
 			}
 		}
 	} else {
@@ -359,12 +371,16 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 		topLeft = left[0]
 	}
 
-	// Intra predict.
 	predBuf := make([]uint8, txW*txH)
-	PredictIntra(predBuf, txW, mode, txW, txH, above, left, topLeft, haveAbove, haveLeft)
+	angleDelta := 0
+	if plane == 0 {
+		angleDelta = bi.angleDeltaY
+	} else {
+		angleDelta = bi.angleDeltaUV
+	}
+	PredictIntra(predBuf, txW, mode, txW, txH, above, left, topLeft, haveAbove, haveLeft, angleDelta)
 
 	if bi.skip {
-		// Skip: write prediction directly to frame, no residual.
 		for r := 0; r < effH; r++ {
 			for c := 0; c < effW; c++ {
 				planeBuf[(pixY+r)*stride+(pixX+c)] = predBuf[r*txW+c]
@@ -378,14 +394,10 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 		return nil
 	}
 
-	// Decode coefficients (TX type read once per block in decodeModeInfo).
+	// Decode coefficients — TX type is returned per TXB.
 	td.txbCount++
-	coeffs, err := td.decodeCoeffs(plane, txSize, bi.txType, bi.bSize, pixX, pixY)
-	if err != nil {
-		return err
-	}
+	coeffs, txType := td.decodeCoeffs(plane, txSize, bi.bSize, bi, pixX, pixY)
 
-	// Check if all zero.
 	allZero := true
 	for _, c := range coeffs {
 		if c != 0 {
@@ -394,7 +406,6 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 		}
 	}
 
-	// Update DC sign context: 0=zero, 1=positive, 2=negative.
 	dcSign := 0
 	if len(coeffs) > 0 && coeffs[0] > 0 {
 		dcSign = 1
@@ -405,7 +416,6 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 
 	if !allZero {
 		td.txbNzCount++
-		// Dequantize using current Q index (BaseQIdx + delta Q).
 		fh := d.frameHdr
 		qIdx := td.currentQIdx
 
@@ -422,7 +432,6 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 			acQ = GetACQuant(qIdx + fh.Quant.DeltaQVAc)
 		}
 
-		// Capture first TXB diagnostics (before dequant).
 		if d.diagFirstTXBCoeffs == nil && plane == 0 {
 			snap := make([]int32, len(coeffs))
 			copy(snap, coeffs)
@@ -432,12 +441,9 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 		}
 
 		DequantCoeffs(coeffs, dcQ, acQ)
-
-		// Inverse transform.
-		InverseTransform2D(coeffs, txW, txH, bi.txType)
+		InverseTransform2D(coeffs, txW, txH, txType)
 	}
 
-	// Add residual to prediction and write to frame.
 	for r := 0; r < effH; r++ {
 		for c := 0; c < effW; c++ {
 			val := int(predBuf[r*txW+c]) + int(coeffs[r*txW+c])
@@ -456,15 +462,12 @@ func (td *tileDecoder) reconstructTXB(plane, pixX, pixY, txSize, mode int, bi *b
 }
 
 // applyCfL adds the scaled luma AC component to the chroma DC prediction.
-// Per AV1 spec Section 7.11.5: CfL prediction.
-// pixX, pixY are chroma pixel coordinates. The corresponding luma is at 2*pixX, 2*pixY.
 func (td *tileDecoder) applyCfL(predBuf []uint8, txW, txH, pixX, pixY, alpha, sign int) {
 	img := td.dec.img
 	lumaStride := img.YStride
 	lumaW := img.Rect.Dx()
 	lumaH := img.Rect.Dy()
 
-	// Compute average luma value over the block (for DC subtraction).
 	var lumaSum int
 	count := 0
 	for r := 0; r < txH; r++ {
@@ -472,7 +475,6 @@ func (td *tileDecoder) applyCfL(predBuf []uint8, txW, txH, pixX, pixY, alpha, si
 			ly := pixY*2 + r*2
 			lx := pixX*2 + c*2
 			if ly < lumaH && lx < lumaW {
-				// Average of 2x2 luma block.
 				var s int
 				n := 0
 				for dr := 0; dr < 2; dr++ {
@@ -497,8 +499,6 @@ func (td *tileDecoder) applyCfL(predBuf []uint8, txW, txH, pixX, pixY, alpha, si
 	}
 	lumaDC := lumaSum / count
 
-	// Apply CfL: for each chroma pixel, add alpha * (luma_subsampled - lumaDC).
-	// sign: 1 = positive alpha, 2 = negative alpha.
 	signMul := 1
 	if sign == 2 {
 		signMul = -1
@@ -511,7 +511,6 @@ func (td *tileDecoder) applyCfL(predBuf []uint8, txW, txH, pixX, pixY, alpha, si
 			if ly >= lumaH || lx >= lumaW {
 				continue
 			}
-			// Subsample luma: average of 2x2 block.
 			var s int
 			n := 0
 			for dr := 0; dr < 2; dr++ {
@@ -527,10 +526,6 @@ func (td *tileDecoder) applyCfL(predBuf []uint8, txW, txH, pixX, pixY, alpha, si
 			lumaVal := s / n
 			ac := lumaVal - lumaDC
 
-			// Scale: alpha ranges 1-16, scale is alpha/16 approximately.
-			// Per spec: scaled = clip(pred + ((alpha * ac + 32) >> 6), 0, 255)
-			// But alpha from CDF is 1-16, and the scaling in the spec uses a different convention.
-			// Simplified: use alpha directly as the scaling factor.
 			adj := (signMul * alpha * ac + 32) >> 6
 			val := int(predBuf[r*txW+c]) + adj
 			if val < 0 {
@@ -544,19 +539,9 @@ func (td *tileDecoder) applyCfL(predBuf []uint8, txW, txH, pixX, pixY, alpha, si
 	}
 }
 
-// getNzCtx returns whether the above and left neighbors have nonzero coefficients.
+// getNzCtx returns whether above/left neighbors have nonzero coefficients.
 func (td *tileDecoder) getNzCtx(plane, pixX, pixY, txW, txH int) (aboveNz, leftNz bool) {
-	var miX, miY int
-	if plane == 0 {
-		miX = pixX / 4
-		miY = pixY / 4
-	} else {
-		miX = pixX / 4 // chroma MI is half of luma MI, but stored at same MI units
-		miY = pixY / 4
-	}
-
-	// Check above.
-	aboveIdx := miX - td.miColStart
+	aboveIdx := pixX/4 - td.miColStart
 	if plane > 0 {
 		aboveIdx = pixX / 4
 	}
@@ -564,8 +549,7 @@ func (td *tileDecoder) getNzCtx(plane, pixX, pixY, txW, txH int) (aboveNz, leftN
 		aboveNz = td.aboveNzCtx[plane][aboveIdx]
 	}
 
-	// Check left.
-	leftIdx := miY - td.miRowStart
+	leftIdx := pixY/4 - td.miRowStart
 	if plane > 0 {
 		leftIdx = pixY / 4
 	}
@@ -578,11 +562,7 @@ func (td *tileDecoder) getNzCtx(plane, pixX, pixY, txW, txH int) (aboveNz, leftN
 
 // updateNzCtx updates the nonzero coefficient context.
 func (td *tileDecoder) updateNzCtx(plane, pixX, pixY, txW, txH int, hasNz bool) {
-	// Update above context.
 	startX := pixX / 4
-	if plane > 0 {
-		startX = pixX / 4
-	}
 	nMI := txW / 4
 	if nMI < 1 {
 		nMI = 1
@@ -597,11 +577,7 @@ func (td *tileDecoder) updateNzCtx(plane, pixX, pixY, txW, txH int, hasNz bool) 
 		}
 	}
 
-	// Update left context.
 	startY := pixY / 4
-	if plane > 0 {
-		startY = pixY / 4
-	}
 	nMIH := txH / 4
 	if nMIH < 1 {
 		nMIH = 1
@@ -617,8 +593,7 @@ func (td *tileDecoder) updateNzCtx(plane, pixX, pixY, txW, txH int, hasNz bool) 
 	}
 }
 
-// maxTXSizeForDimensions returns the largest square TX size index
-// that fits within the given pixel dimensions.
+// maxTXSizeForDimensions returns the largest square TX size that fits.
 func maxTXSizeForDimensions(w, h int) int {
 	minDim := w
 	if h < minDim {

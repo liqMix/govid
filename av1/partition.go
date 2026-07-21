@@ -1,5 +1,44 @@
 package av1
 
+// Block level constants matching dav1d.
+const (
+	BL128x128 = 0
+	BL64x64   = 1
+	BL32x32   = 2
+	BL16x16   = 3
+	BL8x8     = 4
+)
+
+// bSizeToBlockLevel maps block size to dav1d block level.
+func bSizeToBlockLevel(bSize int) int {
+	switch bSize {
+	case Block128x128:
+		return BL128x128
+	case Block64x64:
+		return BL64x64
+	case Block32x32:
+		return BL32x32
+	case Block16x16:
+		return BL16x16
+	case Block8x8:
+		return BL8x8
+	default:
+		return BL8x8
+	}
+}
+
+// partitionNsymbs returns the number of partition symbols for a block level.
+func partitionNsymbs(bl int) int {
+	switch bl {
+	case BL8x8:
+		return 4 // NONE, HORZ, VERT, SPLIT
+	case BL128x128:
+		return 8 // no HORZ_4/VERT_4
+	default:
+		return 10
+	}
+}
+
 // decodePartition recursively decodes the partition tree for a superblock.
 // AV1 spec 5.11.4.
 func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
@@ -7,7 +46,6 @@ func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
 		return nil
 	}
 
-	// For blocks smaller than 8x8, only PARTITION_NONE is allowed.
 	if bSize < Block8x8 {
 		return td.decodeBlock(miRow, miCol, bSize)
 	}
@@ -20,69 +58,39 @@ func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
 	hasRows := (miRow + halfH) < td.miRowEnd
 	hasCols := (miCol + halfW) < td.miColEnd
 
+	bl := bSizeToBlockLevel(bSize)
+	nsymbs := partitionNsymbs(bl)
+
 	var partition int
 	if hasRows && hasCols {
 		ctx := td.getPartitionCtx(miRow, miCol, bSize)
-		var nsymbs int
-		if bSize == Block8x8 {
-			nsymbs = 4 // NONE, HORZ, VERT, SPLIT
-		} else {
-			nsymbs = 10
-		}
-		var err error
-		partition, err = td.sc.ReadSymbol(td.cdf.Partition[ctx], nsymbs)
-		if err != nil {
-			return err
-		}
+		partition = td.sc.ReadSymbol(td.cdf.Partition[bl][ctx], nsymbs)
 	} else if hasCols {
-		// Only bottom half might be out of frame → force HORZ or SPLIT.
 		ctx := td.getPartitionCtx(miRow, miCol, bSize)
-		var nsymbs int
-		if bSize == Block8x8 {
-			nsymbs = 4
-		} else {
-			nsymbs = 10
-		}
-		p, err := td.sc.ReadSymbol(td.cdf.Partition[ctx], nsymbs)
-		if err != nil {
-			return err
-		}
+		p := td.sc.ReadSymbol(td.cdf.Partition[bl][ctx], nsymbs)
 		if p == PartitionNone || p == PartitionHorz || p == PartitionHorzA || p == PartitionHorzB || p == PartitionHorz4 {
 			partition = p
 		} else {
 			partition = PartitionSplit
 		}
 	} else if hasRows {
-		// Only right half might be out of frame → force VERT or SPLIT.
 		ctx := td.getPartitionCtx(miRow, miCol, bSize)
-		var nsymbs int
-		if bSize == Block8x8 {
-			nsymbs = 4
-		} else {
-			nsymbs = 10
-		}
-		p, err := td.sc.ReadSymbol(td.cdf.Partition[ctx], nsymbs)
-		if err != nil {
-			return err
-		}
+		p := td.sc.ReadSymbol(td.cdf.Partition[bl][ctx], nsymbs)
 		if p == PartitionNone || p == PartitionVert || p == PartitionVertA || p == PartitionVertB || p == PartitionVert4 {
 			partition = p
 		} else {
 			partition = PartitionSplit
 		}
 	} else {
-		// Both halves out of frame → must split.
 		partition = PartitionSplit
 	}
 
 	subSize := SubSize[bSize][partition]
 	if subSize < 0 || subSize >= NumBlockSizes {
-		// Fallback: split.
 		partition = PartitionSplit
 		subSize = SubSize[bSize][PartitionSplit]
 	}
 
-	// Log partition decision for diagnostics.
 	td.partitionLog = append(td.partitionLog, partition)
 
 	switch partition {
@@ -130,7 +138,6 @@ func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
 		}
 
 	case PartitionHorzA:
-		// Top-left and top-right are half-width, bottom is full-width.
 		splitSize := SubSize[bSize][PartitionSplit]
 		if err := td.decodeBlock(miRow, miCol, splitSize); err != nil {
 			return err
@@ -143,7 +150,6 @@ func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
 		}
 
 	case PartitionHorzB:
-		// Top is full-width, bottom-left and bottom-right are half-width.
 		splitSize := SubSize[bSize][PartitionSplit]
 		if err := td.decodeBlock(miRow, miCol, subSize); err != nil {
 			return err
@@ -202,22 +208,17 @@ func (td *tileDecoder) decodePartition(miRow, miCol, bSize int) error {
 		}
 	}
 
-	// Update above/left partition context.
 	td.updatePartitionCtx(miRow, miCol, bSize, subSize)
-
 	return nil
 }
 
-// getPartitionCtx computes the partition CDF context index.
-// ctx = bsl * 4 + 2*left + above where bsl = BlockWidthLog2[bSize].
+// getPartitionCtx computes the 2-bit partition context from above/left neighbors.
 func (td *tileDecoder) getPartitionCtx(miRow, miCol, bSize int) int {
-	bsl := BlockWidthLog2[bSize]
-
 	above := 0
 	if miRow > td.miRowStart {
-		aboveIdx := miCol - td.miColStart
-		if aboveIdx >= 0 && aboveIdx < len(td.abovePartCtx) {
-			if td.abovePartCtx[aboveIdx] < BlockWidthLog2[bSize] {
+		idx := miCol - td.miColStart
+		if idx >= 0 && idx < len(td.abovePartCtx) {
+			if td.abovePartCtx[idx] < BlockWidthLog2[bSize] {
 				above = 1
 			}
 		}
@@ -225,17 +226,17 @@ func (td *tileDecoder) getPartitionCtx(miRow, miCol, bSize int) int {
 
 	left := 0
 	if miCol > td.miColStart {
-		leftIdx := miRow - td.miRowStart
-		if leftIdx >= 0 && leftIdx < len(td.leftPartCtx) {
-			if td.leftPartCtx[leftIdx] < BlockHeightLog2[bSize] {
+		idx := miRow - td.miRowStart
+		if idx >= 0 && idx < len(td.leftPartCtx) {
+			if td.leftPartCtx[idx] < BlockHeightLog2[bSize] {
 				left = 1
 			}
 		}
 	}
 
-	ctx := bsl*4 + 2*left + above
-	if ctx > 23 {
-		ctx = 23
+	ctx := 2*left + above
+	if ctx > 3 {
+		ctx = 3
 	}
 	return ctx
 }

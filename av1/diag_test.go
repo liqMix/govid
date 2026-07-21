@@ -115,8 +115,8 @@ func TestDiagBakerFirstBlock(t *testing.T) {
 		if bi.txSize >= 0 && bi.txSize < len(txSizeNames) {
 			txSzName = txSizeNames[bi.txSize]
 		}
-		t.Logf("  bSize=%d yMode=%d uvMode=%d txSize=%s txType=%d skip=%v",
-			bi.bSize, bi.yMode, bi.uvMode, txSzName, bi.txType, bi.skip)
+		t.Logf("  bSize=%d yMode=%d uvMode=%d txSize=%s skip=%v",
+			bi.bSize, bi.yMode, bi.uvMode, txSzName, bi.skip)
 	}
 	if c := dec.diagFirstTXBCoeffs; c != nil {
 		nz := 0

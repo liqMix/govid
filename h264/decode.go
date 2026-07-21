@@ -119,6 +119,19 @@ var zigzagToRaster = [16]int{0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 1
 // rasterToScan maps raster index to Z-scan (block scan) index for 4x4 blocks.
 var rasterToScan = [16]int{0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15}
 
+// zigzagToRaster8x8 maps 8x8 zigzag scan position (0..63) to raster index
+// (row*8 + col). Spec Figure 6-10. Matches FFmpeg's ff_zigzag_direct8x8.
+var zigzagToRaster8x8 = [64]int{
+	0, 1, 8, 16, 9, 2, 3, 10,
+	17, 24, 32, 25, 18, 11, 4, 5,
+	12, 19, 26, 33, 40, 48, 41, 34,
+	27, 20, 13, 6, 7, 14, 21, 28,
+	35, 42, 49, 56, 57, 50, 43, 36,
+	29, 22, 15, 23, 30, 37, 44, 51,
+	58, 59, 52, 45, 38, 31, 39, 46,
+	53, 60, 61, 54, 47, 55, 62, 63,
+}
+
 // reorderCoeffs reorders 16 coefficients from zigzag scan order to raster order in-place.
 func reorderCoeffs(coeffs []int16) {
 	var tmp [16]int16
@@ -126,6 +139,48 @@ func reorderCoeffs(coeffs []int16) {
 	for i := 0; i < 16; i++ {
 		coeffs[zigzagToRaster[i]] = tmp[i]
 	}
+}
+
+// read8x8ResidualCAVLC reads the 64 coefficients of an 8x8 transform block
+// via CAVLC. Per FFmpeg's scan8x8_cavlc, the 64 coefficients are read as
+// 4 sub-blocks of 16 coefficients each where sub-block s covers the
+// contiguous slice zigzag[16*s .. 16*s+15]. Sub-block s position k
+// corresponds to zigzag position 16*s + k, mapped to raster via
+// zigzagToRaster8x8.
+//
+// This is NOT the `4*k+s` interleave you'd naïvely assume from reading the
+// spec — the CAVLC sub-block scan groups low-frequency coefficients together
+// so the context-adaptive coeff_token tables exploit the typical DC-heavy
+// low / AC-heavy high frequency separation.
+//
+// coeffs must be length >= 64 and will be written in raster order.
+// Returns the total non-zero count across all sub-blocks.
+func read8x8ResidualCAVLC(br *BitReader, coeffs []int16, nCs [4]int) (int, error) {
+	for i := 0; i < 64; i++ {
+		coeffs[i] = 0
+	}
+	var subBlock [16]int16
+	totalNZ := 0
+	for s := 0; s < 4; s++ {
+		for i := 0; i < 16; i++ {
+			subBlock[i] = 0
+		}
+		nz, err := readResidualBlock(br, subBlock[:], 16, nCs[s])
+		if err != nil {
+			return 0, err
+		}
+		totalNZ += nz
+		// Scatter sub-block coefficients into the 8x8 block in raster order.
+		// subBlock[k] carries zigzag position 16*s + k.
+		for k := 0; k < 16; k++ {
+			if subBlock[k] == 0 {
+				continue
+			}
+			scanPos := 16*s + k
+			coeffs[zigzagToRaster8x8[scanPos]] = subBlock[k]
+		}
+	}
+	return totalNZ, nil
 }
 
 func NewDecoder() *Decoder {
@@ -258,6 +313,11 @@ func (d *Decoder) ensureImg() {
 // DebugMBBits, if non-nil, is called with (mbx, mby, startBit, endBit) for each MB.
 var DebugMBBits func(mbx, mby, startBit, endBit int)
 
+// DebugPSliceTrace, if non-nil, is called for every MB in a P-slice with full context.
+// branch: "S" = skip (inside skipRun batch), "N" = non-skip.
+// rawVal: skipRun UE value for "S", mbType UE value for "N".
+var DebugPSliceTrace func(mbx, mby int, branch string, startBit, endBit int, rawVal uint32)
+
 func (d *Decoder) decodeISlice(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
 	for mby := 0; mby < d.mbh; mby++ {
 		for mbx := 0; mbx < d.mbw; mbx++ {
@@ -329,6 +389,10 @@ func (d *Decoder) decodeMBIntraWithType(br *BitReader, mbx, mby, mbType int) err
 				return fmt.Errorf("transform_size_8x8_flag: %w", err)
 			}
 			if t8x8 {
+				// decodeMBI8x8 exists but is disabled pending bit-exactness
+				// debug; it shared a bit-desync with the inter 8x8 path that
+				// was not resolved this session. Keep the hard-stop until
+				// an isolated fixture proves both paths match FFmpeg.
 				return fmt.Errorf("h264: 8x8 intra transform not supported")
 			}
 		}
@@ -463,6 +527,150 @@ func (d *Decoder) decodeMBI4x4(br *BitReader, mbx, mby int) error {
 				dequant4x4(d.coeff[blk*16:blk*16+16], d.qp)
 				idct4x4(d.coeff[blk*16 : blk*16+16])
 				d.addResidual4x4(y, x, d.coeff[blk*16:blk*16+16])
+			}
+		}
+	}
+
+	if err := d.decodeChroma(br, mbx, mby, int(chromaPredMode), cbpChroma); err != nil {
+		return err
+	}
+	d.storeIntraModes(mbx, mby)
+	d.storeNZCoeff(mbx, mby)
+	d.copyMBToImg(mbx, mby)
+	return nil
+}
+
+// decodeMBI8x8 decodes an I_NxN macroblock using the 8x8 transform, spec 8.5.13.
+// Called from decodeMBIntraWithType when transform_size_8x8_flag=1 on an I_NxN MB.
+//
+// Layout: the MB is split into 4 8x8 luma partitions (raster order: top-left,
+// top-right, bottom-left, bottom-right). Each has its own Intra_8x8 prediction
+// mode read via prev_intra8x8_pred_mode_flag + optional rem_intra8x8_pred_mode.
+//
+// MPM (spec 8.3.2.1): each partition's top-left 4x4 scan index (0, 4, 8, 12)
+// reuses the existing mostProbableMode 4x4 logic — which already handles
+// cross-MB neighbor lookups and the spec 8.3.1.1 joint-DC reset fix. The 8x8
+// mode is stored at all 4 4x4 scan positions within its partition so neighbor
+// queries return the same value regardless of which 4x4 they land on.
+//
+// Residual: 4 × 64-coeff blocks via read8x8ResidualCAVLC + dequant8x8 + idct8x8.
+func (d *Decoder) decodeMBI8x8(br *BitReader, mbx, mby int) error {
+	var predModes [4]int
+	for p := 0; p < 4; p++ {
+		// Top-left 4x4 scan index of partition p is p*4 (scans 0,4,8,12).
+		scanIdx := p * 4
+		prevFlag, err := br.ReadBool()
+		if err != nil {
+			return err
+		}
+		mpm := d.mostProbableMode(mbx, mby, scanIdx)
+		if prevFlag {
+			predModes[p] = mpm
+		} else {
+			rem, err := br.ReadBits(3)
+			if err != nil {
+				return err
+			}
+			if int(rem) < mpm {
+				predModes[p] = int(rem)
+			} else {
+				predModes[p] = int(rem) + 1
+			}
+		}
+		// Store mode at all 4 4x4 scan indices in this partition so within-MB
+		// and cross-MB neighbor lookups return the 8x8 mode consistently.
+		for k := 0; k < 4; k++ {
+			d.intraModeCur[p*4+k] = predModes[p]
+		}
+	}
+
+	chromaPredMode, err := br.ReadUE()
+	if err != nil {
+		return err
+	}
+	if chromaPredMode > 3 {
+		return fmt.Errorf("invalid intra_chroma_pred_mode %d", chromaPredMode)
+	}
+
+	cbpCode, err := br.ReadUE()
+	if err != nil {
+		return err
+	}
+	if int(cbpCode) >= len(cbpTableIntra4x4) {
+		return fmt.Errorf("invalid CBP code %d", cbpCode)
+	}
+	cbp := cbpTableIntra4x4[cbpCode]
+	cbpLuma := cbp % 16
+	cbpChroma := cbp / 16
+
+	if cbp > 0 {
+		qpDelta, err := br.ReadSE()
+		if err != nil {
+			return err
+		}
+		d.qp = (d.qp + int(qpDelta) + 52) % 52
+	}
+
+	var blk [64]int16
+	for p := 0; p < 4; p++ {
+		partY := (p / 2) * 8
+		partX := (p % 2) * 8
+		y := ybrYY + partY
+		x := ybrYX + partX
+
+		// Neighbor availability for this 8x8 partition's intra prediction.
+		hasTop := partY > 0 || mby > 0
+		hasLeft := partX > 0 || mbx > 0
+		hasCorner := (partY > 0 && partX > 0) ||
+			(partY > 0 && mbx > 0) ||
+			(partX > 0 && mby > 0) ||
+			(mbx > 0 && mby > 0)
+
+		// above-right for each partition:
+		//  p=0: columns 8..15 of y=-1 come from above MB (if mby > 0).
+		//  p=1: columns 16..23 of y=-1 come from above-right MB (mbx+1, mby-1).
+		//  p=2: partition 1 is already decoded; its bottom row is our above-right.
+		//  p=3: past right edge; right MB not yet decoded.
+		aboveRightAvail := false
+		switch p {
+		case 0:
+			aboveRightAvail = mby > 0
+		case 1:
+			aboveRightAvail = mby > 0 && mbx < d.mbw-1
+		case 2:
+			aboveRightAvail = true
+		case 3:
+			aboveRightAvail = false
+		}
+
+		samples := d.prepareIntra8x8Samples(y, x, hasTop, hasLeft, hasCorner, aboveRightAvail)
+		predIntra8x8Func[predModes[p]](d, y, x, &samples)
+
+		if cbpLuma&(1<<uint(p)) != 0 {
+			for i := range blk {
+				blk[i] = 0
+			}
+			// nC at the 8x8 partition's top-left 4x4 scan index, reused for
+			// all 4 CAVLC sub-blocks — matches reference decoders (FFmpeg /
+			// JM). Using nC=0 here desyncs bit consumption from encoder.
+			nC := d.calcNC(mbx, mby, p*4)
+			nz, err := read8x8ResidualCAVLC(br, blk[:], [4]int{nC, nC, nC, nC})
+			if err != nil {
+				return err
+			}
+			if nz > 0 {
+				dequant8x8(blk[:], d.qp)
+				idct8x8(blk[:])
+				d.addResidual8x8(y, x, blk[:])
+			}
+			// Spec-aligned nz tracking for 8x8 (matches FFmpeg): all 4 4x4
+			// scan positions within the 8x8 get 16 if any nz, else 0.
+			mark := 0
+			if nz > 0 {
+				mark = 16
+			}
+			for k := 0; k < 4; k++ {
+				d.nzCoeffCur[p*4+k] = mark
 			}
 		}
 	}
@@ -624,6 +832,22 @@ func (d *Decoder) addResidual4x4(y, x int, coeffs []int16) {
 	for j := 0; j < 4; j++ {
 		for i := 0; i < 4; i++ {
 			val := int(d.ybr[y+j][x+i]) + int(coeffs[j*4+i])
+			if val < 0 {
+				val = 0
+			} else if val > 255 {
+				val = 255
+			}
+			d.ybr[y+j][x+i] = uint8(val)
+		}
+	}
+}
+
+// addResidual8x8 adds an 8x8 residual (64 coeffs in raster order) to the
+// prediction at ybr[y..y+7][x..x+7], clamping to [0, 255].
+func (d *Decoder) addResidual8x8(y, x int, coeffs []int16) {
+	for j := 0; j < 8; j++ {
+		for i := 0; i < 8; i++ {
+			val := int(d.ybr[y+j][x+i]) + int(coeffs[j*8+i])
 			if val < 0 {
 				val = 0
 			} else if val > 255 {
@@ -814,6 +1038,15 @@ func (d *Decoder) storeIntraModes(mbx, mby int) {
 }
 
 func (d *Decoder) mostProbableMode(mbx, mby, blk int) int {
+	// Spec 8.3.1.1: when mbAddrA or mbAddrB is unavailable, both
+	// intraMxMPredModeA and intraMxMPredModeB are jointly set to Intra_4x4_DC.
+	// "Unavailable" means the neighbor MB lies outside the picture / slice.
+	// Within-MB neighbors (blkLeftIdx/blkAboveIdx >= 0) are always available.
+	leftMBUnavail := blkLeftIdx[blk] < 0 && mbx == 0
+	aboveMBUnavail := blkAboveIdx[blk] < 0 && mby == 0
+	if leftMBUnavail || aboveMBUnavail {
+		return intra4x4DC
+	}
 	modeA := d.getIntraModeNeighbor(mbx, mby, blk, true)
 	modeB := d.getIntraModeNeighbor(mbx, mby, blk, false)
 	if modeA < modeB {

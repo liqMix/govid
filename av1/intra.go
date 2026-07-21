@@ -1,13 +1,21 @@
 package av1
 
-import "math"
+// drIntraDerivative is the dav1d dr_intra_derivative table.
+// Indexed by (angle >> 1) for angles 0..86.
+var drIntraDerivative = [44]int{
+	0,
+	1023, 0, 547, 372, 0, 0, 273, 215, 0, 178, 151, 0, 132, 116, 0,
+	102, 0, 90, 80, 0, 71, 64, 0, 57, 51, 0, 45, 0, 40, 35, 0,
+	31, 27, 0, 23, 19, 0, 15, 0, 11, 0, 7, 3,
+}
 
 // PredictIntra performs intra prediction for a block.
 // dst is the output buffer (row-major), stride is the output stride.
 // above and left are the reference samples (above[0..w-1], left[0..h-1]).
 // topLeft is the top-left corner sample.
+// angleDelta is the angle delta from the bitstream (ignored for non-directional modes).
 func PredictIntra(dst []uint8, stride int, mode int, w, h int,
-	above, left []uint8, topLeft uint8, haveAbove, haveLeft bool) {
+	above, left []uint8, topLeft uint8, haveAbove, haveLeft bool, angleDelta int) {
 
 	switch mode {
 	case IntraDC:
@@ -25,7 +33,7 @@ func PredictIntra(dst []uint8, stride int, mode int, w, h int,
 	case IntraSmoothH:
 		predSmoothH(dst, stride, w, h, above, left)
 	case IntraD45, IntraD135, IntraD113, IntraD157, IntraD203, IntraD67:
-		predDirectional(dst, stride, mode, w, h, above, left, topLeft)
+		predDirectional(dst, stride, mode, w, h, above, left, topLeft, angleDelta)
 	default:
 		predDC(dst, stride, w, h, above, left, haveAbove, haveLeft)
 	}
@@ -165,90 +173,76 @@ var modeToAngle = [NumIntraModes]int{
 	0, 0, 0, 0, // SMOOTH, SMOOTH_V, SMOOTH_H, PAETH
 }
 
-// predDirectional performs directional intra prediction.
-func predDirectional(dst []uint8, stride, mode, w, h int,
-	above, left []uint8, topLeft uint8) {
+// clampRef returns ref[i] with clamping to [0, maxIdx].
+func clampRef(ref []uint8, i, maxIdx int) int {
+	if i < 0 {
+		i = 0
+	} else if i > maxIdx {
+		i = maxIdx
+	}
+	return int(ref[i])
+}
 
-	angle := modeToAngle[mode]
-	if angle == 0 {
+// predDirectional performs directional intra prediction using the
+// dav1d integer-based dr_intra_derivative table.
+func predDirectional(dst []uint8, stride, mode, w, h int,
+	above, left []uint8, topLeft uint8, angleDelta int) {
+
+	angle := modeToAngle[mode] + angleDelta*3
+	if angle <= 0 {
 		return
 	}
 
-	// Compute dx and dy from angle.
-	dx := getDx(angle)
-	dy := getDy(angle)
+	aboveMax := len(above) - 1
+	leftMax := len(left) - 1
 
 	if angle < 90 {
-		// Mainly above reference.
+		// Above-reference prediction.
+		dx := drIntraDerivative[angle>>1]
 		for r := 0; r < h; r++ {
+			idx := (r + 1) * dx
 			for c := 0; c < w; c++ {
-				idx := (r+1)*dx + (c << 8)
-				base := idx >> 8
-				frac := idx & 0xFF
-				if base >= 0 && base < len(above)-1 {
-					dst[r*stride+c] = uint8(
-						(int(above[base])*(256-frac) + int(above[base+1])*frac + 128) >> 8)
-				} else if base >= 0 && base < len(above) {
-					dst[r*stride+c] = above[base]
-				}
+				base := (idx >> 6) + c
+				shift := (idx << 1) & 62
+				a := clampRef(above, base, aboveMax)
+				b := clampRef(above, base+1, aboveMax)
+				dst[r*stride+c] = uint8((a*(64-shift) + b*shift + 32) >> 6)
 			}
 		}
 	} else if angle > 90 && angle < 180 {
-		// Mix of above and left.
+		// Left-reference prediction.
+		dy := drIntraDerivative[(180-angle)>>1]
 		for r := 0; r < h; r++ {
 			for c := 0; c < w; c++ {
-				idx := (c+1)*dy + (r << 8)
-				base := idx >> 8
-				frac := idx & 0xFF
-				if base >= 0 && base < len(left)-1 {
-					dst[r*stride+c] = uint8(
-						(int(left[base])*(256-frac) + int(left[base+1])*frac + 128) >> 8)
-				} else if base >= 0 && base < len(left) {
-					dst[r*stride+c] = left[base]
-				}
+				idx := (c + 1) * dy
+				base := (idx >> 6) + r
+				shift := (idx << 1) & 62
+				a := clampRef(left, base, leftMax)
+				b := clampRef(left, base+1, leftMax)
+				dst[r*stride+c] = uint8((a*(64-shift) + b*shift + 32) >> 6)
 			}
 		}
 	} else if angle > 180 {
-		// Mainly left reference.
+		// Left-reference prediction (angles > 180).
+		dx := drIntraDerivative[(angle-180)>>1]
 		for r := 0; r < h; r++ {
 			for c := 0; c < w; c++ {
-				idx := (c+1)*dx + (r << 8)
-				base := idx >> 8
-				frac := idx & 0xFF
-				if base >= 0 && base < len(left)-1 {
-					dst[r*stride+c] = uint8(
-						(int(left[base])*(256-frac) + int(left[base+1])*frac + 128) >> 8)
-				} else if base >= 0 && base < len(left) {
-					dst[r*stride+c] = left[base]
-				}
+				idx := (c + 1) * dx
+				base := (idx >> 6) + r
+				shift := (idx << 1) & 62
+				a := clampRef(left, base, leftMax)
+				b := clampRef(left, base+1, leftMax)
+				dst[r*stride+c] = uint8((a*(64-shift) + b*shift + 32) >> 6)
 			}
 		}
 	} else {
-		// angle == 90 or 180: handled by V_PRED or H_PRED
+		// angle == 90 or 180: handled by V_PRED or H_PRED.
 		if angle == 90 {
 			predVertical(dst, stride, w, h, above)
 		} else {
 			predHorizontal(dst, stride, w, h, left)
 		}
 	}
-}
-
-// getDx returns the horizontal displacement for a given angle (scaled by 256).
-func getDx(angle int) int {
-	if angle == 90 {
-		return 0
-	}
-	rad := float64(angle) * math.Pi / 180.0
-	return int(math.Round(256.0 / math.Tan(rad)))
-}
-
-// getDy returns the vertical displacement for a given angle (scaled by 256).
-func getDy(angle int) int {
-	if angle == 180 {
-		return 0
-	}
-	rad := float64(angle) * math.Pi / 180.0
-	return int(math.Round(256.0 * math.Tan(rad-math.Pi)))
 }
 
 func abs(x int) int {

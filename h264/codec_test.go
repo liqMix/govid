@@ -1402,6 +1402,761 @@ func TestFrame2WithPerfectReference(t *testing.T) {
 	}
 }
 
+// TestDecodeBGMP4 decodes every packet of examples/videos/bg.mp4 and, on the
+// first decode error, reports the packet index, the sync-sample flag, and the
+// NAL unit types contained in the failing packet. The player silently stops
+// playback on any decode error (player.go:92-94), so a test is the only way
+// to surface the actual decoder error for this file.
+func TestDecodeBGMP4(t *testing.T) {
+	const bgMP4 = "../examples/videos/bg.mp4"
+	if _, err := os.Stat(bgMP4); err != nil {
+		t.Skip("bg.mp4 not found")
+	}
+
+	src := openTestPackets(t, bgMP4)
+	codec := NewCodec()
+
+	type mbTrace struct {
+		mbx, mby         int
+		branch           string
+		startBit, endBit int
+		rawVal           uint32
+	}
+	var trace []mbTrace
+	var lastMBType uint32
+	DebugPSliceTrace = func(mbx, mby int, branch string, startBit, endBit int, rawVal uint32) {
+		trace = append(trace, mbTrace{mbx, mby, branch, startBit, endBit, rawVal})
+	}
+	DebugMBLog = func(mbx, mby, mbType, bitsBeforeMB int) {
+		lastMBType = uint32(mbType)
+	}
+	DebugMBBits = func(mbx, mby, startBit, endBit int) {
+		// Only record if there's no P-slice trace entry already for this bit range.
+		// DebugMBBits is wired for both I-slice and P-slice; trace via DebugPSliceTrace
+		// covers P-slice, so only log I-slice MBs here.
+		if len(trace) > 0 && trace[len(trace)-1].startBit == startBit {
+			return
+		}
+		trace = append(trace, mbTrace{mbx, mby, "I", startBit, endBit, lastMBType})
+	}
+	t.Cleanup(func() {
+		DebugPSliceTrace = nil
+		DebugMBLog = nil
+		DebugMBBits = nil
+	})
+
+	pktIdx := 0
+	framesOk := 0
+	for {
+		pkt, err := src.nextPacket()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("packet %d: nextPacket: %v", pktIdx, err)
+		}
+
+		nals, nerr := ParseNALUnits(pkt.Data, 4)
+		nalDesc := ""
+		if nerr == nil {
+			for _, n := range nals {
+				nalDesc += fmt.Sprintf(" t=%d(%dB)", n.Type, len(n.Data))
+			}
+		} else {
+			nalDesc = fmt.Sprintf(" nalParseErr=%v", nerr)
+		}
+
+		trace = trace[:0]
+		frame, err := codec.Decode(pkt)
+		if err != nil {
+			t.Logf("packet %d (keyframe=%v, size=%dB, nals=%s): Decode failed: %v",
+				pktIdx, pkt.Keyframe, len(pkt.Data), nalDesc, err)
+			// Dump last 40 MBs from the trace to see the desync context.
+			start := len(trace) - 40
+			if start < 0 {
+				start = 0
+			}
+			t.Logf("Last %d MBs of trace (I=I-slice intra, N=non-skip in P, S=skip in P):", len(trace)-start)
+			for _, m := range trace[start:] {
+				kind := "mbType"
+				if m.branch == "S" {
+					kind = "skipRun"
+				}
+				t.Logf("  MB(%3d,%3d) %s bits=[%7d..%7d] span=%4d %s=%d",
+					m.mbx, m.mby, m.branch, m.startBit, m.endBit, m.endBit-m.startBit, kind, m.rawVal)
+			}
+			t.Logf("lastMBType (mbType read for the failing MB) = %d", lastMBType)
+			t.FailNow()
+		}
+		if frame != nil {
+			framesOk++
+		}
+		pktIdx++
+	}
+
+	t.Logf("decoded %d packets → %d frames with no error", pktIdx, framesOk)
+}
+
+// TestDecodeBGMP4VsReference compares the first 30 decoded frames of bg.mp4
+// against a raw-YUV reference produced by ffmpeg. On the first frame where any
+// plane's max pixel error exceeds 2 (deblocking rounding floor), it dumps a
+// per-MB-type error breakdown and a per-MB grid of max errors — enough data to
+// name the broken code path (intra pred / motion comp / skip / deblocking).
+//
+// This is a diagnostic test — it is expected to fail and produce signal.
+func TestDecodeBGMP4VsReference(t *testing.T) {
+	const bgMP4 = "../examples/videos/bg.mp4"
+	const refYUV = "testdata/bg_frames_0_119.yuv"
+	const numFrames = 120
+	const errThreshold = 2
+
+	if _, err := os.Stat(bgMP4); err != nil {
+		t.Skip("bg.mp4 not found")
+	}
+	if _, err := os.Stat(refYUV); err != nil {
+		t.Skip("bg_frames_0_119.yuv not found")
+	}
+
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := openTestPackets(t, bgMP4)
+	codec := NewCodec()
+
+	pkt0, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame0, err := codec.Decode(pkt0)
+	if err != nil {
+		t.Fatalf("frame 0 (IDR): %v", err)
+	}
+	if frame0 == nil || frame0.YCbCr == nil {
+		t.Fatal("frame 0: nil frame")
+	}
+
+	w := frame0.Width
+	h := frame0.Height
+	ySize := w * h
+	cw := w / 2
+	ch := h / 2
+	cSize := cw * ch
+	frameSize := ySize + 2*cSize
+
+	if len(ref) < numFrames*frameSize {
+		t.Fatalf("ref file too small: %d bytes, need %d", len(ref), numFrames*frameSize)
+	}
+	t.Logf("dimensions: %dx%d, frameSize=%d", w, h, frameSize)
+
+	type planeStats struct {
+		wrongPixels int
+		maxError    int
+		totalPixels int
+	}
+	comparePlane := func(decoded []byte, stride int, refData []byte, pw, ph int) planeStats {
+		stats := planeStats{totalPixels: pw * ph}
+		for j := 0; j < ph; j++ {
+			for i := 0; i < pw; i++ {
+				got := int(decoded[j*stride+i])
+				want := int(refData[j*pw+i])
+				d := got - want
+				if d < 0 {
+					d = -d
+				}
+				if d > 0 {
+					stats.wrongPixels++
+				}
+				if d > stats.maxError {
+					stats.maxError = d
+				}
+			}
+		}
+		return stats
+	}
+
+	frames := make([]*govid.Frame, 0, numFrames)
+	frames = append(frames, frame0)
+	for i := 1; i < numFrames; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatalf("frame %d: nextPacket: %v", i, err)
+		}
+		f, err := codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: Decode: %v", i, err)
+		}
+		if f == nil || f.YCbCr == nil {
+			t.Fatalf("frame %d: nil frame", i)
+		}
+		frames = append(frames, f)
+	}
+
+	firstBadFrame := -1
+	for i, f := range frames {
+		refOff := i * frameSize
+		refY := ref[refOff : refOff+ySize]
+		refCb := ref[refOff+ySize : refOff+ySize+cSize]
+		refCr := ref[refOff+ySize+cSize : refOff+ySize+2*cSize]
+
+		ycbcr := f.YCbCr
+		yStats := comparePlane(ycbcr.Y, ycbcr.YStride, refY, w, h)
+		cbStats := comparePlane(ycbcr.Cb, ycbcr.CStride, refCb, cw, ch)
+		crStats := comparePlane(ycbcr.Cr, ycbcr.CStride, refCr, cw, ch)
+
+		frameType := "P"
+		if i == 0 {
+			frameType = "IDR"
+		}
+		t.Logf("frame %2d (%s): Y %d/%d (%.2f%%) max=%3d | Cb max=%3d | Cr max=%3d",
+			i, frameType,
+			yStats.wrongPixels, yStats.totalPixels,
+			100*float64(yStats.wrongPixels)/float64(yStats.totalPixels),
+			yStats.maxError, cbStats.maxError, crStats.maxError)
+
+		if firstBadFrame == -1 && (yStats.maxError > errThreshold || cbStats.maxError > errThreshold || crStats.maxError > errThreshold) {
+			firstBadFrame = i
+		}
+	}
+
+	if firstBadFrame == -1 {
+		t.Log("no frame exceeded error threshold — decoder output matches reference within rounding")
+		return
+	}
+
+	// Per-MB-type error breakdown for the first bad frame.
+	// Re-decode up to and including the bad frame so d.mbInfo reflects it.
+	// (The codec stores mbInfo for the most-recently-decoded frame only.)
+	srcReplay := openTestPackets(t, bgMP4)
+	codecReplay := NewCodec()
+	var badFrame *govid.Frame
+	for i := 0; i <= firstBadFrame; i++ {
+		pkt, err := srcReplay.nextPacket()
+		if err != nil {
+			t.Fatalf("replay frame %d: nextPacket: %v", i, err)
+		}
+		badFrame, err = codecReplay.Decode(pkt)
+		if err != nil {
+			t.Fatalf("replay frame %d: Decode: %v", i, err)
+		}
+	}
+
+	d := codecReplay.dec
+	refOff := firstBadFrame * frameSize
+	refY := ref[refOff : refOff+ySize]
+	ycbcr := badFrame.YCbCr
+	mbw := w / 16
+	mbh := h / 16
+
+	typeNames := map[int]string{
+		-2: "intra ", -1: "skip  ", 0: "L016  ", 1: "L0_168", 2: "L0_816", 3: "L08x8 ", 4: "L08r0 ",
+	}
+	typeMaxErr := make(map[int]int)
+	typeWrongPx := make(map[int]int)
+	typeTotalPx := make(map[int]int)
+	typeCount := make(map[int]int)
+
+	for mby := 0; mby < mbh; mby++ {
+		for mbx := 0; mbx < mbw; mbx++ {
+			mbIdx := mby*mbw + mbx
+			mt := d.mbInfo[mbIdx].mbType
+			typeCount[mt]++
+			typeTotalPx[mt] += 256
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(refY[py*w+px])
+					dd := got - want
+					if dd < 0 {
+						dd = -dd
+					}
+					if dd > 0 {
+						typeWrongPx[mt]++
+					}
+					if dd > mbMax {
+						mbMax = dd
+					}
+				}
+			}
+			if mbMax > typeMaxErr[mt] {
+				typeMaxErr[mt] = mbMax
+			}
+		}
+	}
+
+	t.Logf("=== first bad frame: %d (Y-plane per-MB-type breakdown) ===", firstBadFrame)
+	for mt := -2; mt <= 4; mt++ {
+		if typeCount[mt] == 0 {
+			continue
+		}
+		t.Logf("  type=%s count=%4d wrongPix=%6d/%7d (%5.1f%%) maxErr=%3d",
+			typeNames[mt], typeCount[mt], typeWrongPx[mt], typeTotalPx[mt],
+			100*float64(typeWrongPx[mt])/float64(typeTotalPx[mt]), typeMaxErr[mt])
+	}
+
+	// Grid of per-MB max Y error for the bad frame.
+	// Symbol encodes MB type: I=intra, _=skip, =/-/|/+ for inter variants, . = no error.
+	t.Log("--- per-MB max Y error grid (symbol = MB type; number = max err) ---")
+	for mby := 0; mby < mbh; mby++ {
+		line := fmt.Sprintf("%3d:", mby)
+		for mbx := 0; mbx < mbw; mbx++ {
+			mbIdx := mby*mbw + mbx
+			mt := d.mbInfo[mbIdx].mbType
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(refY[py*w+px])
+					dd := got - want
+					if dd < 0 {
+						dd = -dd
+					}
+					if dd > mbMax {
+						mbMax = dd
+					}
+				}
+			}
+			sym := "."
+			switch mt {
+			case -2:
+				sym = "I"
+			case -1:
+				sym = "_"
+			case 0:
+				sym = "="
+			case 1:
+				sym = "-"
+			case 2:
+				sym = "|"
+			case 3, 4:
+				sym = "+"
+			}
+			if mbMax > 0 {
+				line += fmt.Sprintf(" %s%2d", sym, mbMax)
+			} else {
+				line += "  . "
+			}
+		}
+		t.Log(line)
+	}
+
+	// Find first erroring MB in raster order (any type) and dump detail.
+	firstBadMB := -1
+	for mby := 0; mby < mbh && firstBadMB == -1; mby++ {
+		for mbx := 0; mbx < mbw && firstBadMB == -1; mbx++ {
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(refY[py*w+px])
+					dd := got - want
+					if dd < 0 {
+						dd = -dd
+					}
+					if dd > mbMax {
+						mbMax = dd
+					}
+				}
+			}
+			if mbMax > 0 {
+				firstBadMB = mby*mbw + mbx
+				t.Logf("=== first erroring MB (raster): (%d,%d) maxErr=%d mbType=%d isIntra=%v ===",
+					mbx, mby, mbMax, d.mbInfo[firstBadMB].mbType, d.mbInfo[firstBadMB].isIntra)
+				// Pixel dump.
+				for j := 0; j < 16; j++ {
+					var gotLine, wantLine, diffLine string
+					for i := 0; i < 16; i++ {
+						py := mby*16 + j
+						px := mbx*16 + i
+						g := int(ycbcr.Y[py*ycbcr.YStride+px])
+						wr := int(refY[py*w+px])
+						gotLine += fmt.Sprintf(" %3d", g)
+						wantLine += fmt.Sprintf(" %3d", wr)
+						diffLine += fmt.Sprintf(" %+3d", g-wr)
+					}
+					t.Logf("  first-bad row %2d got:  %s", j, gotLine)
+					t.Logf("  first-bad row %2d ref:  %s", j, wantLine)
+					t.Logf("  first-bad row %2d diff: %s", j, diffLine)
+				}
+			}
+		}
+	}
+
+	// Dump full detail for the first erroring MB matching filter (legacy: P_8x8ref0).
+	for mby := 0; mby < mbh; mby++ {
+		for mbx := 0; mbx < mbw; mbx++ {
+			mbIdx := mby*mbw + mbx
+			info := &d.mbInfo[mbIdx]
+			if info.mbType != 4 { // only P_8x8ref0
+				continue
+			}
+			mbMax := 0
+			for j := 0; j < 16; j++ {
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					got := int(ycbcr.Y[py*ycbcr.YStride+px])
+					want := int(refY[py*w+px])
+					dd := got - want
+					if dd < 0 {
+						dd = -dd
+					}
+					if dd > mbMax {
+						mbMax = dd
+					}
+				}
+			}
+			if mbMax == 0 {
+				continue
+			}
+			t.Logf("=== first erroring P_8x8ref0 MB: (%d,%d) maxErr=%d ===", mbx, mby, mbMax)
+			t.Logf("  subMBType[0..3]: %v", info.subMBType)
+			t.Logf("  refIdx[0..3]:    %v", info.refIdx)
+			for bi := 0; bi < 16; bi++ {
+				t.Logf("  mv[%2d] (4x4 at (%d,%d)): (%d, %d)", bi, (bi%4)*4, (bi/4)*4, info.mv[bi][0], info.mv[bi][1])
+			}
+			// Show all 16 rows of got vs want
+			for j := 0; j < 16; j++ {
+				var gotLine, wantLine, diffLine string
+				for i := 0; i < 16; i++ {
+					py := mby*16 + j
+					px := mbx*16 + i
+					g := int(ycbcr.Y[py*ycbcr.YStride+px])
+					wr := int(refY[py*w+px])
+					dd := g - wr
+					gotLine += fmt.Sprintf(" %3d", g)
+					wantLine += fmt.Sprintf(" %3d", wr)
+					diffLine += fmt.Sprintf(" %+3d", dd)
+				}
+				t.Logf("  row %2d got:  %s", j, gotLine)
+				t.Logf("  row %2d ref:  %s", j, wantLine)
+				t.Logf("  row %2d diff: %s", j, diffLine)
+			}
+			goto dumpDone
+		}
+	}
+dumpDone:
+
+	// Intentionally fail so the diagnostic log is surfaced via `go test -v`.
+	t.Errorf("decoder diverges from reference starting at frame %d — see log above", firstBadFrame)
+}
+
+// TestDecodeBGMP4Frame18_DumpIntra dumps the intra prediction modes + residual
+// coefficients for MB(0,0) of frame 18 so we can see what the decoder chose.
+func TestDecodeBGMP4Frame18_DumpIntra(t *testing.T) {
+	const bgMP4 = "../examples/videos/bg.mp4"
+	if _, err := os.Stat(bgMP4); err != nil {
+		t.Skip("bg.mp4 not found")
+	}
+
+	type modesInfo struct {
+		mbx, mby, cbpLuma, cbpChroma int
+		modes                        [16]int
+	}
+	var i4Dump []modesInfo
+	var mbTypeDump = make(map[int]int) // mbIdx → mbType read at that MB
+	DebugI4x4Modes = func(mbx, mby int, modes [16]int, cbpLuma, cbpChroma int) {
+		if mbx == 0 && mby == 0 {
+			i4Dump = append(i4Dump, modesInfo{mbx, mby, cbpLuma, cbpChroma, modes})
+		}
+	}
+	DebugMBLog = func(mbx, mby, mbType, bitsBeforeMB int) {
+		if mbx == 0 && mby == 0 {
+			mbTypeDump[len(mbTypeDump)] = mbType
+		}
+	}
+	t.Cleanup(func() {
+		DebugI4x4Modes = nil
+		DebugMBLog = nil
+	})
+
+	src := openTestPackets(t, bgMP4)
+	codec := NewCodec()
+	for i := 0; i <= 18; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatalf("pkt %d: %v", i, err)
+		}
+		_, err = codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("decode %d: %v", i, err)
+		}
+	}
+
+	t.Logf("mbType read events for MB(0,0) across frames: %v", mbTypeDump)
+	t.Logf("I4x4 mode events for MB(0,0): %d events", len(i4Dump))
+	for i, info := range i4Dump {
+		t.Logf("  event %d: cbpLuma=%d cbpChroma=%d modes=%v", i, info.cbpLuma, info.cbpChroma, info.modes)
+	}
+}
+
+// TestDecodeBGMP4Frame7_DumpCoeff dumps CAVLC-decoded coefficients for every 4x4
+// luma residual block in MB(13,21) of frame 7. Used to verify whether the
+// coefficients themselves or the placement/MC is the root of the error.
+func TestDecodeBGMP4Frame7_DumpCoeff(t *testing.T) {
+	const bgMP4 = "../examples/videos/bg.mp4"
+	if _, err := os.Stat(bgMP4); err != nil {
+		t.Skip("bg.mp4 not found")
+	}
+
+	type blkEntry struct {
+		mbx, mby, blk, nz, nC int
+		coeffs                [16]int16
+	}
+	var dump []blkEntry
+	DebugBlkLog = func(mbx, mby, blk, nz int, coeffs []int16, _ int, nC int) {
+		if mbx != 13 || mby != 21 {
+			return
+		}
+		var e blkEntry
+		e.mbx, e.mby, e.blk, e.nz, e.nC = mbx, mby, blk, nz, nC
+		copy(e.coeffs[:], coeffs)
+		dump = append(dump, e)
+	}
+	t.Cleanup(func() { DebugBlkLog = nil })
+
+	src := openTestPackets(t, bgMP4)
+	codec := NewCodec()
+	for i := 0; i <= 7; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatalf("pkt %d: %v", i, err)
+		}
+		_, err = codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("decode %d: %v", i, err)
+		}
+	}
+
+	t.Logf("MB(13,21) frame 7 — %d residual blocks parsed:", len(dump))
+	for _, e := range dump {
+		t.Logf("  blk=%2d nz=%d nC=%d coeffs=%v", e.blk, e.nz, e.nC, e.coeffs)
+	}
+}
+
+// TestDecodeBGMP4Frame7_DeblockIsolation toggles deblocking on/off and re-checks
+// the specific error pixel (13,21) at (col=4, row=12). If the error is present
+// only with deblocking enabled, the bug is in the deblocking filter for 4x4
+// sub-partition edges in P_8x8ref0 MBs.
+func TestDecodeBGMP4Frame7_DeblockIsolation(t *testing.T) {
+	const bgMP4 = "../examples/videos/bg.mp4"
+	const refYUV = "testdata/bg_frames_0_119.yuv"
+
+	if _, err := os.Stat(bgMP4); err != nil {
+		t.Skip("bg.mp4 not found")
+	}
+	if _, err := os.Stat(refYUV); err != nil {
+		t.Skip("bg_frames_0_119.yuv not found")
+	}
+
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(disableDeblock bool) (yMaxAtTarget int, yFrameMax int) {
+		src := openTestPackets(t, bgMP4)
+		codec := NewCodec()
+		codec.dec.disableDeblock = disableDeblock
+
+		var f *govid.Frame
+		for i := 0; i <= 7; i++ {
+			pkt, err := src.nextPacket()
+			if err != nil {
+				t.Fatalf("pkt %d: %v", i, err)
+			}
+			f, err = codec.Decode(pkt)
+			if err != nil {
+				t.Fatalf("decode %d: %v", i, err)
+			}
+		}
+		w := f.Width
+		h := f.Height
+		ySize := w * h
+		cSize := (w / 2) * (h / 2)
+		frameSize := ySize + 2*cSize
+		refY := ref[7*frameSize : 7*frameSize+ySize]
+		ycbcr := f.YCbCr
+
+		// Compute max Y err across whole frame + at the specific target pixel.
+		targetPx := 13*16 + 4
+		targetPy := 21*16 + 12
+		got := int(ycbcr.Y[targetPy*ycbcr.YStride+targetPx])
+		want := int(refY[targetPy*w+targetPx])
+		yMaxAtTarget = got - want
+		if yMaxAtTarget < 0 {
+			yMaxAtTarget = -yMaxAtTarget
+		}
+		for j := 0; j < h; j++ {
+			for i := 0; i < w; i++ {
+				gg := int(ycbcr.Y[j*ycbcr.YStride+i])
+				ww := int(refY[j*w+i])
+				dd := gg - ww
+				if dd < 0 {
+					dd = -dd
+				}
+				if dd > yFrameMax {
+					yFrameMax = dd
+				}
+			}
+		}
+		return
+	}
+
+	// With deblock (default). Reference has deblock too, so this is the apples-to-apples case.
+	withTgt, withFrameMax := run(false)
+	withoutTgt, withoutFrameMax := run(true)
+
+	t.Logf("frame 7 target pixel (col=4, row=12 of MB(13,21)):")
+	t.Logf("  deblock ENABLED:  err at target = %d, frame max Y err = %d", withTgt, withFrameMax)
+	t.Logf("  deblock DISABLED: err at target = %d, frame max Y err = %d", withoutTgt, withoutFrameMax)
+
+	if withTgt > 0 && withoutTgt == 0 {
+		t.Log("CONCLUSION: target pixel error appears ONLY with deblock enabled → bug is in deblocking")
+	} else if withTgt == withoutTgt {
+		t.Log("CONCLUSION: target pixel error is SAME with/without deblock → bug is in MC or residual (not deblock)")
+	} else {
+		t.Logf("CONCLUSION: target err changed from %d (with) to %d (without) — partial deblock contribution", withTgt, withoutTgt)
+	}
+}
+
+// TestDecodeH264_8x8InterVsReference is currently skipped. Primitives for
+// 8x8 (idct8x8, dequant8x8, predfunc8x8, read8x8ResidualCAVLC) are in place,
+// but wiring both inter and intra paths caused CAVLC bit desync on real
+// x264 streams that was not resolved this session. The hard-stops at
+// decode.go and pslice.go remain active. See project memory
+// project_h264_phaseA_8x8.md for the debug state.
+func TestDecodeH264_8x8InterVsReference_DISABLED(t *testing.T) {
+	const mp4Path = "testdata/bg_8x8inter.mp4"
+	const refYUVPath = "testdata/bg_8x8inter_yuv.yuv"
+	const numFrames = 120
+	const errThreshold = 2
+
+	if _, err := os.Stat(mp4Path); err != nil {
+		t.Skip("bg_8x8inter.mp4 not found")
+	}
+	if _, err := os.Stat(refYUVPath); err != nil {
+		t.Skip("bg_8x8inter_yuv.yuv not found")
+	}
+
+	// Tag 8x8 intra MBs so we can see which ones appear before any desync.
+	DebugMBLog = func(mbx, mby, mbType, _ int) {
+		if mbType == -8888 {
+			t.Logf("  8x8-intra MB at (%d,%d)", mbx, mby)
+		}
+	}
+	t.Cleanup(func() { DebugMBLog = nil })
+
+	ref, err := os.ReadFile(refYUVPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := openTestPackets(t, mp4Path)
+	codec := NewCodec()
+
+	pkt0, err := src.nextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame0, err := codec.Decode(pkt0)
+	if err != nil {
+		t.Fatalf("frame 0 (IDR): %v", err)
+	}
+	if frame0 == nil || frame0.YCbCr == nil {
+		t.Fatal("frame 0: nil frame")
+	}
+
+	w := frame0.Width
+	h := frame0.Height
+	ySize := w * h
+	cw := w / 2
+	ch := h / 2
+	cSize := cw * ch
+	frameSize := ySize + 2*cSize
+	t.Logf("dimensions: %dx%d, frameSize=%d", w, h, frameSize)
+
+	if len(ref) < numFrames*frameSize {
+		t.Fatalf("ref too small: %d, need %d", len(ref), numFrames*frameSize)
+	}
+
+	comparePlane := func(decoded []byte, stride int, refData []byte, pw, ph int) (wrong, maxErr int) {
+		for j := 0; j < ph; j++ {
+			for i := 0; i < pw; i++ {
+				got := int(decoded[j*stride+i])
+				want := int(refData[j*pw+i])
+				d := got - want
+				if d < 0 {
+					d = -d
+				}
+				if d > 0 {
+					wrong++
+				}
+				if d > maxErr {
+					maxErr = d
+				}
+			}
+		}
+		return
+	}
+
+	frames := make([]*govid.Frame, 0, numFrames)
+	frames = append(frames, frame0)
+	for i := 1; i < numFrames; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatalf("frame %d: nextPacket: %v", i, err)
+		}
+		f, err := codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: Decode: %v", i, err)
+		}
+		if f == nil || f.YCbCr == nil {
+			t.Fatalf("frame %d: nil frame", i)
+		}
+		frames = append(frames, f)
+	}
+
+	firstBad := -1
+	for i, f := range frames {
+		off := i * frameSize
+		refY := ref[off : off+ySize]
+		refCb := ref[off+ySize : off+ySize+cSize]
+		refCr := ref[off+ySize+cSize : off+ySize+2*cSize]
+
+		yc := f.YCbCr
+		yWrong, yMax := comparePlane(yc.Y, yc.YStride, refY, w, h)
+		cbWrong, cbMax := comparePlane(yc.Cb, yc.CStride, refCb, cw, ch)
+		crWrong, crMax := comparePlane(yc.Cr, yc.CStride, refCr, cw, ch)
+
+		tag := "P"
+		if i == 0 {
+			tag = "IDR"
+		}
+		t.Logf("frame %3d (%s): Y %6d (%5.2f%%) max=%3d | Cb %5d max=%3d | Cr %5d max=%3d",
+			i, tag, yWrong, 100*float64(yWrong)/float64(ySize), yMax,
+			cbWrong, cbMax, crWrong, crMax)
+
+		if firstBad == -1 && (yMax > errThreshold || cbMax > errThreshold || crMax > errThreshold) {
+			firstBad = i
+		}
+	}
+
+	if firstBad == -1 {
+		t.Log("all frames bit-exact within tolerance")
+		return
+	}
+	t.Errorf("8x8 decode diverges from reference starting at frame %d", firstBad)
+}
+
 func TestDumpSliceBits(t *testing.T) {
 	src := openTestPackets(t, "testdata/test.mp4")
 

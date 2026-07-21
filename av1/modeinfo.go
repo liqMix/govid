@@ -8,7 +8,6 @@ type blockInfo struct {
 	angleDeltaUV    int
 	bSize           int
 	txSize          int
-	txType          int
 	skip            bool
 	segmentID       int
 	cflAlphaU       int
@@ -17,7 +16,7 @@ type blockInfo struct {
 	cflSignV        int
 	useFilterIntra  bool
 	filterIntraMode int
-	paletteSizeY    int // 0 = no palette, 2-8 = palette size
+	paletteSizeY    int
 	paletteSizeUV   int
 	paletteColorsY  []uint8
 	paletteColorsUV []uint8
@@ -29,52 +28,37 @@ func isDirectional(mode int) bool {
 }
 
 // decodeModeInfo reads per-block intra mode information from the bitstream.
-// Follows AV1 spec intra_frame_mode_info() reading order.
+// TX type is NOT read here — it moves to coeffs.go (per TXB).
 func (td *tileDecoder) decodeModeInfo(miRow, miCol, bSize int) (*blockInfo, error) {
 	bi := &blockInfo{bSize: bSize}
 	fh := td.dec.frameHdr
 	sh := td.dec.seqHdr
 
-	// 1. Segment ID (if Segmentation.Enabled && UpdateMap).
+	// 1. Segment ID.
 	if fh.Segmentation.Enabled && fh.Segmentation.UpdateMap {
 		ctx := td.getSegmentIDCtx(miRow, miCol)
-		seg, err := td.sc.ReadSymbol(td.cdf.SegmentID[ctx], maxSegments)
-		if err != nil {
-			return nil, err
-		}
-		bi.segmentID = seg
+		bi.segmentID = td.sc.ReadSymbol(td.cdf.SegmentID[ctx], maxSegments)
 	}
 
 	// 2. Skip flag.
 	skipCtx := td.getSkipCtx(miRow, miCol)
-	skipSym, err := td.sc.ReadSymbol(td.cdf.Skip[skipCtx], 2)
-	if err != nil {
-		return nil, err
-	}
-	bi.skip = skipSym == 1
+	bi.skip = td.sc.ReadSymbol(td.cdf.Skip[skipCtx], 2) == 1
 
-	// 3. CDEF block index — once per 64x64 region, first non-skip block.
-	if err := td.readCDEF(miRow, miCol, bi.skip); err != nil {
-		return nil, err
-	}
+	// 3. CDEF block index.
+	td.readCDEF(miRow, miCol, bi.skip)
 
 	// 4. Delta Q/LF.
-	if err := td.readDeltaQLF(bSize, bi.skip); err != nil {
-		return nil, err
-	}
+	td.readDeltaQLF(bSize, bi.skip)
 
-	// 5. Y intra mode — keyframes use above/left mode context per spec.
+	// 5. Y intra mode.
 	var yMode int
 	if fh.FrameType == FrameTypeKeyFrame || fh.FrameType == FrameTypeIntraOnly {
 		aboveCtx := td.getKFYModeCtx(miRow, miCol, true)
 		leftCtx := td.getKFYModeCtx(miRow, miCol, false)
-		yMode, err = td.sc.ReadSymbol(td.cdf.KFIntraMode[aboveCtx][leftCtx], NumIntraModes)
+		yMode = td.sc.ReadSymbol(td.cdf.KFIntraMode[aboveCtx][leftCtx], NumIntraModes)
 	} else {
 		sizeCtx := bsizeToIntraModeCtx(bSize)
-		yMode, err = td.sc.ReadSymbol(td.cdf.IntraMode[sizeCtx], NumIntraModes)
-	}
-	if err != nil {
-		return nil, err
+		yMode = td.sc.ReadSymbol(td.cdf.IntraMode[sizeCtx], NumIntraModes)
 	}
 	bi.yMode = yMode
 
@@ -87,14 +71,11 @@ func (td *tileDecoder) decodeModeInfo(miRow, miCol, bSize int) (*blockInfo, erro
 		if deltaIdx >= 8 {
 			deltaIdx = 7
 		}
-		sym, err := td.sc.ReadSymbol(td.cdf.AngleDelta[deltaIdx], 7)
-		if err != nil {
-			return nil, err
-		}
+		sym := td.sc.ReadSymbol(td.cdf.AngleDelta[deltaIdx], 7)
 		bi.angleDeltaY = sym - 3
 	}
 
-	// 7. UV mode: 14 symbols if CfL allowed, 13 otherwise.
+	// 7. UV mode.
 	uvCtx := yMode
 	if uvCtx >= 14 {
 		uvCtx = 13
@@ -102,27 +83,17 @@ func (td *tileDecoder) decodeModeInfo(miRow, miCol, bSize int) (*blockInfo, erro
 	hasChroma := sh.Color.NumPlanes > 1
 	cflAllowed := hasChroma && td.isCfLAllowed(bSize)
 	if cflAllowed {
-		uvMode, err := td.sc.ReadSymbol(td.cdf.IntraModeUVCfL[uvCtx], NumIntraModes+1)
-		if err != nil {
-			return nil, err
-		}
-		bi.uvMode = uvMode
+		bi.uvMode = td.sc.ReadSymbol(td.cdf.IntraModeUVCfL[uvCtx], NumIntraModes+1)
 	} else if hasChroma {
-		uvMode, err := td.sc.ReadSymbol(td.cdf.IntraModeUV[uvCtx], NumIntraModes)
-		if err != nil {
-			return nil, err
-		}
-		bi.uvMode = uvMode
+		bi.uvMode = td.sc.ReadSymbol(td.cdf.IntraModeUV[uvCtx], NumIntraModes)
 	}
 
-	// 8. CfL alpha values if UV mode is CfL.
+	// 8. CfL alpha values.
 	if bi.uvMode == UV_CFL_PRED {
-		if err := td.readCfLAlphas(bi); err != nil {
-			return nil, err
-		}
+		td.readCfLAlphas(bi)
 	}
 
-	// 9. Angle delta for UV directional modes (skip if CfL).
+	// 9. Angle delta for UV directional modes.
 	if bi.uvMode != UV_CFL_PRED && isDirectional(bi.uvMode) {
 		deltaIdx := bi.uvMode - IntraVertical
 		if deltaIdx < 0 {
@@ -131,38 +102,24 @@ func (td *tileDecoder) decodeModeInfo(miRow, miCol, bSize int) (*blockInfo, erro
 		if deltaIdx >= 8 {
 			deltaIdx = 7
 		}
-		sym, err := td.sc.ReadSymbol(td.cdf.AngleDelta[deltaIdx], 7)
-		if err != nil {
-			return nil, err
-		}
+		sym := td.sc.ReadSymbol(td.cdf.AngleDelta[deltaIdx], 7)
 		bi.angleDeltaUV = sym - 3
 	}
 
-	// 10. Palette mode info (when AllowScreenContentTools).
-	if err := td.readPaletteModeInfo(bSize, bi); err != nil {
-		return nil, err
-	}
+	// 10. Palette mode info.
+	td.readPaletteModeInfo(bSize, bi)
 
 	// 11. Filter intra mode info.
-	if err := td.readFilterIntraModeInfo(bSize, bi); err != nil {
-		return nil, err
-	}
+	td.readFilterIntraModeInfo(bSize, bi)
 
-	// 12. TX size: skip blocks use largest, non-skip reads depth.
+	// 12. TX size.
 	if !bi.skip {
-		bi.txSize, err = td.getTXSize(bSize)
-		if err != nil {
-			return nil, err
-		}
+		bi.txSize = td.getTXSize(bSize)
 	} else {
 		bi.txSize = TXSizeForBlockSize[bSize]
 	}
 
-	// 13. TX type (once per block).
-	bi.txType, err = td.readTXType(bi.yMode, bi.txSize, bi.skip)
-	if err != nil {
-		return nil, err
-	}
+	// TX type is read per-TXB in decodeCoeffs (correct per dav1d/spec).
 
 	// Update above/left mode context.
 	bw4 := MISizeWide[bSize]
@@ -186,29 +143,26 @@ func (td *tileDecoder) decodeModeInfo(miRow, miCol, bSize int) (*blockInfo, erro
 }
 
 // readCDEF reads CDEF index for the 64x64 region containing this block.
-// Per spec, it reads once per 64x64 region (first non-skip block).
-func (td *tileDecoder) readCDEF(miRow, miCol int, skip bool) error {
+func (td *tileDecoder) readCDEF(miRow, miCol int, skip bool) {
 	fh, sh := td.dec.frameHdr, td.dec.seqHdr
 	if skip || fh.CodedLossless || !sh.EnableCDEF || fh.AllowIntraBC || fh.CDEF.Bits == 0 {
-		return nil
+		return
 	}
-	// Align to 64x64 boundary (16 MI units).
 	r := miRow & ^15
 	c := miCol & ^15
 	key := [2]int{r, c}
 	if td.cdefRead[key] {
-		return nil
+		return
 	}
 	td.cdefRead[key] = true
-	_, err := td.sc.ReadLiteral(fh.CDEF.Bits)
-	return err
+	td.sc.ReadLiteral(fh.CDEF.Bits)
 }
 
-// readDeltaQLF reads delta Q and delta LF values from the bitstream.
-func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) error {
+// readDeltaQLF reads delta Q and delta LF values.
+func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) {
 	fh := td.dec.frameHdr
 	if !fh.DeltaQPresent || !td.readDeltas {
-		return nil
+		return
 	}
 
 	sbSize := Block64x64
@@ -216,14 +170,11 @@ func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) error {
 		sbSize = Block128x128
 	}
 	if bSize == sbSize && skip {
-		return nil
+		return
 	}
 
-	// Delta Q: per dav1d, 4-symbol CDF then exponential extension if sym==3.
-	deltaQAbs, err := td.readDeltaAbsValue(td.cdf.DeltaQ)
-	if err != nil {
-		return err
-	}
+	// Delta Q.
+	deltaQAbs := td.readDeltaAbsValue(td.cdf.DeltaQ)
 	deltaQSign := 0
 	if deltaQAbs > 0 {
 		if td.sc.ReadBoolEqui() {
@@ -232,10 +183,8 @@ func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) error {
 			deltaQSign = 1
 		}
 	}
-	// Apply delta Q to current quantizer index.
 	if deltaQAbs > 0 {
-		deltaQ := deltaQSign * deltaQAbs
-		td.currentQIdx += deltaQ
+		td.currentQIdx += deltaQSign * deltaQAbs
 		if td.currentQIdx < 1 {
 			td.currentQIdx = 1
 		}
@@ -244,7 +193,7 @@ func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) error {
 		}
 	}
 
-	// Delta LF (if present).
+	// Delta LF.
 	if fh.DeltaLFPresent {
 		lfCount := 1
 		if fh.DeltaLFMulti {
@@ -255,175 +204,102 @@ func (td *tileDecoder) readDeltaQLF(bSize int, skip bool) error {
 			if idx >= 5 {
 				idx = 4
 			}
-			dlAbs, err := td.sc.ReadSymbol(td.cdf.DeltaLF[idx], 4)
-			if err != nil {
-				return err
-			}
+			dlAbs := td.sc.ReadSymbol(td.cdf.DeltaLF[idx], 4)
 			dlAbsVal := int(dlAbs)
 			if dlAbs == 3 {
-				n, err := td.sc.ReadLiteral(3)
-				if err != nil {
-					return err
-				}
+				n := td.sc.ReadLiteral(3)
 				nBits := int(n) + 1
-				extra, err := td.sc.ReadLiteral(nBits)
-				if err != nil {
-					return err
-				}
+				extra := td.sc.ReadLiteral(nBits)
 				dlAbsVal = int(extra) + 1 + (1 << nBits)
 			}
 			if dlAbsVal > 0 {
-				td.sc.ReadBoolEqui() // sign bit (unused)
+				td.sc.ReadBoolEqui()
 			}
 		}
 	}
 
 	td.readDeltas = false
-	return nil
 }
 
 // readDeltaAbsValue reads a delta absolute value using CDF + exponential extension.
-// Per dav1d: sym ∈ {0,1,2}; if sym==3 (rare): n_bits=1+bools(3), val=bools(n_bits)+1+(1<<n_bits).
-func (td *tileDecoder) readDeltaAbsValue(cdf []uint16) (int, error) {
-	sym, err := td.sc.ReadSymbol(cdf, 4)
-	if err != nil {
-		return 0, err
-	}
+func (td *tileDecoder) readDeltaAbsValue(cdf []uint16) int {
+	sym := td.sc.ReadSymbol(cdf, 4)
 	if sym < 3 {
-		return int(sym), nil
+		return sym
 	}
-	n, err := td.sc.ReadLiteral(3)
-	if err != nil {
-		return 3, err
-	}
+	n := td.sc.ReadLiteral(3)
 	nBits := int(n) + 1
-	extra, err := td.sc.ReadLiteral(nBits)
-	if err != nil {
-		return 3, err
-	}
-	return int(extra) + 1 + (1 << nBits), nil
+	extra := td.sc.ReadLiteral(nBits)
+	return int(extra) + 1 + (1 << nBits)
 }
 
 // readCfLAlphas reads CfL sign and alpha magnitudes.
-func (td *tileDecoder) readCfLAlphas(bi *blockInfo) error {
-	signs, err := td.sc.ReadSymbol(td.cdf.CfLSign, 8)
-	if err != nil {
-		return err
-	}
-	// Per libaom: signU = joint_sign / 3, signV = joint_sign % 3
+func (td *tileDecoder) readCfLAlphas(bi *blockInfo) {
+	signs := td.sc.ReadSymbol(td.cdf.CfLSign, 8)
 	signU := signs / 3
 	signV := signs % 3
 	bi.cflSignU = signU
 	bi.cflSignV = signV
 	if signU != 0 {
-		ctx := signV*2 + (signU - 1) // context 0-5
-		alpha, err := td.sc.ReadSymbol(td.cdf.CfLAlpha[ctx], 16)
-		if err != nil {
-			return err
-		}
-		bi.cflAlphaU = alpha + 1
+		ctx := signV*2 + (signU - 1)
+		bi.cflAlphaU = td.sc.ReadSymbol(td.cdf.CfLAlpha[ctx], 16) + 1
 	}
 	if signV != 0 {
-		ctx := signU*2 + (signV - 1) // context 0-5
-		alpha, err := td.sc.ReadSymbol(td.cdf.CfLAlpha[ctx], 16)
-		if err != nil {
-			return err
-		}
-		bi.cflAlphaV = alpha + 1
+		ctx := signU*2 + (signV - 1)
+		bi.cflAlphaV = td.sc.ReadSymbol(td.cdf.CfLAlpha[ctx], 16) + 1
 	}
-	return nil
 }
 
 // readPaletteModeInfo reads palette flags from the bitstream.
-// Per libaom: palette Y flag only read when yMode == DC_PRED,
-// palette UV flag only read when uvMode == DC_PRED.
-func (td *tileDecoder) readPaletteModeInfo(bSize int, bi *blockInfo) error {
+func (td *tileDecoder) readPaletteModeInfo(bSize int, bi *blockInfo) {
 	fh := td.dec.frameHdr
 	sh := td.dec.seqHdr
-	if !fh.AllowScreenContentTools {
-		return nil
-	}
-	if !blockAllowsPalette(bSize) {
-		return nil
+	if !fh.AllowScreenContentTools || !blockAllowsPalette(bSize) {
+		return
 	}
 
-	// Read has_palette_y (only when Y mode is DC_PRED).
 	if bi.yMode == IntraDC {
 		bsCtx := bsizeToPaletteCtx(bSize)
-		hasPaletteY, err := td.sc.ReadSymbol(td.cdf.PaletteY[bsCtx][0], 2)
-		if err != nil {
-			return err
-		}
-		if hasPaletteY == 1 {
-			if err := td.readPaletteColors(bi, 0); err != nil {
-				return err
-			}
+		if td.sc.ReadSymbol(td.cdf.PaletteY[bsCtx][0], 2) == 1 {
+			td.readPaletteColors(bi, 0)
 		}
 	}
 
-	// Read has_palette_uv (only when UV mode is DC_PRED and chroma present).
 	hasChroma := sh.Color.NumPlanes > 1
 	if hasChroma && bi.uvMode == IntraDC {
-		hasPaletteUV, err := td.sc.ReadSymbol(td.cdf.PaletteUV[0], 2)
-		if err != nil {
-			return err
-		}
-		if hasPaletteUV == 1 {
-			if err := td.readPaletteColors(bi, 1); err != nil {
-				return err
-			}
+		if td.sc.ReadSymbol(td.cdf.PaletteUV[0], 2) == 1 {
+			td.readPaletteColors(bi, 1)
 		}
 	}
-
-	return nil
 }
 
-// readPaletteColors reads the palette size and color entries from the bitstream.
-// plane: 0=Y, 1=UV.
-func (td *tileDecoder) readPaletteColors(bi *blockInfo, plane int) error {
+// readPaletteColors reads the palette size and color entries.
+func (td *tileDecoder) readPaletteColors(bi *blockInfo, plane int) {
 	bitDepth := td.dec.seqHdr.Color.BitDepth
 	bsCtx := bsizeToPaletteCtx(bi.bSize)
 
-	// Read palette_size_minus_2 from CDF (7 symbols: sizes 2-8).
 	var sizeCDF []uint16
 	if plane == 0 {
 		sizeCDF = td.cdf.PaletteSizeY[bsCtx]
 	} else {
 		sizeCDF = td.cdf.PaletteSizeUV[bsCtx]
 	}
-	sizeMinus2, err := td.sc.ReadSymbol(sizeCDF, 7)
-	if err != nil {
-		return err
-	}
-	palSize := sizeMinus2 + 2
+	palSize := td.sc.ReadSymbol(sizeCDF, 7) + 2
 
-	// Read palette colors with delta encoding per dav1d.
-	// For the first palette block (no cache), all colors are "new."
 	colors := make([]uint8, palSize)
-	// First color: raw literal.
-	val, err := td.sc.ReadLiteral(bitDepth)
-	if err != nil {
-		return err
-	}
+	val := td.sc.ReadLiteral(bitDepth)
 	colors[0] = uint8(val)
 	prev := int(val)
 	if palSize > 1 {
-		// Read bits parameter: bpc - 3 + read(2).
-		bitsVal, err := td.sc.ReadLiteral(2)
-		if err != nil {
-			return err
-		}
+		bitsVal := td.sc.ReadLiteral(2)
 		bits := bitDepth - 3 + int(bitsVal)
 		maxVal := (1 << bitDepth) - 1
 		isLuma := plane == 0
 		for i := 1; i < palSize; i++ {
-			delta, err := td.sc.ReadLiteral(bits)
-			if err != nil {
-				return err
-			}
+			delta := td.sc.ReadLiteral(bits)
 			d := int(delta)
 			if isLuma {
-				d++ // luma: delta + 1 (per spec: +!pl)
+				d++
 			}
 			prev = prev + d
 			if prev > maxVal {
@@ -433,7 +309,6 @@ func (td *tileDecoder) readPaletteColors(bi *blockInfo, plane int) error {
 			if isLuma {
 				remaining := maxVal - prev - 1
 				if remaining < 0 {
-					// Fill remaining colors with max.
 					for j := i + 1; j < palSize; j++ {
 						colors[j] = uint8(maxVal)
 					}
@@ -457,18 +332,13 @@ func (td *tileDecoder) readPaletteColors(bi *blockInfo, plane int) error {
 		bi.paletteSizeUV = palSize
 		bi.paletteColorsUV = colors
 	}
-	return nil
 }
 
-// readFilterIntraModeInfo reads filter intra mode info per the AV1 spec.
-func (td *tileDecoder) readFilterIntraModeInfo(bSize int, bi *blockInfo) error {
+// readFilterIntraModeInfo reads filter intra mode info.
+func (td *tileDecoder) readFilterIntraModeInfo(bSize int, bi *blockInfo) {
 	sh := td.dec.seqHdr
-	if !sh.EnableFilterIntra {
-		return nil
-	}
-	// Spec conditions: YMode == DC_PRED, PaletteSizeY == 0, Max(w, h) <= 32.
-	if bi.yMode != IntraDC || bi.paletteSizeY > 0 {
-		return nil
+	if !sh.EnableFilterIntra || bi.yMode != IntraDC || bi.paletteSizeY > 0 {
+		return
 	}
 	w := BlockWidth[bSize]
 	h := BlockHeight[bSize]
@@ -477,22 +347,13 @@ func (td *tileDecoder) readFilterIntraModeInfo(bSize int, bi *blockInfo) error {
 		maxDim = h
 	}
 	if maxDim > 32 {
-		return nil
+		return
 	}
 
-	useSym, err := td.sc.ReadSymbol(td.cdf.UseFilterIntra[bSize], 2)
-	if err != nil {
-		return err
-	}
-	bi.useFilterIntra = useSym == 1
+	bi.useFilterIntra = td.sc.ReadSymbol(td.cdf.UseFilterIntra[bSize], 2) == 1
 	if bi.useFilterIntra {
-		fiMode, err := td.sc.ReadSymbol(td.cdf.FilterIntraMode, 5)
-		if err != nil {
-			return err
-		}
-		bi.filterIntraMode = fiMode
+		bi.filterIntraMode = td.sc.ReadSymbol(td.cdf.FilterIntraMode, 5)
 	}
-	return nil
 }
 
 // isCfLAllowed returns true if Chroma-from-Luma is allowed for this block.
@@ -504,14 +365,14 @@ func (td *tileDecoder) isCfLAllowed(bSize int) bool {
 	return BlockWidth[bSize] <= 32 && BlockHeight[bSize] <= 32
 }
 
-// blockAllowsPalette returns true if palette mode is allowed for this block size.
+// blockAllowsPalette returns true if palette mode is allowed.
 func blockAllowsPalette(bSize int) bool {
 	w := BlockWidth[bSize]
 	h := BlockHeight[bSize]
 	return w >= 8 && h >= 8 && w <= 64 && h <= 64
 }
 
-// bsizeToPaletteCtx maps block size to the palette CDF bsize_ctx (0-6).
+// bsizeToPaletteCtx maps block size to palette CDF context (0-6).
 func bsizeToPaletteCtx(bSize int) int {
 	w := BlockWidth[bSize]
 	h := BlockHeight[bSize]
@@ -554,31 +415,42 @@ func (td *tileDecoder) getSkipCtx(miRow, miCol int) int {
 	return ctx
 }
 
+// txPartIdx computes the flat index into TXSize (txpart) CDF array.
+func txPartIdx(maxTx, depth int) int {
+	if maxTx == 1 {
+		return 0
+	}
+	return 2*(maxTx-2) + 1 + depth
+}
+
 // getTXSize determines the transform size for the current block.
-func (td *tileDecoder) getTXSize(bSize int) (int, error) {
+// Reads TX partition decisions with above/left neighbor context.
+func (td *tileDecoder) getTXSize(bSize int) int {
 	txMode := td.dec.frameHdr.TXMode
 	maxTx := TXSizeForBlockSize[bSize]
 
 	switch txMode {
 	case txModeOnly4x4:
-		return TX4x4, nil
+		return TX4x4
 	case txModeLargest:
-		return maxTx, nil
+		return maxTx
 	case txModeSelect:
 		maxDepth := maxTx
 		if maxDepth > 2 {
 			maxDepth = 2
 		}
 		if maxDepth == 0 {
-			return TX4x4, nil
+			return TX4x4
 		}
-		// Sequential binary split decisions per depth level.
 		txDepth := 0
 		for d := 0; d < maxDepth; d++ {
-			split, err := td.sc.ReadSymbol(td.cdf.TXSize[maxTx][d], 2)
-			if err != nil {
-				return TX4x4, err
+			idx := txPartIdx(maxTx, d)
+			if idx > 6 {
+				idx = 6
 			}
+			// TX partition context from above/left neighbors.
+			txCtx := 0 // default context
+			split := td.sc.ReadSymbol(td.cdf.TXSize[idx][txCtx], 2)
 			if split == 0 {
 				break
 			}
@@ -588,46 +460,42 @@ func (td *tileDecoder) getTXSize(bSize int) (int, error) {
 		if result < TX4x4 {
 			result = TX4x4
 		}
-		return result, nil
+		return result
 	default:
-		return maxTx, nil
+		return maxTx
 	}
 }
 
-// dav1d tx_types_per_set mapping tables:
-// Intra2 (reduced/TX16x16): 5 symbols → TX types
+// dav1d tx_types_per_set mapping tables.
 var txTypesIntra2 = [5]int{
-	TxTypeIDENTITY_IDENTITY, // 0: IDTX
-	TxTypeDCT_DCT,           // 1: DCT_DCT
-	TxTypeADST_ADST,         // 2: ADST_ADST
-	TxTypeADST_DCT,          // 3: ADST_DCT
-	TxTypeDCT_ADST,          // 4: DCT_ADST
+	TxTypeIDENTITY_IDENTITY,
+	TxTypeDCT_DCT,
+	TxTypeADST_ADST,
+	TxTypeADST_DCT,
+	TxTypeDCT_ADST,
 }
 
-// Intra1 (non-reduced, TX4x4/TX8x8): 7 symbols → TX types
 var txTypesIntra1 = [7]int{
-	TxTypeIDENTITY_IDENTITY, // 0: IDTX
-	TxTypeDCT_DCT,           // 1: DCT_DCT
-	TxTypeIDENTITY_DCT,      // 2: V_DCT
-	TxTypeDCT_IDENTITY,      // 3: H_DCT
-	TxTypeADST_ADST,         // 4: ADST_ADST
-	TxTypeADST_DCT,          // 5: ADST_DCT
-	TxTypeDCT_ADST,          // 6: DCT_ADST
+	TxTypeIDENTITY_IDENTITY,
+	TxTypeDCT_DCT,
+	TxTypeIDENTITY_DCT,
+	TxTypeDCT_IDENTITY,
+	TxTypeADST_ADST,
+	TxTypeADST_DCT,
+	TxTypeDCT_ADST,
 }
 
 // readTXType reads or derives the TX type for an intra block.
-// Matches dav1d decode.c: derives for TX32x32+, reads intra2 for TX16x16/reduced,
-// reads intra1 for TX4x4/TX8x8 non-reduced.
-func (td *tileDecoder) readTXType(yMode, txSize int, skip bool) (int, error) {
+// Called from coeffs.go per-TXB, not per-block.
+func (td *tileDecoder) readTXType(yMode, txSize int, skip bool) int {
 	fh := td.dec.frameHdr
 
 	if skip || fh.CodedLossless {
-		return TxTypeDCT_DCT, nil
+		return TxTypeDCT_DCT
 	}
 
-	// For intra: max+1 >= TX_64X64 means txSize >= TX32x32 → derive DCT_DCT
 	if txSize >= TX32x32 {
-		return TxTypeDCT_DCT, nil
+		return TxTypeDCT_DCT
 	}
 
 	modeCtx := yMode
@@ -636,48 +504,38 @@ func (td *tileDecoder) readTXType(yMode, txSize int, skip bool) (int, error) {
 	}
 
 	if fh.ReducedTXSet || txSize == TX16x16 {
-		// Intra2: reduced set (4 symbols = nsymbs 5)
 		minCtx := txSize
 		if minCtx > 2 {
 			minCtx = 2
 		}
 		cdf := td.cdf.IntraTXType2[minCtx][modeCtx]
 		if cdf == nil {
-			return TxTypeDCT_DCT, nil
+			return TxTypeDCT_DCT
 		}
-		sym, err := td.sc.ReadSymbol(cdf, 5)
-		if err != nil {
-			return TxTypeDCT_DCT, err
-		}
+		sym := td.sc.ReadSymbol(cdf, 5)
 		if sym < len(txTypesIntra2) {
-			return txTypesIntra2[sym], nil
+			return txTypesIntra2[sym]
 		}
-		return TxTypeDCT_DCT, nil
+		return TxTypeDCT_DCT
 	}
 
-	// Intra1: non-reduced, TX4x4/TX8x8 (6 symbols = nsymbs 7)
 	minCtx := txSize
 	if minCtx > 1 {
 		minCtx = 1
 	}
 	cdf := td.cdf.IntraTXType1[minCtx][modeCtx]
 	if cdf == nil {
-		return TxTypeDCT_DCT, nil
+		return TxTypeDCT_DCT
 	}
-	sym, err := td.sc.ReadSymbol(cdf, 7)
-	if err != nil {
-		return TxTypeDCT_DCT, err
-	}
+	sym := td.sc.ReadSymbol(cdf, 7)
 	if sym < len(txTypesIntra1) {
-		return txTypesIntra1[sym], nil
+		return txTypesIntra1[sym]
 	}
-	return TxTypeDCT_DCT, nil
+	return TxTypeDCT_DCT
 }
 
 // intraModeToTxType derives the TX type from the intra prediction mode.
-// Per AV1 spec Table 7-10. For TX sizes > 16x16, ADST falls back to DCT.
 func intraModeToTxType(mode, txSize int) int {
-	// AV1 spec: ADST/FLIPADST not available for TX sizes > 16x16.
 	if txSize > TX16x16 {
 		return TxTypeDCT_DCT
 	}
@@ -715,7 +573,6 @@ func intraModeToTxType(mode, txSize int) int {
 }
 
 // kfYModeCtxMap maps intra mode to KF Y mode context (0-4).
-// Modes 0-2 → ctx 0-2, modes 3-8 → ctx 3, modes 9-12 → ctx 4.
 var kfYModeCtxMap = [NumIntraModes]int{0, 1, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4}
 
 // getKFYModeCtx returns the keyframe Y mode context from neighbor modes.
@@ -741,7 +598,7 @@ func (td *tileDecoder) getKFYModeCtx(miRow, miCol int, isAbove bool) int {
 			}
 		}
 	}
-	return 0 // DC_PRED context when unavailable
+	return 0
 }
 
 // bsizeToIntraModeCtx maps block size to the intra mode CDF context index.

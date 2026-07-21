@@ -73,7 +73,6 @@ func TestReconstructSingleBlock(t *testing.T) {
 		yMode:  IntraDC,
 		uvMode: IntraDC,
 		txSize: TX16x16,
-		txType: TxTypeDCT_DCT,
 		skip:   true,
 	}
 
@@ -153,7 +152,6 @@ func TestReconstructVerticalPrediction(t *testing.T) {
 		yMode:  IntraVertical,
 		uvMode: IntraDC,
 		txSize: TX4x4,
-		txType: TxTypeDCT_DCT,
 		skip:   true,
 	}
 

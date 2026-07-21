@@ -39,23 +39,25 @@ func TestEOBPositionMapping(t *testing.T) {
 }
 
 func TestTXSizeToCtx(t *testing.T) {
+	// txSizeToCtx is the identity mapping matching dav1d's t_dim->ctx.
 	if txSizeToCtx(TX4x4) != 0 {
 		t.Errorf("TX4x4 ctx = %d, want 0", txSizeToCtx(TX4x4))
 	}
 	if txSizeToCtx(TX8x8) != 1 {
 		t.Errorf("TX8x8 ctx = %d, want 1", txSizeToCtx(TX8x8))
 	}
-	if txSizeToCtx(TX16x16) != 1 {
-		t.Errorf("TX16x16 ctx = %d, want 1", txSizeToCtx(TX16x16))
+	if txSizeToCtx(TX16x16) != 2 {
+		t.Errorf("TX16x16 ctx = %d, want 2", txSizeToCtx(TX16x16))
 	}
-	if txSizeToCtx(TX32x32) != 2 {
-		t.Errorf("TX32x32 ctx = %d, want 2", txSizeToCtx(TX32x32))
+	if txSizeToCtx(TX32x32) != 3 {
+		t.Errorf("TX32x32 ctx = %d, want 3", txSizeToCtx(TX32x32))
 	}
 }
 
 func TestCoeffBaseCtxNeighborSum(t *testing.T) {
 	// Test that coefficient base context computation doesn't panic
 	// with various block dimensions.
+	td := &tileDecoder{}
 	for _, txSize := range []int{TX4x4, TX8x8, TX16x16} {
 		txW := TXWidth[txSize]
 		txH := TXHeight[txSize]
@@ -69,7 +71,7 @@ func TestCoeffBaseCtxNeighborSum(t *testing.T) {
 		levels[txW] = 2
 
 		for c := 0; c < n; c++ {
-			ctx := getCoeffBaseCtx(scan, levels, c, txW, txSize)
+			ctx := td.getCoeffBaseCtxLo(levels, c, txW, txH, scan)
 			if ctx < 0 || ctx > 40 {
 				t.Errorf("txSize=%d pos=%d: ctx=%d out of range [0,40]", txSize, c, ctx)
 			}

@@ -13,6 +13,12 @@ type mbInterInfo struct {
 	subMBType [4]int       // sub-partition types for P_8x8 MBs
 	qp        int          // QP used for this macroblock (for deblocking)
 	mbType    int          // decoded MB type: -1=skip, -2=intra-in-P, 0-4=inter P types
+	// decodedMask is a bitmap: bit i set iff 4x4 block i (raster order) has
+	// been decoded in the current frame. Required by H.264 spec 6.4.8: within
+	// the same MB, neighbors in partitions that have not yet been decoded are
+	// considered unavailable for MV prediction. Without this, getNeighborMVAt
+	// returns stale mv[]/refIdx[] from the previous frame.
+	decodedMask uint16
 }
 
 // predictMVWithSize predicts MV using median predictor from neighbors A, B, C (or D).
@@ -136,6 +142,12 @@ func (d *Decoder) getNeighborMVAt(mbx, mby, px, py int) (mv [2]int16, ref int, a
 		by = 3
 	}
 	blk4x4 := by*4 + bx
+	// Spec 6.4.8: a within-MB neighbor that lies in a partition not yet decoded
+	// is unavailable. Track this via decodedMask; the bit is set when the 4x4
+	// block's MV is stored.
+	if nmbIdx == curMBIdx && info.decodedMask&(uint16(1)<<uint(blk4x4)) == 0 {
+		return [2]int16{0, 0}, -1, false
+	}
 	part8x8 := (by/2)*2 + bx/2
 	return info.mv[blk4x4], info.refIdx[part8x8], true
 }
