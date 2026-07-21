@@ -87,6 +87,10 @@ func discoverVideos(dir string) []string {
 	return paths
 }
 
+// decodeAhead is how many frames the background decoder keeps queued. Four
+// frames absorbs a slow decode without adding noticeable seek latency.
+const decodeAhead = 4
+
 func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -111,13 +115,15 @@ func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 		default:
 			codec = vp8.NewCodec()
 		}
-		player, err = govid.NewPlayer(demuxer, codec)
+		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead)
 		if err != nil {
 			demuxer.Close()
 			f.Close()
 			return nil, nil, fmt.Errorf("player: %w", err)
 		}
-		closers = []io.Closer{demuxer, f}
+		// The player closes first: it returns only once the decode goroutine
+		// has stopped touching the demuxer and file.
+		closers = []io.Closer{player, demuxer, f}
 
 	case ".mpg", ".mpeg":
 		source, err := mpeg1.NewSource(f)
@@ -125,13 +131,13 @@ func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 			f.Close()
 			return nil, nil, fmt.Errorf("mpeg1 source: %w", err)
 		}
-		player, err = govid.NewPlayer(source, source)
+		player, err = govid.NewAsyncPlayer(source, source, decodeAhead)
 		if err != nil {
 			source.Close()
 			f.Close()
 			return nil, nil, fmt.Errorf("player: %w", err)
 		}
-		closers = []io.Closer{source, f}
+		closers = []io.Closer{player, source, f}
 
 	case ".mp4":
 		demuxer, err := mp4pkg.NewDemuxer(f)
@@ -146,13 +152,13 @@ func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 		default:
 			codec = h264.NewCodec()
 		}
-		player, err = govid.NewPlayer(demuxer, codec)
+		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead)
 		if err != nil {
 			demuxer.Close()
 			f.Close()
 			return nil, nil, fmt.Errorf("player: %w", err)
 		}
-		closers = []io.Closer{demuxer, f}
+		closers = []io.Closer{player, demuxer, f}
 
 	default:
 		f.Close()

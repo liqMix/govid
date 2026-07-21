@@ -1,5 +1,7 @@
 # govid
 
+### Disclaimer: This repo is written by Claude.
+
 Pure-Go, codec-agnostic video decoding and playback library — no cgo, no ffmpeg.
 
 > **Status: work in progress.** This is an in-progress project to write video decoders from the specs in Go. Some of it works well (the H.264 decoder is bit-exact against ffmpeg on the test clips); some of it is half-finished (VP8 inter frames drift); and some of it does not produce correct pictures yet at all (AV1). See the status table below before depending on any of it.
@@ -70,6 +72,10 @@ gen2brain/mpeg (MPEG-1)           113ms      0.94ms     1063.6
 
 Enough for 720p30 real-time playback in a game loop; MPEG-1 is far cheaper if you control the encoding.
 
+Per second of 30 fps video that works out to ~414 ms of CPU for H.264 (~41% of one core) versus ~28 ms for MPEG-1 (~2.8%). With `NewPlayer` that cost lands on whichever goroutine calls `Update` — in a 60 TPS game loop, H.264's 13.8 ms decode eats most of the 16.7 ms tick budget on the ticks where a new frame is due. Use [`NewAsyncPlayer`](#decoding-off-the-game-thread) to move it off that goroutine.
+
+At matched quality (SSIM measured against the same 720p source), Baseline H.264 is roughly half the size of MPEG-1 — 0.945 SSIM costs ~886 KB as MPEG-1 versus ~410 KB as H.264. So: MPEG-1 buys frame budget, H.264 buys install size.
+
 ## Architecture
 
 ```
@@ -85,6 +91,7 @@ Player (orchestration)
    │
    ├── Update() / UpdateToTime() / Seek() / SetLoop()
    ├── CurrentFrame() → *Frame
+   ├── Close()  — stops the decode goroutine (async players)
    │
 Frame
    │
@@ -165,6 +172,32 @@ Encode input with a Baseline-profile, CAVLC, no-B-frame configuration:
 ```bash
 ffmpeg -i input.mov -c:v libx264 -profile:v baseline -bf 0 -pix_fmt yuv420p out.mp4
 ```
+
+### Decoding off the game thread
+
+`NewPlayer` decodes inline: `Update` demuxes and decodes the next frame on the calling goroutine, so a 13.8 ms H.264 decode is 13.8 ms your game loop does not get. `NewAsyncPlayer` runs the demux+decode on a background goroutine and keeps a bounded queue of frames ready:
+
+```go
+// Keep 4 frames decoded ahead.
+player, err := govid.NewAsyncPlayer(demuxer, h264.NewCodec(), 4)
+if err != nil {
+	panic(err)
+}
+// Close before closing the demuxer — it returns only once the decode
+// goroutine has stopped touching it.
+defer player.Close()
+```
+
+The rest of the API is identical. The behavioral difference is what happens when the decoder falls behind: `Update` and `UpdateToTime` return `false` and leave the current frame on screen instead of blocking. A dropped tick shows a stale frame; it does not stall the loop.
+
+Details worth knowing:
+
+- **Depth** bounds both memory and latency. Each queued frame is a full YCbCr copy (~1.4 MB at 720p), and the queue applies backpressure — the decoder stops once it is full, so a paused player does not run away decoding.
+- **`Seek`, loop restart, and the initial two frames still block**, by design: you want the frame you seeked to, now. A seek waits at most one in-flight decode, because the decode goroutine holds the demuxer lock while decoding.
+- **Frames decoded before a seek are discarded**, not displayed — each frame carries a generation stamp that a seek invalidates.
+- **`Close` is required** and is safe to call twice. It stops the goroutine and waits for it to exit, which is what makes closing the demuxer or file afterwards safe. `Close` on a `NewPlayer` player is a no-op, so the two are interchangeable.
+
+`examples/ebitengine/` uses this path for every format it loads.
 
 ### MPEG-1
 

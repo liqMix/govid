@@ -1,7 +1,6 @@
 package govid
 
 import (
-	"io"
 	"time"
 )
 
@@ -17,32 +16,64 @@ const (
 // Player orchestrates demuxing, decoding, and frame timing.
 // It is not thread-safe; the caller must synchronize access.
 type Player struct {
-	demuxer      Demuxer
-	codec        Codec
+	src          frameSource
 	currentFrame *Frame
 	nextFrame    *Frame
 	state        State
 	loop         bool
+	eof          bool
 	startTime    time.Time
 	pauseOffset  time.Duration
 	duration     time.Duration
 }
 
 // NewPlayer creates a player, decodes the first frame, and reads one ahead.
+// Decoding happens inline on the goroutine that calls Update or UpdateToTime.
 func NewPlayer(d Demuxer, c Codec) (*Player, error) {
+	return newPlayer(d, &syncSource{d: d, c: c})
+}
+
+// NewAsyncPlayer creates a player that decodes on a background goroutine,
+// keeping up to depth frames ready ahead of playback. Update and UpdateToTime
+// never block on a decode: if the decoder has not caught up they leave the
+// current frame in place and report no change.
+//
+// The caller must call Close before closing the demuxer or codec, so that the
+// decode goroutine has stopped touching them.
+func NewAsyncPlayer(d Demuxer, c Codec, depth int) (*Player, error) {
+	src := newAsyncSource(d, c, depth)
+	p, err := newPlayer(d, src)
+	if err != nil {
+		src.close()
+		return nil, err
+	}
+	return p, nil
+}
+
+func newPlayer(d Demuxer, src frameSource) (*Player, error) {
 	p := &Player{
-		demuxer:  d,
-		codec:    c,
+		src:      src,
 		state:    StatePaused,
 		duration: d.Duration(),
 	}
-	first, err := readNextFrame(d, c)
+	first, err := src.next()
 	if err != nil {
 		return nil, err
 	}
 	p.currentFrame = first
-	p.nextFrame, _ = readNextFrame(d, c)
+	next, err := src.next()
+	if err != nil {
+		p.eof = true
+	}
+	p.nextFrame = next
 	return p, nil
+}
+
+// Close releases the player's decoding resources. It returns once no further
+// calls will be made to the demuxer or codec. Closing a player created by
+// NewPlayer is a no-op. The demuxer and codec are not closed.
+func (p *Player) Close() error {
+	return p.src.close()
 }
 
 // Play begins or resumes playback.
@@ -85,17 +116,31 @@ func (p *Player) UpdateToTime(t time.Duration) bool {
 
 func (p *Player) advanceTo(elapsed time.Duration) bool {
 	changed := false
-	for p.nextFrame != nil && elapsed >= p.nextFrame.Timestamp {
-		p.currentFrame = p.nextFrame
-		changed = true
-		next, err := readNextFrame(p.demuxer, p.codec)
-		if err != nil {
-			p.nextFrame = nil
+	for {
+		if p.nextFrame == nil {
+			if p.eof {
+				break
+			}
+			next, err := p.src.poll()
+			if err != nil {
+				p.eof = true
+				break
+			}
+			if next == nil {
+				// Async source: the decoder has not produced the next frame
+				// yet. Hold the current frame rather than blocking.
+				break
+			}
+			p.nextFrame = next
+		}
+		if elapsed < p.nextFrame.Timestamp {
 			break
 		}
-		p.nextFrame = next
+		p.currentFrame = p.nextFrame
+		p.nextFrame = nil
+		changed = true
 	}
-	if p.nextFrame == nil && changed {
+	if p.eof && p.nextFrame == nil && changed {
 		if p.loop {
 			p.restartLoop()
 			return true
@@ -106,36 +151,43 @@ func (p *Player) advanceTo(elapsed time.Duration) bool {
 }
 
 func (p *Player) restartLoop() {
-	_, err := p.demuxer.Seek(0)
-	if err != nil {
+	if _, err := p.reload(0); err != nil {
 		p.state = StateStopped
 		return
 	}
-	p.codec.Flush()
-	first, err := readNextFrame(p.demuxer, p.codec)
-	if err != nil {
-		p.state = StateStopped
-		return
-	}
-	p.currentFrame = first
-	p.nextFrame, _ = readNextFrame(p.demuxer, p.codec)
 	p.startTime = time.Now()
 	p.pauseOffset = 0
 }
 
-// Seek jumps to the given position.
-func (p *Player) Seek(t time.Duration) error {
-	actual, err := p.demuxer.Seek(t)
+// reload seeks the source and refills the current and next frames. It returns
+// the position actually seeked to.
+func (p *Player) reload(t time.Duration) (time.Duration, error) {
+	actual, err := p.src.seek(t)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	p.codec.Flush()
-	first, err := readNextFrame(p.demuxer, p.codec)
+	p.eof = false
+	p.nextFrame = nil
+	first, err := p.src.next()
 	if err != nil {
-		return err
+		p.eof = true
+		return 0, err
 	}
 	p.currentFrame = first
-	p.nextFrame, _ = readNextFrame(p.demuxer, p.codec)
+	next, err := p.src.next()
+	if err != nil {
+		p.eof = true
+	}
+	p.nextFrame = next
+	return actual, nil
+}
+
+// Seek jumps to the given position.
+func (p *Player) Seek(t time.Duration) error {
+	actual, err := p.reload(t)
+	if err != nil {
+		return err
+	}
 	p.pauseOffset = actual
 	if p.state == StatePlaying {
 		p.startTime = time.Now().Add(-actual)
@@ -169,23 +221,4 @@ func (p *Player) Duration() time.Duration {
 // State returns the current playback state.
 func (p *Player) State() State {
 	return p.state
-}
-
-func readNextFrame(d Demuxer, c Codec) (*Frame, error) {
-	for {
-		pkt, err := d.NextPacket()
-		if err != nil {
-			if err == io.EOF {
-				return nil, err
-			}
-			return nil, err
-		}
-		frame, err := c.Decode(pkt)
-		if err != nil {
-			return nil, err
-		}
-		if frame != nil {
-			return frame, nil
-		}
-	}
 }
