@@ -19,6 +19,10 @@ type Player struct {
 	src          frameSource
 	currentFrame *Frame
 	nextFrame    *Frame
+	// retired holds the frame displaced one change ago. Its buffer is only
+	// recycled at the following change, giving consumers the whole tick — the
+	// Draw that follows Update included — to finish reading it.
+	retired *Frame
 	state        State
 	loop         bool
 	eof          bool
@@ -38,10 +42,12 @@ func NewPlayer(d Demuxer, c Codec) (*Player, error) {
 // never block on a decode: if the decoder has not caught up they leave the
 // current frame in place and report no change.
 //
+// Pass WithRGBA to also move color conversion onto the decode goroutine.
+//
 // The caller must call Close before closing the demuxer or codec, so that the
 // decode goroutine has stopped touching them.
-func NewAsyncPlayer(d Demuxer, c Codec, depth int) (*Player, error) {
-	src := newAsyncSource(d, c, depth)
+func NewAsyncPlayer(d Demuxer, c Codec, depth int, opts ...AsyncOption) (*Player, error) {
+	src := newAsyncSource(d, c, depth, opts...)
 	p, err := newPlayer(d, src)
 	if err != nil {
 		src.close()
@@ -136,6 +142,8 @@ func (p *Player) advanceTo(elapsed time.Duration) bool {
 		if elapsed < p.nextFrame.Timestamp {
 			break
 		}
+		p.src.release(p.retired)
+		p.retired = p.currentFrame
 		p.currentFrame = p.nextFrame
 		p.nextFrame = nil
 		changed = true
@@ -167,6 +175,11 @@ func (p *Player) reload(t time.Duration) (time.Duration, error) {
 		return 0, err
 	}
 	p.eof = false
+	// The queued next frame is from before the seek and will never be shown;
+	// the displaced current frame keeps its one-change grace period.
+	p.src.release(p.retired)
+	p.src.release(p.nextFrame)
+	p.retired = p.currentFrame
 	p.nextFrame = nil
 	first, err := p.src.next()
 	if err != nil {

@@ -178,8 +178,8 @@ ffmpeg -i input.mov -c:v libx264 -profile:v baseline -bf 0 -pix_fmt yuv420p out.
 `NewPlayer` decodes inline: `Update` demuxes and decodes the next frame on the calling goroutine, so a 13.8 ms H.264 decode is 13.8 ms your game loop does not get. `NewAsyncPlayer` runs the demux+decode on a background goroutine and keeps a bounded queue of frames ready:
 
 ```go
-// Keep 4 frames decoded ahead.
-player, err := govid.NewAsyncPlayer(demuxer, h264.NewCodec(), 4)
+// Keep 4 frames decoded ahead, converting to RGBA on the decode goroutine.
+player, err := govid.NewAsyncPlayer(demuxer, h264.NewCodec(), 4, govid.WithRGBA())
 if err != nil {
 	panic(err)
 }
@@ -196,6 +196,8 @@ Details worth knowing:
 - **`Seek`, loop restart, and the initial two frames still block**, by design: you want the frame you seeked to, now. A seek waits at most one in-flight decode, because the decode goroutine holds the demuxer lock while decoding.
 - **Frames decoded before a seek are discarded**, not displayed — each frame carries a generation stamp that a seek invalidates.
 - **`Close` is required** and is safe to call twice. It stops the goroutine and waits for it to exit, which is what makes closing the demuxer or file afterwards safe. `Close` on a `NewPlayer` player is a no-op, so the two are interchangeable.
+
+`WithRGBA` moves the other per-frame cost off the consumer's goroutine. Without it, `Frame.RGBA()` runs a full YCbCr→RGBA conversion wherever you call it — on the game thread, that is ~6 ms at 1080p (`BenchmarkConvertRGBA1080p`) on top of the decode. With it, the decode goroutine converts, `Frame.HasRGBA()` reports true, and `Frame.RGBA()` is a field read; the Ebitengine bridge then does nothing but `WritePixels`. Conversion buffers are pooled and recycled as frames retire, so a long video does not allocate a frame-sized buffer per frame (~110 MB/s at 720p30). The tradeoff is a lifetime rule: **the slice returned by `Frame.RGBA()` is valid until the second frame change after the one that delivered it** — long enough for the `Update` → `Draw` pair that received it, but copy it if you intend to keep it. Calling `Frame.RGBA()` on a recycled frame stays safe; it recomputes.
 
 `examples/ebitengine/` uses this path for every format it loads.
 

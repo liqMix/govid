@@ -238,6 +238,138 @@ func TestAsyncPlayerCloseStopsDecoding(t *testing.T) {
 	}
 }
 
+func TestAsyncPlayerPreparesRGBAOnDecodeGoroutine(t *testing.T) {
+	d := newTestDemuxer(10, 33*time.Millisecond)
+	p, err := NewAsyncPlayer(d, &testCodec{}, 4, WithRGBA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	f := p.CurrentFrame()
+	if !f.HasRGBA() {
+		t.Fatal("expected the decode goroutine to have converted the frame already")
+	}
+	// The prepared pixels must match what an inline conversion produces.
+	want := convertYCbCr420ToRGBA(f.YCbCr, nil)
+	got := f.RGBA()
+	if len(got) != len(want) {
+		t.Fatalf("length mismatch: got %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("prepared RGBA differs at byte %d: got %d, want %d", i, got[i], want[i])
+		}
+	}
+}
+
+func TestAsyncPlayerWithoutRGBAOptionDefersConversion(t *testing.T) {
+	d := newTestDemuxer(10, 33*time.Millisecond)
+	p, err := NewAsyncPlayer(d, &testCodec{}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if p.CurrentFrame().HasRGBA() {
+		t.Error("expected no conversion without WithRGBA")
+	}
+	if p.CurrentFrame().RGBA() == nil {
+		t.Error("expected RGBA to convert on demand")
+	}
+}
+
+func TestAsyncPlayerRecyclesRGBABuffers(t *testing.T) {
+	const frames = 40
+	d := newTestDemuxer(frames, 33*time.Millisecond)
+	p, err := NewAsyncPlayer(d, &testCodec{}, 4, WithRGBA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.Play()
+
+	seen := make(map[*byte]bool)
+	delivered := 0
+	for i := 1; i < frames; i++ {
+		waitForFrame(t, p, time.Duration(i)*33*time.Millisecond, byte(i))
+		f := p.CurrentFrame()
+		if !f.HasRGBA() {
+			t.Fatalf("frame %d arrived without prepared RGBA", i)
+		}
+		buf := f.RGBA()
+		seen[&buf[0]] = true
+		delivered++
+
+		// A live frame must never share a buffer with the queued next frame.
+		if p.nextFrame != nil && p.nextFrame.HasRGBA() {
+			next := p.nextFrame.RGBA()
+			if &next[0] == &buf[0] {
+				t.Fatalf("frame %d shares its buffer with the queued next frame", i)
+			}
+		}
+	}
+
+	if len(seen) >= delivered {
+		t.Errorf("no buffer reuse: %d distinct buffers for %d frames", len(seen), delivered)
+	}
+	t.Logf("%d distinct buffers for %d frames", len(seen), delivered)
+}
+
+func TestAsyncPlayerRetiredFrameSurvivesOneChange(t *testing.T) {
+	d := newTestDemuxer(10, 33*time.Millisecond)
+	p, err := NewAsyncPlayer(d, &testCodec{}, 4, WithRGBA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.Play()
+
+	first := p.CurrentFrame()
+	firstPix := first.RGBA()
+	firstVal := firstPix[0]
+
+	// One frame change: the frame just displaced keeps its buffer, so a
+	// consumer reading it during the following Draw sees intact pixels.
+	waitForFrame(t, p, 33*time.Millisecond, 1)
+	if !first.HasRGBA() {
+		t.Fatal("frame buffer was recycled one change too early")
+	}
+	if got := first.RGBA()[0]; got != firstVal {
+		t.Fatalf("retired frame pixels changed: got %d, want %d", got, firstVal)
+	}
+
+	// Second change: now it may be recycled, and RGBA must still be safe to
+	// call — it recomputes rather than returning a reused buffer.
+	waitForFrame(t, p, 66*time.Millisecond, 2)
+	if recomputed := first.RGBA(); len(recomputed) != 4*4*4 {
+		t.Fatalf("recycled frame recomputed %d bytes, want %d", len(recomputed), 4*4*4)
+	}
+}
+
+func TestAsyncPlayerSeekRecyclesDiscardedFrames(t *testing.T) {
+	d := newTestDemuxer(20, 33*time.Millisecond)
+	p, err := NewAsyncPlayer(d, &testCodec{}, 4, WithRGBA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.Play()
+
+	waitForFrame(t, p, 99*time.Millisecond, 3)
+	if err := p.Seek(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.CurrentFrame().YCbCr.Y[0]; got != 0 {
+		t.Fatalf("expected frame 0 after seek, got %d", got)
+	}
+	if !p.CurrentFrame().HasRGBA() {
+		t.Error("post-seek frame lost its prepared RGBA")
+	}
+	// Frames decoded before the seek must not be displayed after it.
+	waitForFrame(t, p, 33*time.Millisecond, 1)
+}
+
 func TestAsyncPlayerEmptyStream(t *testing.T) {
 	d := newTestDemuxer(0, 33*time.Millisecond)
 	p, err := NewAsyncPlayer(d, &testCodec{}, 4)

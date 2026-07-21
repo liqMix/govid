@@ -37,8 +37,15 @@ func (v *VideoImage) Update() error {
 				v.height = f.Height
 				v.rgbaBuf = nil
 			}
-			v.rgbaBuf = f.ConvertRGBA(v.rgbaBuf)
-			v.image.WritePixels(v.rgbaBuf)
+			if f.HasRGBA() {
+				// Converted on the decode goroutine (govid.WithRGBA); this
+				// goroutine only uploads. WritePixels copies into ebiten's
+				// atlas, so the buffer may be recycled after this call.
+				v.image.WritePixels(f.RGBA())
+			} else {
+				v.rgbaBuf = f.ConvertRGBA(v.rgbaBuf)
+				v.image.WritePixels(v.rgbaBuf)
+			}
 		}
 	}
 	return nil

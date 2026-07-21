@@ -23,6 +23,10 @@ type frameSource interface {
 	// any frames already decoded from the previous position.
 	seek(time.Duration) (time.Duration, error)
 
+	// release returns a retired frame's pixel buffer for reuse. It is a no-op
+	// for sources that do not pool buffers.
+	release(*Frame)
+
 	// close releases the source. It returns once no further calls will be made
 	// to the underlying demuxer or codec, so the caller may then close them.
 	close() error
@@ -47,7 +51,27 @@ func (s *syncSource) seek(t time.Duration) (time.Duration, error) {
 	return actual, nil
 }
 
+func (s *syncSource) release(*Frame) {}
+
 func (s *syncSource) close() error { return nil }
+
+// AsyncOption configures a player created by NewAsyncPlayer.
+type AsyncOption func(*asyncSource)
+
+// WithRGBA makes the decode goroutine convert each frame to packed RGBA, so
+// Frame.RGBA() costs nothing on the consumer's goroutine — it becomes a field
+// read instead of a full-frame color conversion (~6 ms at 1080p, per
+// BenchmarkConvertRGBA1080p). Use it when the consumer uploads RGBA, as the
+// Ebitengine bridge does.
+//
+// Conversion buffers are pooled and recycled as frames retire, which avoids
+// allocating a frame-sized buffer per frame (~110 MB/s at 720p30). The slice
+// returned by Frame.RGBA() is therefore only valid until the second frame
+// change after the one that delivered it — copy it if you need to keep it.
+// Frame.RGBA() itself stays safe: a recycled frame recomputes on demand.
+func WithRGBA() AsyncOption {
+	return func(a *asyncSource) { a.prepareRGBA = true }
+}
 
 // decoded is one result from the decode-ahead goroutine. gen identifies the
 // seek generation it was decoded for, so results from before a seek can be
@@ -76,11 +100,16 @@ type asyncSource struct {
 	wake   chan struct{}
 	done   chan struct{}
 
+	// prepareRGBA converts frames on the decode goroutine; pool recycles the
+	// conversion buffers handed back through release.
+	prepareRGBA bool
+	pool        sync.Pool // holds *[]byte
+
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 }
 
-func newAsyncSource(d Demuxer, c Codec, depth int) *asyncSource {
+func newAsyncSource(d Demuxer, c Codec, depth int, opts ...AsyncOption) *asyncSource {
 	if depth < 1 {
 		depth = 1
 	}
@@ -91,9 +120,33 @@ func newAsyncSource(d Demuxer, c Codec, depth int) *asyncSource {
 		wake:   make(chan struct{}, 1),
 		done:   make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(a)
+	}
 	a.wg.Add(1)
 	go a.run()
 	return a
+}
+
+// getBuf returns a recycled conversion buffer, or nil to let ConvertRGBA
+// allocate one sized for the stream.
+func (a *asyncSource) getBuf() []byte {
+	if p, _ := a.pool.Get().(*[]byte); p != nil {
+		return (*p)[:0]
+	}
+	return nil
+}
+
+// release returns a frame's conversion buffer to the pool and detaches it from
+// the frame, so a caller still holding the frame recomputes rather than reading
+// a buffer the decoder may have overwritten.
+func (a *asyncSource) release(f *Frame) {
+	if f == nil || f.rgba == nil {
+		return
+	}
+	buf := f.rgba[:0]
+	f.rgba = nil
+	a.pool.Put(&buf)
 }
 
 func (a *asyncSource) run() {
@@ -116,7 +169,14 @@ func (a *asyncSource) run() {
 			// has ended does not spin producing errors.
 			a.parked = true
 		}
+		prepare := a.prepareRGBA
 		a.mu.Unlock()
+
+		if prepare && frame != nil {
+			// Pay the color conversion here rather than on the consumer's
+			// goroutine.
+			frame.rgba = frame.ConvertRGBA(a.getBuf())
+		}
 
 		select {
 		case a.frames <- decoded{frame: frame, err: err, gen: gen}:
@@ -138,6 +198,7 @@ func (a *asyncSource) next() (*Frame, error) {
 		select {
 		case d := <-a.frames:
 			if !a.currentGen(d.gen) {
+				a.release(d.frame)
 				continue
 			}
 			return d.frame, d.err
@@ -152,6 +213,7 @@ func (a *asyncSource) poll() (*Frame, error) {
 		select {
 		case d := <-a.frames:
 			if !a.currentGen(d.gen) {
+				a.release(d.frame)
 				continue
 			}
 			return d.frame, d.err
@@ -189,7 +251,8 @@ func (a *asyncSource) seek(t time.Duration) (time.Duration, error) {
 func (a *asyncSource) drain() {
 	for {
 		select {
-		case <-a.frames:
+		case d := <-a.frames:
+			a.release(d.frame)
 		default:
 			return
 		}

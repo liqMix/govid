@@ -115,7 +115,7 @@ func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 		default:
 			codec = vp8.NewCodec()
 		}
-		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead)
+		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead, govid.WithRGBA())
 		if err != nil {
 			demuxer.Close()
 			f.Close()
@@ -131,7 +131,7 @@ func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 			f.Close()
 			return nil, nil, fmt.Errorf("mpeg1 source: %w", err)
 		}
-		player, err = govid.NewAsyncPlayer(source, source, decodeAhead)
+		player, err = govid.NewAsyncPlayer(source, source, decodeAhead, govid.WithRGBA())
 		if err != nil {
 			source.Close()
 			f.Close()
@@ -152,7 +152,7 @@ func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 		default:
 			codec = h264.NewCodec()
 		}
-		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead)
+		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead, govid.WithRGBA())
 		if err != nil {
 			demuxer.Close()
 			f.Close()

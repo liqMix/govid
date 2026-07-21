@@ -73,6 +73,13 @@ func (f *Frame) ConvertRGBA(dst []byte) []byte {
 	return convertYCbCr420ToRGBA(f.YCbCr, dst)
 }
 
+// HasRGBA reports whether the frame already holds converted RGBA pixels, so
+// RGBA costs nothing. True for frames from a player created with WithRGBA, and
+// for any frame whose RGBA has already been computed.
+func (f *Frame) HasRGBA() bool {
+	return f.rgba != nil
+}
+
 // RGBA returns the frame pixels as packed RGBA bytes.
 // The result is cached; subsequent calls return the same slice.
 func (f *Frame) RGBA() []byte {
