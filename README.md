@@ -79,7 +79,7 @@ go get github.com/liqmix/govid
 
 ## Usage
 
-### H.264 in MP4 (recommended path)
+### H.264 in MP4
 
 ```go
 f, _ := os.Open("video.mp4")
@@ -138,7 +138,53 @@ Same API, different behavior under load: if the decoder falls behind, `Update`/`
 
 ### Ebitengine
 
-`ebitengine/` wraps a player in a `VideoImage`: call its `Update()` in your game's `Update`, draw `Image()` in `Draw`. See [`examples/`](examples) for runnable programs, one per codec.
+```go
+package main
+
+import (
+	"os"
+
+	"github.com/hajimehoshi/ebiten/v2"
+	govid "github.com/liqmix/govid"
+	govidebiten "github.com/liqmix/govid/ebitengine"
+	"github.com/liqmix/govid/mpeg1"
+)
+
+type Game struct {
+	video *govidebiten.VideoImage
+}
+
+func (g *Game) Update() error {
+	g.video.Update()
+	return nil
+}
+
+func (g *Game) Draw(screen *ebiten.Image) {
+	screen.DrawImage(g.video.Image(), nil)
+}
+
+func (g *Game) Layout(_, _ int) (int, int) {
+	f := g.video.Player().CurrentFrame()
+	return f.Width, f.Height
+}
+
+func main() {
+	f, _ := os.Open(os.Args[1])
+	defer f.Close()
+
+	source, _ := mpeg1.NewSource(f)
+	defer source.Close()
+
+	player, _ := govid.NewPlayer(source, source)
+	player.Play()
+
+	game := &Game{video: govidebiten.New(player)}
+	ebiten.SetWindowTitle("govid")
+	ebiten.RunGame(game)
+}
+```
+
+See [`examples/`](examples) for runnable programs, one per codec.
 
 ## Development
 
