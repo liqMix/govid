@@ -49,6 +49,7 @@ func TestPredictMVSingleNeighbor(t *testing.T) {
 
 	// Set left MB (0,0) with a known MV.
 	d.mbInfo[0].isIntra = false
+	d.mbInfo[0].predMask = [4]uint8{1, 1, 1, 1}
 	for k := 0; k < 16; k++ {
 		d.mbInfo[0].mv[k] = [2]int16{8, 4}
 	}
@@ -73,6 +74,7 @@ func TestPredictMVMedian(t *testing.T) {
 
 	// Set left MB (0,1).
 	d.mbInfo[3].isIntra = false
+	d.mbInfo[3].predMask = [4]uint8{1, 1, 1, 1}
 	for k := 0; k < 16; k++ {
 		d.mbInfo[3].mv[k] = [2]int16{4, 2}
 	}
@@ -82,6 +84,7 @@ func TestPredictMVMedian(t *testing.T) {
 
 	// Set above MB (1,0).
 	d.mbInfo[1].isIntra = false
+	d.mbInfo[1].predMask = [4]uint8{1, 1, 1, 1}
 	for k := 0; k < 16; k++ {
 		d.mbInfo[1].mv[k] = [2]int16{12, 8}
 	}
@@ -91,6 +94,7 @@ func TestPredictMVMedian(t *testing.T) {
 
 	// Set above-right MB (2,0).
 	d.mbInfo[2].isIntra = false
+	d.mbInfo[2].predMask = [4]uint8{1, 1, 1, 1}
 	for k := 0; k < 16; k++ {
 		d.mbInfo[2].mv[k] = [2]int16{6, 10}
 	}

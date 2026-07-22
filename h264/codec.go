@@ -7,8 +7,21 @@ import (
 )
 
 // Codec implements govid.Codec for H.264 video.
+//
+// Streams with B-frames arrive in decode order but must be displayed in
+// picture order. The codec keeps a small reorder buffer sized from the SPS
+// VUI max_num_reorder_frames (0 for streams without B-frames, so P-only
+// streams keep zero-latency behavior). Decode returns nil while the buffer
+// fills; Drain returns the tail frames after the last packet.
 type Codec struct {
-	dec *Decoder
+	dec     *Decoder
+	pending []pendingFrame
+	epoch   int64 // increments at each IDR so output keys stay monotonic
+}
+
+type pendingFrame struct {
+	frame *govid.Frame
+	key   int64 // (epoch << 32) | poc
 }
 
 // NewCodec creates a new H.264 codec.
@@ -16,7 +29,25 @@ func NewCodec() *Codec {
 	return &Codec{dec: NewDecoder()}
 }
 
-// Decode decodes an H.264 packet into a video frame.
+// reorderDepth is the number of frames the display reorder buffer holds.
+func (c *Codec) reorderDepth() int {
+	sps := c.dec.activeSPS
+	if sps != nil && sps.MaxNumReorderFrames >= 0 {
+		return sps.MaxNumReorderFrames
+	}
+	if c.dec.sawB {
+		// Stream has B-frames but no VUI restriction: buffer up to the
+		// reference capacity, which bounds any conforming reorder distance.
+		if sps != nil && sps.MaxNumRefFrames > 0 {
+			return int(sps.MaxNumRefFrames)
+		}
+		return 2
+	}
+	return 0
+}
+
+// Decode decodes an H.264 packet and returns the next frame in display
+// order, or nil while the reorder buffer is filling.
 func (c *Codec) Decode(pkt govid.Packet) (*govid.Frame, error) {
 	img, err := c.dec.DecodePacket(pkt.Data)
 	if err != nil {
@@ -27,18 +58,51 @@ func (c *Codec) Decode(pkt govid.Packet) (*govid.Frame, error) {
 		return nil, nil
 	}
 
-	ycbcr := deepCopyYCbCr(img)
-	return &govid.Frame{
-		YCbCr:     ycbcr,
+	if c.dec.curIsIDR {
+		c.epoch++
+	}
+	frame := &govid.Frame{
+		YCbCr:     deepCopyYCbCr(img),
 		Timestamp: pkt.Timestamp,
 		Width:     img.Rect.Dx(),
 		Height:    img.Rect.Dy(),
-	}, nil
+	}
+	c.pending = append(c.pending, pendingFrame{
+		frame: frame,
+		key:   c.epoch<<32 | int64(uint32(c.dec.curPOC)),
+	})
+	if len(c.pending) <= c.reorderDepth() {
+		return nil, nil
+	}
+	return c.popMin(), nil
 }
 
-// Flush resets the decoder state.
+// Drain returns buffered frames in display order after the last packet has
+// been decoded, nil when empty.
+func (c *Codec) Drain() *govid.Frame {
+	return c.popMin()
+}
+
+func (c *Codec) popMin() *govid.Frame {
+	if len(c.pending) == 0 {
+		return nil
+	}
+	min := 0
+	for i := 1; i < len(c.pending); i++ {
+		if c.pending[i].key < c.pending[min].key {
+			min = i
+		}
+	}
+	f := c.pending[min].frame
+	c.pending = append(c.pending[:min], c.pending[min+1:]...)
+	return f
+}
+
+// Flush resets the decoder state (e.g., on seek), discarding buffered frames.
 func (c *Codec) Flush() {
 	c.dec = NewDecoder()
+	c.pending = nil
+	c.epoch = 0
 }
 
 func deepCopyYCbCr(src *image.YCbCr) *image.YCbCr {

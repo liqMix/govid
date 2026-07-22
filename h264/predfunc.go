@@ -5,15 +5,15 @@ package h264
 
 // Intra 4x4 prediction mode constants.
 const (
-	intra4x4Vertical         = 0
-	intra4x4Horizontal       = 1
-	intra4x4DC               = 2
-	intra4x4DiagDownLeft     = 3
-	intra4x4DiagDownRight    = 4
-	intra4x4VerticalRight    = 5
-	intra4x4HorizDown        = 6
-	intra4x4VerticalLeft     = 7
-	intra4x4HorizUp          = 8
+	intra4x4Vertical      = 0
+	intra4x4Horizontal    = 1
+	intra4x4DC            = 2
+	intra4x4DiagDownLeft  = 3
+	intra4x4DiagDownRight = 4
+	intra4x4VerticalRight = 5
+	intra4x4HorizDown     = 6
+	intra4x4VerticalLeft  = 7
+	intra4x4HorizUp       = 8
 )
 
 // Intra 16x16 prediction mode constants.

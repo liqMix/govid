@@ -150,7 +150,14 @@ func (d *Demuxer) NextPacket() (govid.Packet, error) {
 
 	stts := d.videoTrack.Mdia.Minf.Stbl.Stts
 	decTime, _ := stts.GetDecodeTime(d.sampleNr)
-	ts := time.Duration(float64(decTime) / float64(d.timescale) * float64(time.Second))
+	// Composition (presentation) time = decode time + ctts offset. Streams
+	// with B-frames deliver packets in decode order; the timestamp must be
+	// the display time so reordered frames carry correct presentation times.
+	compTime := int64(decTime)
+	if ctts := d.videoTrack.Mdia.Minf.Stbl.Ctts; ctts != nil {
+		compTime += int64(ctts.GetCompositionTimeOffset(d.sampleNr))
+	}
+	ts := time.Duration(float64(compTime) / float64(d.timescale) * float64(time.Second))
 
 	keyframe := d.isSync(d.sampleNr)
 

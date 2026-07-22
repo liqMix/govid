@@ -4,24 +4,24 @@ import "fmt"
 
 // PPS represents a Picture Parameter Set.
 type PPS struct {
-	ID                       uint32
-	SPSID                    uint32
-	EntropyCodingModeFlag    bool // false = CAVLC, true = CABAC
-	BottomFieldPicOrderInFrame bool
-	NumSliceGroupsMinus1     uint32
-	NumRefIdxL0DefaultActive uint32
-	NumRefIdxL1DefaultActive uint32
-	WeightedPredFlag         bool
-	WeightedBipredIDC        uint32
-	PicInitQPMinus26         int32
-	PicInitQSMinus26         int32
-	ChromaQPIndexOffset      int32
+	ID                             uint32
+	SPSID                          uint32
+	EntropyCodingModeFlag          bool // false = CAVLC, true = CABAC
+	BottomFieldPicOrderInFrame     bool
+	NumSliceGroupsMinus1           uint32
+	NumRefIdxL0DefaultActive       uint32
+	NumRefIdxL1DefaultActive       uint32
+	WeightedPredFlag               bool
+	WeightedBipredIDC              uint32
+	PicInitQPMinus26               int32
+	PicInitQSMinus26               int32
+	ChromaQPIndexOffset            int32
 	DeblockingFilterControlPresent bool
-	ConstrainedIntraPred     bool
-	RedundantPicCntPresent   bool
-	Transform8x8Mode         bool
-	PicScalingMatrixPresent  bool
-	SecondChromaQPIndexOffset int32
+	ConstrainedIntraPred           bool
+	RedundantPicCntPresent         bool
+	Transform8x8Mode               bool
+	PicScalingMatrixPresent        bool
+	SecondChromaQPIndexOffset      int32
 }
 
 // ParsePPS parses a PPS from RBSP data (after NAL header removal).

@@ -23,6 +23,9 @@ const (
 	subMBType4x4 = 3
 )
 
+// part8x8Pos maps 8x8 partition index (Z order) to (x, y) pixel offsets.
+var part8x8Pos = [4][2]int{{0, 0}, {8, 0}, {0, 8}, {8, 8}}
+
 // CBP table for inter macroblocks (spec Table 9-4, inter column).
 var cbpTableInter = [48]int{
 	0, 16, 1, 2, 4, 8, 32, 3, 5, 10, 12, 15, 47, 7, 11, 13,
@@ -33,6 +36,9 @@ var cbpTableInter = [48]int{
 func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
 	if len(d.refFrames) == 0 {
 		return nil, fmt.Errorf("P-slice: no reference frames available")
+	}
+	if err := d.buildRefLists(sh); err != nil {
+		return nil, fmt.Errorf("P-slice: %w", err)
 	}
 
 	totalMBs := d.mbw * d.mbh
@@ -51,7 +57,7 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 		for i := 0; i < int(skipRun) && mbIdx < totalMBs; i++ {
 			mbx := mbIdx % d.mbw
 			mby := mbIdx / d.mbw
-			d.decodeMBSkip(mbx, mby)
+			d.decodeMBSkip(mbx, mby, sh)
 			if DebugMBBits != nil {
 				DebugMBBits(mbx, mby, skipStart, skipEnd)
 			}
@@ -91,6 +97,8 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 			}
 			for k := range d.mbInfo[idx].refIdx {
 				d.mbInfo[idx].refIdx[k] = -1
+				d.mbInfo[idx].refIdxL1[k] = -1
+				d.mbInfo[idx].predMask[k] = 0
 			}
 			d.mbInfo[idx].hasCoef = true
 		} else {
@@ -110,7 +118,7 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 	return d.cropImg(), nil
 }
 
-func (d *Decoder) decodeMBSkip(mbx, mby int) {
+func (d *Decoder) decodeMBSkip(mbx, mby int, sh *sliceHeader) {
 	ref := d.getRefFrame(0)
 	if ref == nil {
 		return
@@ -132,6 +140,7 @@ func (d *Decoder) decodeMBSkip(mbx, mby int) {
 	d.motionCompLuma(ref, mbx, mby, mvp, ybrYY, ybrYX, 16, 16)
 	// Motion compensation: chroma.
 	d.motionCompChroma(ref, mbx, mby, mvp)
+	d.applyWeights(sh, 0, ybrYY, ybrYX, 16, 16, 0, 0)
 
 	// Copy to output image.
 	d.copyMBToImg(mbx, mby)
@@ -140,12 +149,22 @@ func (d *Decoder) decodeMBSkip(mbx, mby int) {
 	idx := mby*d.mbw + mbx
 	d.mbInfo[idx].isIntra = false
 	d.mbInfo[idx].mbType = -1 // skip
+	d.mbInfo[idx].transform8x8 = false
 	d.mbInfo[idx].qp = d.qp
+	// CABAC neighbor-context state (no-ops for CAVLC streams).
+	d.mbInfo[idx].cbpCabac = 0
+	d.mbInfo[idx].chromaPredMode = 0
+	d.mbInfo[idx].i16OrPCM = false
+	d.mbInfo[idx].mvdAbs = [16][2]uint8{}
 	for k := 0; k < 16; k++ {
 		d.mbInfo[idx].mv[k] = mvp
 	}
 	for k := 0; k < 4; k++ {
 		d.mbInfo[idx].refIdx[k] = 0
+		d.mbInfo[idx].refPicID[k] = d.refPicID(0)
+		d.mbInfo[idx].refIdxL1[k] = -1
+		d.mbInfo[idx].refPicIDL1[k] = -1
+		d.mbInfo[idx].predMask[k] = 1
 	}
 	d.mbInfo[idx].hasCoef = false
 	d.mbInfo[idx].decodedMask = 0xFFFF
@@ -170,6 +189,14 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 	// availability. Start with no blocks decoded; each partition sets its bits
 	// as it stores MVs.
 	info.decodedMask = 0
+	// P MBs always predict from list 0 only; set before MV prediction so
+	// within-MB neighbor lookups do not see stale two-list state.
+	for k := 0; k < 4; k++ {
+		info.predMask[k] = 1
+		info.refIdxL1[k] = -1
+	}
+	info.isDirectMB = false
+	info.directMask = 0
 
 	// Clear workspace.
 	for i := range d.coeff {
@@ -213,6 +240,7 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 
 		d.motionCompLuma(ref, mbx, mby, mv, ybrYY, ybrYX, 16, 16)
 		d.motionCompChroma(ref, mbx, mby, mv)
+		d.applyWeights(sh, refIdx, ybrYY, ybrYX, 16, 16, 0, 0)
 
 		for k := 0; k < 16; k++ {
 			info.mv[k] = mv
@@ -254,6 +282,7 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 
 			d.motionCompLuma(ref, mbx, mby, mvs[p], ybrYY+partY, ybrYX, 16, 8)
 			d.motionCompChromaBlock(ref, mbx, mby, mvs[p], 0, p*4, 8, 4)
+			d.applyWeights(sh, refs[p], ybrYY+partY, ybrYX, 16, 8, 0, p*4)
 
 			// Store MVs for this partition.
 			startBlk := p * 8 // blocks 0-7 or 8-15
@@ -297,6 +326,7 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 
 			d.motionCompLuma(ref, mbx, mby, mvs[p], ybrYY, ybrYX+partX, 8, 16)
 			d.motionCompChromaBlock(ref, mbx, mby, mvs[p], p*4, 0, 4, 8)
+			d.applyWeights(sh, refs[p], ybrYY, ybrYX+partX, 8, 16, p*4, 0)
 
 			// Store MVs: left half (blocks 0,1,2,3,8,9,10,11) or right half (4,5,6,7,12,13,14,15)
 			// Using 4x4 grid: columns 0-1 for left, 2-3 for right.
@@ -326,7 +356,6 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 	}
 	cbp := cbpTableInter[cbpCode]
 	cbpLuma := cbp & 15
-	cbpChroma := cbp >> 4
 
 	// Read transform_size_8x8_flag for High profile inter MBs.
 	use8x8Transform := false
@@ -346,59 +375,56 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 			if err != nil {
 				return fmt.Errorf("transform_size_8x8_flag: %w", err)
 			}
-			if t8x8 {
-				// Inter 8x8 path is implemented below under use8x8Transform
-				// but shows bit-desync on ~12% of real x264 streams — likely
-				// the CAVLC nC context for 8x8 sub-blocks differs from the
-				// encoder. Keep the hard-stop in place until a bit-exact
-				// fixture is isolated.
-				return fmt.Errorf("h264: 8x8 inter transform not supported")
-			}
 			use8x8Transform = t8x8
 		}
 	}
+	info.transform8x8 = use8x8Transform
 
+	hasCoef, err := d.decodeInterResidualCAVLC(br, mbx, mby, use8x8Transform, cbp)
+	if err != nil {
+		return err
+	}
+
+	info.hasCoef = hasCoef
+	info.qp = d.qp
+	for k := 0; k < 4; k++ {
+		info.refPicID[k] = d.refPicID(info.refIdx[k])
+		info.refIdxL1[k] = -1
+		info.refPicIDL1[k] = -1
+		info.predMask[k] = 1
+	}
+	d.storeIntraModes(mbx, mby)
+	d.storeNZCoeff(mbx, mby)
+	d.copyMBToImg(mbx, mby)
+	return nil
+}
+
+// decodeInterResidualCAVLC decodes the mb_qp_delta and residual of an inter
+// (P or B) macroblock via CAVLC, reconstructing in place. Returns whether
+// any non-zero coefficients were decoded.
+func (d *Decoder) decodeInterResidualCAVLC(br *BitReader, mbx, mby int, use8x8Transform bool, cbp int) (bool, error) {
+	cbpLuma := cbp & 15
+	cbpChroma := cbp >> 4
 	hasCoef := false
 	if cbp > 0 {
 		qpDelta, err := br.ReadSE()
 		if err != nil {
-			return fmt.Errorf("mb_qp_delta: %w", err)
+			return false, fmt.Errorf("mb_qp_delta: %w", err)
 		}
 		d.qp = (d.qp + int(qpDelta) + 52) % 52
 
 		if use8x8Transform {
-			// 8x8 transform path: 4 × 8×8 luma blocks, CBP bit per 8×8 partition.
-			// Each 8×8 is decoded via CAVLC as 4 sub-blocks of 16 coefficients
-			// (spec §9.2.1.2) using read8x8ResidualCAVLC.
-			//
-			// nC for each sub-block uses the 4×4 neighbor predictor at the
-			// partition's top-left 4×4 scan index — this matches reference
-			// decoders (FFmpeg / JM) which compute nC once per 8×8 and reuse
-			// for all 4 sub-blocks. Without this, bit consumption diverges
-			// from the encoder and subsequent MBs desync.
+			// 8x8 transform path: 4 × 8×8 luma blocks, CBP bit per 8×8
+			// partition, each read via read8x8ResidualCAVLC (which handles
+			// per-sub-block nC and nzCoeffCur updates).
 			var blk [64]int16
 			for p := 0; p < 4; p++ {
 				if cbpLuma&(1<<uint(p)) == 0 {
 					continue
 				}
-				for i := range blk {
-					blk[i] = 0
-				}
-				nC := d.calcNC(mbx, mby, p*4)
-				nz, err := read8x8ResidualCAVLC(br, blk[:], [4]int{nC, nC, nC, nC})
+				nz, err := d.read8x8ResidualCAVLC(br, blk[:], mbx, mby, p)
 				if err != nil {
-					return err
-				}
-				// Spec-aligned nz count for 8x8 blocks (matches FFmpeg): all 4
-				// 4x4 scan positions within the 8x8 are stamped with 16 if any
-				// coefficient was non-zero, else 0. This is what neighbor MBs
-				// will read when computing their own 4x4 CAVLC nC context.
-				mark := 0
-				if nz > 0 {
-					mark = 16
-				}
-				for k := 0; k < 4; k++ {
-					d.nzCoeffCur[p*4+k] = mark
+					return false, err
 				}
 				if nz > 0 {
 					hasCoef = true
@@ -417,7 +443,7 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 					nC := d.calcNC(mbx, mby, blk)
 					nz, err := readResidualBlock(br, d.coeff[blk*16:blk*16+16], 16, nC)
 					if err != nil {
-						return err
+						return false, err
 					}
 					d.nzCoeffCur[blk] = nz
 					if DebugBlkLog != nil {
@@ -441,17 +467,11 @@ func (d *Decoder) decodeMBInter(br *BitReader, mbx, mby int, sh *sliceHeader, mb
 		if cbpChroma > 0 {
 			hasCoef = true
 			if err := d.decodeInterChroma(br, mbx, mby, cbpChroma); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
-
-	info.hasCoef = hasCoef
-	info.qp = d.qp
-	d.storeIntraModes(mbx, mby)
-	d.storeNZCoeff(mbx, mby)
-	d.copyMBToImg(mbx, mby)
-	return nil
+	return hasCoef, nil
 }
 
 // decodeInterChroma decodes chroma residual for inter MBs (no intra prediction).
@@ -559,7 +579,7 @@ func (d *Decoder) decodeMB8x8(br *BitReader, mbx, mby int, sh *sliceHeader, mbTy
 	}
 
 	// 8x8 partition positions in the MB (pixel coordinates).
-	part8x8Pos := [4][2]int{{0, 0}, {8, 0}, {0, 8}, {8, 8}}
+	// part8x8Pos is package-level (shared with the CABAC path).
 
 	// Read MVDs and perform motion compensation for each sub-partition.
 	for p := 0; p < 4; p++ {
@@ -587,6 +607,7 @@ func (d *Decoder) decodeMB8x8(br *BitReader, mbx, mby int, sh *sliceHeader, mbTy
 
 			d.motionCompLuma(ref, mbx, mby, mv, ybrYY+py, ybrYX+px, 8, 8)
 			d.motionCompChromaBlock(ref, mbx, mby, mv, px/2, py/2, 4, 4)
+			d.applyWeights(sh, refs[p], ybrYY+py, ybrYX+px, 8, 8, px/2, py/2)
 
 			// Store MVs for all 4x4 blocks in this 8x8 partition.
 			for by := py / 4; by < py/4+2; by++ {
@@ -612,6 +633,7 @@ func (d *Decoder) decodeMB8x8(br *BitReader, mbx, mby int, sh *sliceHeader, mbTy
 
 				d.motionCompLuma(ref, mbx, mby, mv, ybrYY+spy, ybrYX+px, 8, 4)
 				d.motionCompChromaBlock(ref, mbx, mby, mv, px/2, (spy)/2, 4, 2)
+				d.applyWeights(sh, refs[p], ybrYY+spy, ybrYX+px, 8, 4, px/2, spy/2)
 
 				by := spy / 4
 				for bx := px / 4; bx < px/4+2; bx++ {
@@ -636,6 +658,7 @@ func (d *Decoder) decodeMB8x8(br *BitReader, mbx, mby int, sh *sliceHeader, mbTy
 
 				d.motionCompLuma(ref, mbx, mby, mv, ybrYY+py, ybrYX+spx, 4, 8)
 				d.motionCompChromaBlock(ref, mbx, mby, mv, spx/2, py/2, 2, 4)
+				d.applyWeights(sh, refs[p], ybrYY+py, ybrYX+spx, 4, 8, spx/2, py/2)
 
 				bx := spx / 4
 				for by := py / 4; by < py/4+2; by++ {
@@ -661,6 +684,7 @@ func (d *Decoder) decodeMB8x8(br *BitReader, mbx, mby int, sh *sliceHeader, mbTy
 
 				d.motionCompLuma(ref, mbx, mby, mv, ybrYY+spy, ybrYX+spx, 4, 4)
 				d.motionCompChromaBlock(ref, mbx, mby, mv, spx/2, spy/2, 2, 2)
+				d.applyWeights(sh, refs[p], ybrYY+spy, ybrYX+spx, 4, 4, spx/2, spy/2)
 
 				bx := spx / 4
 				by := spy / 4

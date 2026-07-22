@@ -16,9 +16,12 @@ import (
 )
 
 const (
-	benchMP4  = "../examples/videos/bg.mp4"
-	benchMPG  = "../examples/videos/bg_720p30.mpg"
-	benchMaxFrames = 120
+	benchMP4        = "../examples/videos/bg.mp4"
+	benchHighMP4    = "../examples/videos/bg_high.mp4"
+	benchCabacMP4   = "../examples/videos/bg_cabac.mp4"
+	benchDefaultMP4 = "../examples/videos/bg_default.mp4"
+	benchMPG        = "../examples/videos/bg_720p30.mpg"
+	benchMaxFrames  = 120
 )
 
 // TestBenchmarkDecode is a one-shot timing harness (not a Go benchmark) so it
@@ -32,7 +35,25 @@ func TestBenchmarkDecode(t *testing.T) {
 	}
 
 	// --- H.264 via govid ---
-	h264Total, h264Frames := benchH264(t)
+	h264Total, h264Frames := benchH264(t, benchMP4)
+	// --- H.264 High profile (8x8 transform, CAVLC) via govid, if present ---
+	var highTotal time.Duration
+	highFrames := 0
+	if _, err := os.Stat(benchHighMP4); err == nil {
+		highTotal, highFrames = benchH264(t, benchHighMP4)
+	}
+	// --- H.264 High profile CABAC via govid, if present ---
+	var cabacTotal time.Duration
+	cabacFrames := 0
+	if _, err := os.Stat(benchCabacMP4); err == nil {
+		cabacTotal, cabacFrames = benchH264(t, benchCabacMP4)
+	}
+	// --- H.264 full x264 defaults (CABAC + B-frames) via govid, if present ---
+	var defTotal time.Duration
+	defFrames := 0
+	if _, err := os.Stat(benchDefaultMP4); err == nil {
+		defTotal, defFrames = benchH264(t, benchDefaultMP4)
+	}
 	// --- MPEG-1 via gen2brain/mpeg ---
 	mpg1Total, mpg1Frames := benchMPEG1(t)
 
@@ -47,6 +68,15 @@ func TestBenchmarkDecode(t *testing.T) {
 		t.Logf("%-28s %10.0fms %9.2fms %9.1f", name, float64(total.Microseconds())/1000.0, perFrame, fps)
 	}
 	report("govid h264 (pure Go)", h264Total, h264Frames)
+	if highFrames > 0 {
+		report("govid h264 High 8x8 (pure Go)", highTotal, highFrames)
+	}
+	if cabacFrames > 0 {
+		report("govid h264 High CABAC (pure Go)", cabacTotal, cabacFrames)
+	}
+	if defFrames > 0 {
+		report("govid h264 x264 defaults +B", defTotal, defFrames)
+	}
 	report("gen2brain/mpeg (MPEG-1)", mpg1Total, mpg1Frames)
 
 	ratio := float64(h264Total) / float64(mpg1Total)
@@ -54,11 +84,11 @@ func TestBenchmarkDecode(t *testing.T) {
 	t.Logf("h264 / mpeg-1 ratio: %.2fx (h264 is %.2fx the time of mpeg-1)", ratio, ratio)
 }
 
-// benchH264 decodes the H.264 MP4 test file through govid and returns the
+// benchH264 decodes an H.264 MP4 file through govid and returns the
 // wall-clock spent inside Codec.Decode() plus the demuxer's NextPacket(),
 // skipping the file-open / demux-init costs.
-func benchH264(t *testing.T) (time.Duration, int) {
-	src := openTestPackets(t, benchMP4)
+func benchH264(t *testing.T, path string) (time.Duration, int) {
+	src := openTestPackets(t, path)
 	codec := NewCodec()
 
 	// Warm-up: decode 3 frames so the codec's allocation paths are hot.
@@ -73,7 +103,7 @@ func benchH264(t *testing.T) (time.Duration, int) {
 	}
 
 	// Fresh source so we decode from frame 0 in the measured window.
-	src = openTestPackets(t, benchMP4)
+	src = openTestPackets(t, path)
 	codec = NewCodec()
 
 	start := time.Now()

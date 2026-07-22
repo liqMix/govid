@@ -15,14 +15,14 @@ import (
 
 // helper: open an MP4 and return a demuxer-like packet source.
 type testPacketSource struct {
-	reader     io.ReadSeeker
-	track      *govidmp4.TrakBox
-	spsData    []byte
-	ppsData    []byte
-	sampleNr   uint32
+	reader       io.ReadSeeker
+	track        *govidmp4.TrakBox
+	spsData      []byte
+	ppsData      []byte
+	sampleNr     uint32
 	totalSamples uint32
-	timescale  uint32
-	syncMap    map[uint32]bool
+	timescale    uint32
+	syncMap      map[uint32]bool
 }
 
 func openTestPackets(t *testing.T, path string) *testPacketSource {
@@ -119,7 +119,7 @@ func (s *testPacketSource) nextPacket() (govid.Packet, error) {
 	}, nil
 }
 
-func TestCABACRejection(t *testing.T) {
+func TestCABACTruncatedStream(t *testing.T) {
 	// Construct a minimal packet: SPS + PPS (with EntropyCodingModeFlag=true) + IDR slice.
 	// All NAL units use 4-byte length prefixes.
 	//
@@ -131,15 +131,15 @@ func TestCABACRejection(t *testing.T) {
 		0, 0, 0, 6,
 		0x67,       // NAL header: ref_idc=3, type=7 (SPS)
 		0x42, 0xC0, // profile_idc=66 (Baseline), constraint_flags
-		0x1E,       // level_idc=30
-		0xFB,       // UE(0)*5=sps_id,log2maxfn,poc_type,log2maxpoc,maxref | 0=gaps | 1=width
-		0xC8,       // UE(0)=height | 1=frame_mbs_only | 1=direct8x8 | 0=crop | 0=vui | pad
+		0x1E, // level_idc=30
+		0xFB, // UE(0)*5=sps_id,log2maxfn,poc_type,log2maxpoc,maxref | 0=gaps | 1=width
+		0xC8, // UE(0)=height | 1=frame_mbs_only | 1=direct8x8 | 0=crop | 0=vui | pad
 
 		// PPS NAL (length=3)
 		0, 0, 0, 3,
-		0x68,       // NAL header: ref_idc=3, type=8 (PPS)
-		0xEE,       // UE(0)=pps_id | UE(0)=sps_id | 1=CABAC! | 0=bottom_field | UE(0)*3=slicegroups,l0,l1 | 0=weighted_pred
-		0x38,       // 00=weighted_bipred | SE(0)*3=initqp,initqs,chromaqp | 0=deblock | 0=constrained | 0=redundant
+		0x68, // NAL header: ref_idc=3, type=8 (PPS)
+		0xEE, // UE(0)=pps_id | UE(0)=sps_id | 1=CABAC! | 0=bottom_field | UE(0)*3=slicegroups,l0,l1 | 0=weighted_pred
+		0x38, // 00=weighted_bipred | SE(0)*3=initqp,initqs,chromaqp | 0=deblock | 0=constrained | 0=redundant
 
 		// IDR slice NAL (length=2)
 		0, 0, 0, 2,
@@ -147,13 +147,12 @@ func TestCABACRejection(t *testing.T) {
 		0xB8, // UE(0)=first_mb | UE(2)=slice_type(I) | UE(0)=pps_id | pad
 	}
 
+	// CABAC is now supported; a truncated CABAC slice must fail cleanly
+	// (no panic, non-nil error) rather than being rejected up front.
 	codec := NewCodec()
 	_, err := codec.Decode(govid.Packet{Data: packet})
 	if err == nil {
-		t.Fatal("expected error for CABAC stream, got nil")
-	}
-	if !strings.Contains(err.Error(), "CABAC") {
-		t.Fatalf("expected CABAC error, got: %v", err)
+		t.Fatal("expected error for truncated CABAC stream, got nil")
 	}
 }
 
@@ -936,14 +935,22 @@ func TestDecodeTestVsNoDeblock(t *testing.T) {
 					gotCb := int(ycbcr.Cb[py*ycbcr.CStride+px])
 					wantCb := int(ref[ySize+py*cw+px])
 					d := gotCb - wantCb
-					if d < 0 { d = -d }
-					if d > cbMax { cbMax = d }
+					if d < 0 {
+						d = -d
+					}
+					if d > cbMax {
+						cbMax = d
+					}
 
 					gotCr := int(ycbcr.Cr[py*ycbcr.CStride+px])
 					wantCr := int(ref[ySize+cSize+py*cw+px])
 					d = gotCr - wantCr
-					if d < 0 { d = -d }
-					if d > crMax { crMax = d }
+					if d < 0 {
+						d = -d
+					}
+					if d > crMax {
+						crMax = d
+					}
 				}
 			}
 			cbLine += fmt.Sprintf(" %3d", cbMax)
@@ -1150,7 +1157,6 @@ func TestDecodeBakerMultiFrame(t *testing.T) {
 	t.Logf("Overall worst: frame %d with max error %d", worstFrame, worstMaxErr)
 }
 
-
 func TestFrame2WithPerfectReference(t *testing.T) {
 	const bakerMP4 = "../examples/videos/baker_h264.mp4"
 	const refYUV = "testdata/baker_frames_0_9.yuv"
@@ -1200,9 +1206,13 @@ func TestFrame2WithPerfectReference(t *testing.T) {
 		}
 	}
 
-	// Inject perfect reference frames.
+	// Inject perfect reference frames (with matching frame_num values so
+	// reference list construction orders them newest-first).
 	d := codec.dec
-	d.refFrames = []*image.YCbCr{loadFrame(0), loadFrame(1)}
+	d.refFrames = []*refFrame{
+		{img: loadFrame(0), frameNum: 0, id: 100},
+		{img: loadFrame(1), frameNum: 1, id: 101},
+	}
 
 	// Decode frame 2.
 	pkt, err := src.nextPacket()
@@ -2229,4 +2239,363 @@ func TestDumpSliceBits(t *testing.T) {
 			}
 		}
 	}
+}
+
+// decodeAndCompareYUV decodes every frame of an MP4 fixture and compares each
+// plane pixel-for-pixel against an ffmpeg-generated raw YUV420 reference,
+// requiring bit-exactness. disableDeblock decodes without the loop filter for
+// comparison against an ffmpeg -skip_loop_filter all reference.
+func decodeAndCompareYUV(t *testing.T, mp4Path, yuvPath string, numFrames int, disableDeblock bool) {
+	t.Helper()
+	ref, err := os.ReadFile(yuvPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := openTestPackets(t, mp4Path)
+	codec := NewCodec()
+	codec.dec.disableDeblock = disableDeblock
+
+	comparePlane := func(frameIdx int, plane string, decoded []byte, stride int, refData []byte, pw, ph int) {
+		wrong, maxErr := 0, 0
+		for j := 0; j < ph; j++ {
+			for i := 0; i < pw; i++ {
+				d := int(decoded[j*stride+i]) - int(refData[j*pw+i])
+				if d < 0 {
+					d = -d
+				}
+				if d > 0 {
+					wrong++
+				}
+				if d > maxErr {
+					maxErr = d
+				}
+			}
+		}
+		if wrong > 0 {
+			t.Errorf("frame %d %s: %d/%d wrong pixels, max error %d", frameIdx, plane, wrong, pw*ph, maxErr)
+			if plane == "Y" {
+				// Per-MB max error grid to localize the failure.
+				for mby := 0; mby*16 < ph; mby++ {
+					line := fmt.Sprintf("  MB row %d:", mby)
+					for mbx := 0; mbx*16 < pw; mbx++ {
+						mbMax := 0
+						for j := mby * 16; j < mby*16+16 && j < ph; j++ {
+							for i := mbx * 16; i < mbx*16+16 && i < pw; i++ {
+								d := int(decoded[j*stride+i]) - int(refData[j*pw+i])
+								if d < 0 {
+									d = -d
+								}
+								if d > mbMax {
+									mbMax = d
+								}
+							}
+						}
+						line += fmt.Sprintf(" %3d", mbMax)
+					}
+					t.Log(line)
+				}
+			}
+		}
+	}
+
+	// Decode all packets, collecting display-order output (streams with
+	// B-frames emit with a reorder delay), then drain the tail.
+	var frames []*govid.Frame
+	for i := 0; i < numFrames; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatalf("packet %d: nextPacket: %v", i, err)
+		}
+		frame, err := codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("packet %d: Decode: %v", i, err)
+		}
+		if frame != nil {
+			frames = append(frames, frame)
+		}
+	}
+	for {
+		frame := codec.Drain()
+		if frame == nil {
+			break
+		}
+		frames = append(frames, frame)
+	}
+	if len(frames) != numFrames {
+		t.Fatalf("got %d frames, want %d", len(frames), numFrames)
+	}
+
+	for i, frame := range frames {
+		if frame.YCbCr == nil {
+			t.Fatalf("frame %d: nil image", i)
+		}
+		w, h := frame.Width, frame.Height
+		cw, ch := w/2, h/2
+		frameSize := w*h + 2*cw*ch
+		if len(ref) < (i+1)*frameSize {
+			t.Fatalf("ref file too small: %d bytes, need %d", len(ref), (i+1)*frameSize)
+		}
+		refOff := i * frameSize
+		ycbcr := frame.YCbCr
+		comparePlane(i, "Y", ycbcr.Y, ycbcr.YStride, ref[refOff:refOff+w*h], w, h)
+		comparePlane(i, "Cb", ycbcr.Cb, ycbcr.CStride, ref[refOff+w*h:refOff+w*h+cw*ch], cw, ch)
+		comparePlane(i, "Cr", ycbcr.Cr, ycbcr.CStride, ref[refOff+w*h+cw*ch:refOff+frameSize], cw, ch)
+	}
+}
+
+// TestDecodeHigh8x8Intra covers the Intra_8x8 prediction + 8x8 CAVLC residual
+// path: 5 all-intra High-profile frames encoded with x264 (cabac=0, 8x8dct=1,
+// blurred source to force i8x8 mode selection across all 9 prediction modes).
+func TestDecodeHigh8x8Intra(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_high8x8_intra.mp4", "testdata/test_high8x8_intra.yuv", 5, false)
+}
+
+// TestDecodeHigh8x8MultiFrame covers the inter 8x8 transform path: IDR + 29
+// P-frames, High profile CAVLC, 57.7% of coded inter MBs using the 8x8
+// transform (x264 encode stats).
+func TestDecodeHigh8x8MultiFrame(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_high8x8.mp4", "testdata/test_high8x8.yuv", 30, false)
+}
+
+// TestDecodeHigh8x8MultiFrameNoDeblock is the staged variant of the test
+// above: reconstruction only, compared against an ffmpeg reference decoded
+// with -skip_loop_filter all. If this passes while the deblocked test fails,
+// the divergence is in the loop filter, not reconstruction.
+func TestDecodeHigh8x8MultiFrameNoDeblock(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_high8x8.mp4", "testdata/test_high8x8_nodb.yuv", 30, true)
+}
+
+// TestHigh8x8IntraNoDeblock isolates Intra_8x8 reconstruction from deblocking:
+// decodes the all-intra High-profile fixture with deblocking disabled and
+// compares against an ffmpeg -skip_loop_filter all reference, logging the
+// 8x8 partition prediction modes of any macroblock that mismatches.
+func TestHigh8x8IntraNoDeblock(t *testing.T) {
+	const mp4Path = "testdata/test_high8x8_intra.mp4"
+	const yuvPath = "testdata/test_high8x8_intra_nodb.yuv"
+	const numFrames = 5
+
+	ref, err := os.ReadFile(yuvPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type mbModes struct{ modes [4]int }
+	i8x8Modes := map[[3]int]mbModes{} // key: frame, mbx, mby
+	frameIdx := 0
+	DebugI8x8Modes = func(mbx, mby int, modes [4]int, cbpLuma, cbpChroma int) {
+		i8x8Modes[[3]int{frameIdx, mbx, mby}] = mbModes{modes: modes}
+	}
+	defer func() { DebugI8x8Modes = nil }()
+
+	src := openTestPackets(t, mp4Path)
+	codec := NewCodec()
+	codec.dec.disableDeblock = true
+
+	for i := 0; i < numFrames; i++ {
+		frameIdx = i
+		pkt, err := src.nextPacket()
+		if err != nil {
+			t.Fatalf("frame %d: nextPacket: %v", i, err)
+		}
+		frame, err := codec.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: Decode: %v", i, err)
+		}
+
+		w, h := frame.Width, frame.Height
+		frameSize := w*h + 2*(w/2)*(h/2)
+		refY := ref[i*frameSize : i*frameSize+w*h]
+		ycbcr := frame.YCbCr
+
+		badMBs := 0
+		for mby := 0; mby*16 < h; mby++ {
+			for mbx := 0; mbx*16 < w; mbx++ {
+				mbMax := 0
+				for j := mby * 16; j < mby*16+16 && j < h; j++ {
+					for x := mbx * 16; x < mbx*16+16 && x < w; x++ {
+						d := int(ycbcr.Y[j*ycbcr.YStride+x]) - int(refY[j*w+x])
+						if d < 0 {
+							d = -d
+						}
+						if d > mbMax {
+							mbMax = d
+						}
+					}
+				}
+				if mbMax > 0 {
+					badMBs++
+					if modes, ok := i8x8Modes[[3]int{i, mbx, mby}]; ok {
+						t.Errorf("frame %d MB(%d,%d): maxErr=%d i8x8 modes=%v", i, mbx, mby, mbMax, modes.modes)
+					} else {
+						t.Errorf("frame %d MB(%d,%d): maxErr=%d (not i8x8)", i, mbx, mby, mbMax)
+					}
+				}
+			}
+		}
+		if badMBs == 0 {
+			t.Logf("frame %d: bit-exact (no deblock)", i)
+		}
+	}
+}
+
+// TestDecodeBGHighMP4VsReference decodes the local-only High-profile (CAVLC,
+// 8x8 transform) re-encode of the bg clip — 120 frames at 1280x720, real
+// content — and requires bit-exactness against ffmpeg. Both files are
+// gitignored (large); regenerate from the repo root with:
+//
+//	ffmpeg -i examples/videos/bg.mpg -vf scale=1280:720 -r 30 -c:v libx264 \
+//	  -profile:v high -coder 0 -bf 0 -crf 20 -frames:v 120 -pix_fmt yuv420p \
+//	  -an examples/videos/bg_high.mp4
+//	ffmpeg -i examples/videos/bg_high.mp4 -f rawvideo h264/testdata/bg_high_frames_0_119.yuv
+func TestDecodeBGHighMP4VsReference(t *testing.T) {
+	const mp4Path = "../examples/videos/bg_high.mp4"
+	const yuvPath = "testdata/bg_high_frames_0_119.yuv"
+	if _, err := os.Stat(mp4Path); err != nil {
+		t.Skip("bg_high.mp4 not found")
+	}
+	if _, err := os.Stat(yuvPath); err != nil {
+		t.Skip("bg_high_frames_0_119.yuv not found")
+	}
+	decodeAndCompareYUV(t, mp4Path, yuvPath, 120, false)
+}
+
+// CABAC verification, staged like the High-profile 8x8 work: intra-only
+// without the 8x8 transform, all-intra with every prediction mode, then a
+// full IDR + P-frame sequence. Each fixture is a High-profile CABAC x264
+// encode of test.mp4 compared bit-exact against ffmpeg raw YUV.
+
+func TestDecodeCABACIntra16(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cabac_i16.mp4", "testdata/test_cabac_i16.yuv", 3, false)
+}
+
+func TestDecodeCABACIntra16NoDeblock(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cabac_i16.mp4", "testdata/test_cabac_i16_nodb.yuv", 3, true)
+}
+
+func TestDecodeCABACIntra(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cabac_intra.mp4", "testdata/test_cabac_intra.yuv", 5, false)
+}
+
+func TestDecodeCABACIntraNoDeblock(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cabac_intra.mp4", "testdata/test_cabac_intra_nodb.yuv", 5, true)
+}
+
+func TestDecodeCABACMultiFrame(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cabac.mp4", "testdata/test_cabac.yuv", 30, false)
+}
+
+func TestDecodeCABACMultiFrameNoDeblock(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cabac.mp4", "testdata/test_cabac_nodb.yuv", 30, true)
+}
+
+// TestDecodeCABACP16 is a bisection fixture: P frames restricted to 16x16
+// partitions, single reference, no weighting, no 8x8 transform. Local-only
+// (testdata/_* is gitignored); regenerate per the command in git history.
+func TestDecodeCABACP16(t *testing.T) {
+	const mp4 = "testdata/_cabac_p16.mp4"
+	if _, err := os.Stat(mp4); err != nil {
+		t.Skip("_cabac_p16.mp4 not found")
+	}
+	decodeAndCompareYUV(t, mp4, "testdata/_cabac_p16.yuv", 4, false)
+}
+
+func TestDecodeCABACP8x8(t *testing.T) {
+	const mp4 = "testdata/_cabac_p8x8.mp4"
+	if _, err := os.Stat(mp4); err != nil {
+		t.Skip("_cabac_p8x8.mp4 not found")
+	}
+	decodeAndCompareYUV(t, mp4, "testdata/_cabac_p8x8.yuv", 4, false)
+}
+
+func TestDecodeCABAC8x8DCT(t *testing.T) {
+	const mp4 = "testdata/_cabac_8x8dct.mp4"
+	if _, err := os.Stat(mp4); err != nil {
+		t.Skip("_cabac_8x8dct.mp4 not found")
+	}
+	decodeAndCompareYUV(t, mp4, "testdata/_cabac_8x8dct.yuv", 4, false)
+}
+
+// TestDecodeCABACI720 bisects the 720p I-frame desync: same content at two
+// quality points (crf 20 exercises coefficient escapes, crf 30 does not).
+func TestDecodeCABACI720(t *testing.T) {
+	for _, crf := range []string{"20", "30"} {
+		mp4 := "testdata/_cabac_i720_" + crf + ".mp4"
+		if _, err := os.Stat(mp4); err != nil {
+			t.Skip("fixture not found")
+		}
+		t.Run("crf"+crf, func(t *testing.T) {
+			decodeAndCompareYUV(t, mp4, "testdata/_cabac_i720_"+crf+".yuv", 1, false)
+		})
+	}
+}
+
+// TestI8x8ModeCoverage counts Intra_8x8 mode usage per partition across the
+// CAVLC bg_high fixture, to know which (partition, mode) pairs the bit-exact
+// CAVLC tests actually exercise.
+func TestI8x8ModeCoverage(t *testing.T) {
+	const mp4 = "../examples/videos/bg_high.mp4"
+	if _, err := os.Stat(mp4); err != nil {
+		t.Skip("bg_high.mp4 not found")
+	}
+	var counts [4][9]int
+	DebugI8x8Modes = func(mbx, mby int, modes [4]int, cbpLuma, cbpChroma int) {
+		for p, m := range modes {
+			counts[p][m]++
+		}
+	}
+	defer func() { DebugI8x8Modes = nil }()
+
+	src := openTestPackets(t, mp4)
+	codec := NewCodec()
+	for i := 0; i < 120; i++ {
+		pkt, err := src.nextPacket()
+		if err != nil {
+			break
+		}
+		if _, err := codec.Decode(pkt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for p := 0; p < 4; p++ {
+		t.Logf("partition %d: modes v,h,dc,ddl,ddr,vr,hd,vl,hu = %v", p, counts[p])
+	}
+}
+
+// B-slice verification, staged: simple CAVLC B-frames (bframes=1, no
+// pyramid, single ref, spatial direct), the CABAC equivalent, then full
+// x264 defaults (bframes=3, pyramid, CABAC, implicit weighted bipred,
+// multi-ref, 8x8 transform). Frames compare in display order.
+
+func TestDecodeBCAVLC(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_b_cavlc.mp4", "testdata/test_b_cavlc.yuv", 12, false)
+}
+
+func TestDecodeBCABAC(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_b_cabac.mp4", "testdata/test_b_cabac.yuv", 12, false)
+}
+
+func TestDecodeBFull(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_b.mp4", "testdata/test_b.yuv", 30, false)
+}
+
+// TestDecodeBGDefaultMP4VsReference decodes a real-content 720p clip encoded
+// with completely default x264 settings (High profile, CABAC, bframes=3 with
+// pyramid and adaptive placement, weighted prediction, scenecut) and requires
+// bit-exactness over 120 frames in display order. Local-only files
+// (gitignored); regenerate from repo root:
+//
+//	ffmpeg -i examples/videos/bg.mpg -vf scale=1280:720 -r 30 -c:v libx264 \
+//	  -crf 20 -frames:v 120 -pix_fmt yuv420p -an examples/videos/bg_default.mp4
+//	ffmpeg -i examples/videos/bg_default.mp4 -f rawvideo h264/testdata/bg_default_frames_0_119.yuv
+func TestDecodeBGDefaultMP4VsReference(t *testing.T) {
+	const mp4Path = "../examples/videos/bg_default.mp4"
+	const yuvPath = "testdata/bg_default_frames_0_119.yuv"
+	if _, err := os.Stat(mp4Path); err != nil {
+		t.Skip("bg_default.mp4 not found")
+	}
+	if _, err := os.Stat(yuvPath); err != nil {
+		t.Skip("bg_default_frames_0_119.yuv not found")
+	}
+	decodeAndCompareYUV(t, mp4Path, yuvPath, 120, false)
 }

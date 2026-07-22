@@ -59,6 +59,11 @@ func (d *Decoder) deblockMB(mbx, mby int, sh *sliceHeader) {
 		if edge == 0 && mbx == 0 {
 			continue
 		}
+		// 8x8 transform MBs have no transform boundary at luma edges 1 and 3
+		// (spec 8.7: filterInternalEdgesFlag applies at 8-sample spacing).
+		if edge&1 == 1 && d.mbInfo[mbIdx].transform8x8 {
+			continue
+		}
 
 		// Per spec 8.7.2.2: QPav = (QPp + QPq + 1) >> 1
 		var qp int
@@ -100,6 +105,9 @@ func (d *Decoder) deblockMB(mbx, mby int, sh *sliceHeader) {
 	for edge := 0; edge < 4; edge++ {
 		y := mby*16 + edge*4
 		if edge == 0 && mby == 0 {
+			continue
+		}
+		if edge&1 == 1 && d.mbInfo[mbIdx].transform8x8 {
 			continue
 		}
 
@@ -282,27 +290,87 @@ func (d *Decoder) computeBS(pmbIdx, qmbIdx, pBlk, qBlk int, isMBEdge bool) int {
 	}
 
 	// Check non-zero coefficients (convert raster index to scan order).
-	pNZ := d.nzCoeff[pmbIdx*24+rasterToScan[pBlk]]
-	qNZ := d.nzCoeff[qmbIdx*24+rasterToScan[qBlk]]
+	pNZ := d.filterNZ(pInfo, pmbIdx, pBlk)
+	qNZ := d.filterNZ(qInfo, qmbIdx, qBlk)
 	if pNZ > 0 || qNZ > 0 {
 		return 2
 	}
 
-	// Check different ref frames.
+	// Motion-based bS=1 test (spec 8.7.2.1): different number of MVs,
+	// different reference pictures, or an MV component difference >= 4
+	// quarter-pixels. References compare as pictures, not indices — a
+	// modified reference list can alias the same picture at two indices.
 	pPart := (pBlk/4/2)*2 + (pBlk%4)/2
 	qPart := (qBlk/4/2)*2 + (qBlk%4)/2
-	if pInfo.refIdx[pPart] != qInfo.refIdx[qPart] {
+	pMask := pInfo.predMask[pPart]
+	qMask := qInfo.predMask[qPart]
+	pN := int(pMask&1) + int(pMask>>1&1)
+	qN := int(qMask&1) + int(qMask>>1&1)
+	if pN != qN {
 		return 1
 	}
 
-	// Check MV difference >= 4 quarter-pixels.
-	pMV := pInfo.mv[pBlk]
-	qMV := qInfo.mv[qBlk]
-	if abs16(pMV[0]-qMV[0]) >= 4 || abs16(pMV[1]-qMV[1]) >= 4 {
-		return 1
+	mvFar := func(a, b [2]int16) bool {
+		return abs16(a[0]-b[0]) >= 4 || abs16(a[1]-b[1]) >= 4
 	}
 
-	return 0
+	if pN == 1 {
+		pRef, pMV := blockMotion(pInfo, pMask, pBlk, pPart)
+		qRef, qMV := blockMotion(qInfo, qMask, qBlk, qPart)
+		if pRef != qRef || mvFar(pMV, qMV) {
+			return 1
+		}
+		return 0
+	}
+
+	// Bi-predicted on both sides: compare the reference pairs (unordered).
+	p0, p1 := pInfo.refPicID[pPart], pInfo.refPicIDL1[pPart]
+	q0, q1 := qInfo.refPicID[qPart], qInfo.refPicIDL1[qPart]
+	if !((p0 == q0 && p1 == q1) || (p0 == q1 && p1 == q0)) {
+		return 1
+	}
+	pMV0, pMV1 := pInfo.mv[pBlk], pInfo.mvL1[pBlk]
+	qMV0, qMV1 := qInfo.mv[qBlk], qInfo.mvL1[qBlk]
+	if p0 != p1 {
+		// Two distinct pictures: match the MVs by picture.
+		if p0 == q0 {
+			if mvFar(pMV0, qMV0) || mvFar(pMV1, qMV1) {
+				return 1
+			}
+		} else if mvFar(pMV0, qMV1) || mvFar(pMV1, qMV0) {
+			return 1
+		}
+		return 0
+	}
+	// Both predictions from the same picture: bS=0 only when one of the two
+	// pairings keeps every component difference under 4.
+	if (!mvFar(pMV0, qMV0) && !mvFar(pMV1, qMV1)) ||
+		(!mvFar(pMV0, qMV1) && !mvFar(pMV1, qMV0)) {
+		return 0
+	}
+	return 1
+}
+
+// blockMotion returns the single used list's reference picture ID and MV for
+// a 4x4 block (raster index) of a single-prediction partition.
+func blockMotion(info *mbInterInfo, mask uint8, rasterBlk, part int) (int, [2]int16) {
+	if mask&1 != 0 {
+		return info.refPicID[part], info.mv[rasterBlk]
+	}
+	return info.refPicIDL1[part], info.mvL1[rasterBlk]
+}
+
+// filterNZ returns the non-zero coefficient status used by the bS=2 test for
+// the 4x4 luma block at raster index rasterBlk. For MBs coded with the 8x8
+// transform, spec 8.7.2.1 applies the test to the containing 8x8 transform
+// block, so the four CAVLC sub-block counts of that partition are summed.
+func (d *Decoder) filterNZ(info *mbInterInfo, mbIdx, rasterBlk int) int {
+	scan := rasterToScan[rasterBlk]
+	if !info.transform8x8 {
+		return d.nzCoeff[mbIdx*24+scan]
+	}
+	base := mbIdx*24 + (scan &^ 3) // top-left scan index of the containing 8x8
+	return d.nzCoeff[base] + d.nzCoeff[base+1] + d.nzCoeff[base+2] + d.nzCoeff[base+3]
 }
 
 func abs16(x int16) int16 {
@@ -392,7 +460,7 @@ func filterLumaStrongSample(pix []byte, stride, x, y int, vertical bool, alpha, 
 		return
 	}
 
-	if absInt(p0-q0) < ((alpha>>2)+2) {
+	if absInt(p0-q0) < ((alpha >> 2) + 2) {
 		if absInt(p2-p0) < beta {
 			pix[p0Idx] = uint8((p2 + 2*p1 + 2*p0 + 2*q0 + q1 + 4) >> 3)
 			pix[p1Idx] = uint8((p2 + p1 + p0 + q0 + 2) >> 2)

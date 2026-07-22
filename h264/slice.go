@@ -20,21 +20,59 @@ const (
 
 // sliceHeader holds parsed slice header data.
 type sliceHeader struct {
-	sliceType            uint32
-	ppsID                uint32
-	frameNum             uint32
-	idrPicID             uint32
-	picOrderCntLsb       uint32
-	deltaPicOrderCntBottom int32
-	deltaPicOrderCnt     [2]int32
-	redundantPicCnt      uint32
-	directSpatialMvPred  bool
-	numRefIdxL0Active    uint32
-	numRefIdxL1Active    uint32
-	sliceQPDelta         int32
+	sliceType               uint32
+	ppsID                   uint32
+	frameNum                uint32
+	idrPicID                uint32
+	picOrderCntLsb          uint32
+	deltaPicOrderCntBottom  int32
+	deltaPicOrderCnt        [2]int32
+	redundantPicCnt         uint32
+	directSpatialMvPred     bool
+	numRefIdxL0Active       uint32
+	numRefIdxL1Active       uint32
+	sliceQPDelta            int32
 	disableDeblockingFilter int32
-	sliceAlphaC0Offset   int32
-	sliceBetaOffset      int32
+	sliceAlphaC0Offset      int32
+	sliceBetaOffset         int32
+	refPicListModL0         []refListModOp
+	refPicListModL1         []refListModOp
+	weights                 *predWeights
+	weightsL1               *predWeights
+	cabacInitIdc            uint32
+	mmco                    []mmcoOp
+}
+
+// mmcoOp is one memory_management_control_operation (spec 7.4.3.3).
+type mmcoOp struct {
+	op   uint32
+	arg1 uint32
+	arg2 uint32
+}
+
+// predWeights holds the explicit weighted prediction parameters from
+// pred_weight_table (spec 7.3.3.2), one entry per L0 reference index.
+type predWeights struct {
+	lumaLog2Denom   int
+	chromaLog2Denom int
+	luma            []weightOffset
+	chroma          [][2]weightOffset // [refIdx][0]=Cb, [1]=Cr
+}
+
+// weightOffset is one weight/offset pair. explicit is false when the stream
+// left the entry at its default, which the weighting formula maps to identity.
+type weightOffset struct {
+	weight   int
+	offset   int
+	explicit bool
+}
+
+// refListModOp is one ref_pic_list_modification operation (spec 7.4.3.1).
+// idc 0/1 reorder a short-term picture by abs_diff_pic_num_minus1 (val);
+// idc 2 selects a long-term picture by long_term_pic_num (unsupported).
+type refListModOp struct {
+	idc uint32
+	val uint32
 }
 
 // parseSliceHeader parses a slice header from RBSP data.
@@ -122,40 +160,83 @@ func parseSliceHeader(br *BitReader, sps *SPS, pps *PPS, nalType uint8, nalRefID
 		}
 	}
 
-	// P-slice specific.
-	if sh.sliceType == sliceTypeP || sh.sliceType == sliceTypeSP {
+	if sh.sliceType == sliceTypeB {
+		sh.directSpatialMvPred, err = br.ReadBool()
+		if err != nil {
+			return nil, fmt.Errorf("slice: direct_spatial_mv_pred_flag: %w", err)
+		}
+	}
+
+	// P/B-slice reference count overrides.
+	if sh.sliceType == sliceTypeP || sh.sliceType == sliceTypeSP || sh.sliceType == sliceTypeB {
 		numRefOverride, err := br.ReadBool()
 		if err != nil {
 			return nil, err
 		}
 		sh.numRefIdxL0Active = pps.NumRefIdxL0DefaultActive
+		sh.numRefIdxL1Active = pps.NumRefIdxL1DefaultActive
 		if numRefOverride {
 			l0, err := br.ReadUE()
 			if err != nil {
 				return nil, err
 			}
 			sh.numRefIdxL0Active = l0 + 1
+			if sh.sliceType == sliceTypeB {
+				l1, err := br.ReadUE()
+				if err != nil {
+					return nil, err
+				}
+				sh.numRefIdxL1Active = l1 + 1
+			}
 		}
 	}
 
 	// ref_pic_list_modification
 	if sh.sliceType != sliceTypeI && sh.sliceType != sliceTypeSI {
-		if err := skipRefPicListModification(br); err != nil {
-			return nil, err
+		sh.refPicListModL0, err = parseRefPicListModification(br)
+		if err != nil {
+			return nil, fmt.Errorf("ref_pic_list_modification l0: %w", err)
+		}
+	}
+	if sh.sliceType == sliceTypeB {
+		sh.refPicListModL1, err = parseRefPicListModification(br)
+		if err != nil {
+			return nil, fmt.Errorf("ref_pic_list_modification l1: %w", err)
 		}
 	}
 
-	// pred_weight_table (only for P/SP slices with weighted prediction).
-	if (sh.sliceType == sliceTypeP || sh.sliceType == sliceTypeSP) && pps.WeightedPredFlag {
-		if err := skipPredWeightTable(br, sh.numRefIdxL0Active, sps.ChromaFormatIDC); err != nil {
+	// pred_weight_table: P/SP with weighted prediction, or B with explicit
+	// weighted biprediction (weighted_bipred_idc == 1). The denominators
+	// appear once; the l1 entry loop follows the l0 loop for B slices.
+	if ((sh.sliceType == sliceTypeP || sh.sliceType == sliceTypeSP) && pps.WeightedPredFlag) ||
+		(sh.sliceType == sliceTypeB && pps.WeightedBipredIDC == 1) {
+		sh.weights, err = parsePredWeightTable(br, sh.numRefIdxL0Active, sps.ChromaFormatIDC, nil)
+		if err != nil {
 			return nil, fmt.Errorf("pred_weight_table: %w", err)
+		}
+		if sh.sliceType == sliceTypeB {
+			sh.weightsL1, err = parsePredWeightTable(br, sh.numRefIdxL1Active, sps.ChromaFormatIDC, sh.weights)
+			if err != nil {
+				return nil, fmt.Errorf("pred_weight_table l1: %w", err)
+			}
 		}
 	}
 
 	// dec_ref_pic_marking
 	if nalType == NALSliceIDR || nalRefIDC > 0 {
-		if err := skipDecRefPicMarking(br, nalType); err != nil {
+		sh.mmco, err = parseDecRefPicMarking(br, nalType)
+		if err != nil {
 			return nil, err
+		}
+	}
+
+	if pps.EntropyCodingModeFlag && sh.sliceType != sliceTypeI && sh.sliceType != sliceTypeSI {
+		sh.cabacInitIdc, err = br.ReadUE()
+		if err != nil {
+			return nil, fmt.Errorf("slice: cabac_init_idc: %w", err)
+		}
+		if sh.cabacInitIdc > 2 {
+			return nil, fmt.Errorf("invalid cabac_init_idc %d", sh.cabacInitIdc)
 		}
 	}
 
@@ -194,122 +275,145 @@ func parseSliceHeader(br *BitReader, sps *SPS, pps *PPS, nalType uint8, nalRefID
 	return sh, nil
 }
 
-func skipRefPicListModification(br *BitReader) error {
+func parseRefPicListModification(br *BitReader) ([]refListModOp, error) {
 	flag, err := br.ReadBool()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if flag {
-		for {
-			op, err := br.ReadUE()
-			if err != nil {
-				return err
-			}
-			if op == 3 {
-				break
-			}
-			_, err = br.ReadUE() // abs_diff
-			if err != nil {
-				return err
-			}
+	if !flag {
+		return nil, nil
+	}
+	var ops []refListModOp
+	for {
+		idc, err := br.ReadUE()
+		if err != nil {
+			return nil, err
 		}
+		if idc == 3 {
+			return ops, nil
+		}
+		if idc > 3 {
+			return nil, fmt.Errorf("invalid modification_of_pic_nums_idc %d", idc)
+		}
+		val, err := br.ReadUE()
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, refListModOp{idc: idc, val: val})
 	}
-	return nil
 }
 
-func skipDecRefPicMarking(br *BitReader, nalType uint8) error {
+func parseDecRefPicMarking(br *BitReader, nalType uint8) ([]mmcoOp, error) {
 	if nalType == NALSliceIDR {
-		_, err := br.ReadBool() // no_output_of_prior_pics_flag
-		if err != nil {
-			return err
+		if _, err := br.ReadBool(); err != nil { // no_output_of_prior_pics_flag
+			return nil, err
 		}
-		_, err = br.ReadBool() // long_term_reference_flag
-		return err
+		_, err := br.ReadBool() // long_term_reference_flag
+		return nil, err
 	}
 	flag, err := br.ReadBool() // adaptive_ref_pic_marking_mode_flag
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if flag {
-		for {
-			op, err := br.ReadUE()
-			if err != nil {
-				return err
-			}
-			if op == 0 {
-				break
-			}
-			switch op {
-			case 1, 2, 4, 6:
-				_, err = br.ReadUE()
-			case 3:
-				_, err = br.ReadUE()
-				if err != nil {
-					return err
-				}
-				_, err = br.ReadUE()
-			case 5:
-				// No parameters.
-			default:
-				return fmt.Errorf("unknown MMCO operation %d", op)
-			}
-			if err != nil {
-				return err
-			}
+	if !flag {
+		return nil, nil
+	}
+	var ops []mmcoOp
+	for {
+		op, err := br.ReadUE()
+		if err != nil {
+			return nil, err
 		}
+		if op == 0 {
+			return ops, nil
+		}
+		m := mmcoOp{op: op}
+		switch op {
+		case 1, 2, 4, 6:
+			m.arg1, err = br.ReadUE()
+		case 3:
+			m.arg1, err = br.ReadUE()
+			if err != nil {
+				return nil, err
+			}
+			m.arg2, err = br.ReadUE()
+		case 5:
+			// No parameters.
+		default:
+			return nil, fmt.Errorf("unknown MMCO operation %d", op)
+		}
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, m)
 	}
-	return nil
 }
 
-// skipPredWeightTable skips the pred_weight_table() syntax structure.
-func skipPredWeightTable(br *BitReader, numRefIdxL0Active uint32, chromaFormatIDC uint32) error {
-	// luma_log2_weight_denom
-	_, err := br.ReadUE()
-	if err != nil {
-		return err
+// parsePredWeightTable parses one list's entries of the pred_weight_table()
+// syntax structure (spec 7.3.3.2). When cont is nil the shared denominators
+// are read first; for the l1 continuation of a B slice pass the l0 table so
+// its denominators are reused.
+func parsePredWeightTable(br *BitReader, numRefIdxActive uint32, chromaFormatIDC uint32, cont *predWeights) (*predWeights, error) {
+	pw := &predWeights{
+		luma:   make([]weightOffset, numRefIdxActive),
+		chroma: make([][2]weightOffset, numRefIdxActive),
 	}
-	// chroma_log2_weight_denom
-	if chromaFormatIDC != 0 {
-		_, err = br.ReadUE()
+
+	if cont != nil {
+		pw.lumaLog2Denom = cont.lumaLog2Denom
+		pw.chromaLog2Denom = cont.chromaLog2Denom
+	} else {
+		lumaDenom, err := br.ReadUE()
 		if err != nil {
-			return err
+			return nil, err
+		}
+		pw.lumaLog2Denom = int(lumaDenom)
+		if chromaFormatIDC != 0 {
+			chromaDenom, err := br.ReadUE()
+			if err != nil {
+				return nil, err
+			}
+			pw.chromaLog2Denom = int(chromaDenom)
 		}
 	}
-	for i := uint32(0); i < numRefIdxL0Active; i++ {
+
+	for i := uint32(0); i < numRefIdxActive; i++ {
 		lumaFlag, err := br.ReadBool()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if lumaFlag {
-			_, err = br.ReadSE() // luma_weight
+			w, err := br.ReadSE()
 			if err != nil {
-				return err
+				return nil, err
 			}
-			_, err = br.ReadSE() // luma_offset
+			o, err := br.ReadSE()
 			if err != nil {
-				return err
+				return nil, err
 			}
+			pw.luma[i] = weightOffset{weight: int(w), offset: int(o), explicit: true}
 		}
 		if chromaFormatIDC != 0 {
 			chromaFlag, err := br.ReadBool()
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if chromaFlag {
 				for j := 0; j < 2; j++ {
-					_, err = br.ReadSE() // chroma_weight
+					w, err := br.ReadSE()
 					if err != nil {
-						return err
+						return nil, err
 					}
-					_, err = br.ReadSE() // chroma_offset
+					o, err := br.ReadSE()
 					if err != nil {
-						return err
+						return nil, err
 					}
+					pw.chroma[i][j] = weightOffset{weight: int(w), offset: int(o), explicit: true}
 				}
 			}
 		}
 	}
-	return nil
+	return pw, nil
 }
 
 // i16x16 decodes mb_type for I_16x16 macroblocks.

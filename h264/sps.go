@@ -4,37 +4,41 @@ import "fmt"
 
 // SPS represents a Sequence Parameter Set.
 type SPS struct {
-	ProfileIDC         uint8
-	ConstraintFlags    uint8
-	LevelIDC           uint8
-	ID                 uint32
-	ChromaFormatIDC    uint32
-	SeparateColourPlane bool
-	BitDepthLuma       uint32
-	BitDepthChroma     uint32
+	ProfileIDC                  uint8
+	ConstraintFlags             uint8
+	LevelIDC                    uint8
+	ID                          uint32
+	ChromaFormatIDC             uint32
+	SeparateColourPlane         bool
+	BitDepthLuma                uint32
+	BitDepthChroma              uint32
 	QpprimeYZeroTransformBypass bool
 	SeqScalingMatrixPresent     bool
-	Log2MaxFrameNum    uint32
-	PicOrderCntType    uint32
-	Log2MaxPicOrderCntLsb uint32
-	DeltaPicOrderAlwaysZero bool
-	OffsetForNonRefPic      int32
-	OffsetForTopToBottom    int32
-	NumRefFramesInPOCCycle  uint32
-	OffsetForRefFrame       []int32
-	MaxNumRefFrames    uint32
-	GapsInFrameNumAllowed bool
-	PicWidthInMBs      uint32
-	PicHeightInMapUnits uint32
-	FrameMBSOnly        bool
-	MBAdaptiveFrameField bool
-	Direct8x8Inference  bool
-	FrameCropping       bool
-	CropLeft            uint32
-	CropRight           uint32
-	CropTop             uint32
-	CropBottom          uint32
-	VUIPresent          bool
+	Log2MaxFrameNum             uint32
+	PicOrderCntType             uint32
+	Log2MaxPicOrderCntLsb       uint32
+	DeltaPicOrderAlwaysZero     bool
+	OffsetForNonRefPic          int32
+	OffsetForTopToBottom        int32
+	NumRefFramesInPOCCycle      uint32
+	OffsetForRefFrame           []int32
+	MaxNumRefFrames             uint32
+	GapsInFrameNumAllowed       bool
+	PicWidthInMBs               uint32
+	PicHeightInMapUnits         uint32
+	FrameMBSOnly                bool
+	MBAdaptiveFrameField        bool
+	Direct8x8Inference          bool
+	FrameCropping               bool
+	CropLeft                    uint32
+	CropRight                   uint32
+	CropTop                     uint32
+	CropBottom                  uint32
+	VUIPresent                  bool
+	// MaxNumReorderFrames from the VUI bitstream restriction, or -1 when the
+	// stream does not declare it. Sizes the display reorder buffer for
+	// B-frame streams.
+	MaxNumReorderFrames int
 
 	// Derived dimensions.
 	Width  int
@@ -244,7 +248,15 @@ func ParseSPS(rbsp []byte) (*SPS, error) {
 	if err != nil {
 		return nil, err
 	}
-	// VUI parameters are not parsed further; we have what we need.
+	s.MaxNumReorderFrames = -1 // unknown until VUI bitstream restriction says
+	if s.VUIPresent {
+		// Parse VUI far enough to reach max_num_reorder_frames (needed to
+		// size the display reorder buffer for B-frame streams). Errors here
+		// are non-fatal: leave MaxNumReorderFrames at -1.
+		if v, err := parseVUIReorderFrames(br); err == nil {
+			s.MaxNumReorderFrames = v
+		}
+	}
 
 	// Derive pixel dimensions.
 	cropUnitX := uint32(1)
@@ -265,6 +277,134 @@ func ParseSPS(rbsp []byte) (*SPS, error) {
 	s.Height = int(picHeight - cropUnitY*(s.CropTop+s.CropBottom))
 
 	return s, nil
+}
+
+// parseVUIReorderFrames walks vui_parameters (spec E.1.1) up to
+// max_num_reorder_frames in the bitstream_restriction section. Returns -1 if
+// the restriction section is absent.
+func parseVUIReorderFrames(br *BitReader) (int, error) {
+	if flag, err := br.ReadBool(); err != nil {
+		return -1, err
+	} else if flag { // aspect_ratio_info_present_flag
+		idc, err := br.ReadBits(8)
+		if err != nil {
+			return -1, err
+		}
+		if idc == 255 { // Extended_SAR
+			if _, err := br.ReadBits(32); err != nil {
+				return -1, err
+			}
+		}
+	}
+	if flag, err := br.ReadBool(); err != nil {
+		return -1, err
+	} else if flag { // overscan_info_present_flag
+		if _, err := br.ReadBool(); err != nil {
+			return -1, err
+		}
+	}
+	if flag, err := br.ReadBool(); err != nil {
+		return -1, err
+	} else if flag { // video_signal_type_present_flag
+		if _, err := br.ReadBits(4); err != nil { // format(3) + full_range(1)
+			return -1, err
+		}
+		if cd, err := br.ReadBool(); err != nil {
+			return -1, err
+		} else if cd { // colour_description_present_flag
+			if _, err := br.ReadBits(24); err != nil {
+				return -1, err
+			}
+		}
+	}
+	if flag, err := br.ReadBool(); err != nil {
+		return -1, err
+	} else if flag { // chroma_loc_info_present_flag
+		if _, err := br.ReadUE(); err != nil {
+			return -1, err
+		}
+		if _, err := br.ReadUE(); err != nil {
+			return -1, err
+		}
+	}
+	if flag, err := br.ReadBool(); err != nil {
+		return -1, err
+	} else if flag { // timing_info_present_flag
+		if _, err := br.ReadBits(32); err != nil {
+			return -1, err
+		}
+		if _, err := br.ReadBits(32); err != nil {
+			return -1, err
+		}
+		if _, err := br.ReadBool(); err != nil {
+			return -1, err
+		}
+	}
+	skipHRD := func() error {
+		cpbCnt, err := br.ReadUE()
+		if err != nil {
+			return err
+		}
+		if _, err := br.ReadBits(8); err != nil { // bit_rate_scale + cpb_size_scale
+			return err
+		}
+		for i := uint32(0); i <= cpbCnt; i++ {
+			if _, err := br.ReadUE(); err != nil {
+				return err
+			}
+			if _, err := br.ReadUE(); err != nil {
+				return err
+			}
+			if _, err := br.ReadBool(); err != nil {
+				return err
+			}
+		}
+		_, err = br.ReadBits(20) // 4 x 5-bit delay lengths
+		return err
+	}
+	nalHRD, err := br.ReadBool()
+	if err != nil {
+		return -1, err
+	}
+	if nalHRD {
+		if err := skipHRD(); err != nil {
+			return -1, err
+		}
+	}
+	vclHRD, err := br.ReadBool()
+	if err != nil {
+		return -1, err
+	}
+	if vclHRD {
+		if err := skipHRD(); err != nil {
+			return -1, err
+		}
+	}
+	if nalHRD || vclHRD {
+		if _, err := br.ReadBool(); err != nil { // low_delay_hrd_flag
+			return -1, err
+		}
+	}
+	if _, err := br.ReadBool(); err != nil { // pic_struct_present_flag
+		return -1, err
+	}
+	restriction, err := br.ReadBool()
+	if err != nil || !restriction {
+		return -1, err
+	}
+	if _, err := br.ReadBool(); err != nil { // motion_vectors_over_pic_boundaries
+		return -1, err
+	}
+	for i := 0; i < 4; i++ { // max_bytes/bits denom, log2 mv lengths
+		if _, err := br.ReadUE(); err != nil {
+			return -1, err
+		}
+	}
+	reorder, err := br.ReadUE()
+	if err != nil {
+		return -1, err
+	}
+	return int(reorder), nil
 }
 
 func skipScalingList(br *BitReader, size int) error {

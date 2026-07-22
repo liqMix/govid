@@ -10,7 +10,7 @@ Pure-Go, codec-agnostic video decoding and playback library — no cgo, no ffmpe
 
 | Package | What it is | State |
 |---|---|---|
-| `h264/` | From-scratch H.264 decoder (CAVLC, I + P slices) | **Working** — bit-exact vs ffmpeg on the tracked test clips |
+| `h264/` | From-scratch H.264 decoder (CAVLC + CABAC, I/P/B slices, High profile) — decodes default x264 output | **Working** — bit-exact vs ffmpeg on the tracked test clips |
 | `mpeg1/` | Thin wrapper over [`gen2brain/mpeg`](https://github.com/gen2brain/mpeg) | **Working** — third-party decoder, matches ffmpeg to ±3 |
 | `mp4/`, `webm/` | Container demuxers (mp4ff / ebml-go) | **Working** for the tracks listed below |
 | `player.go`, `ebitengine/` | Playback orchestration + Ebitengine bridge | **Working** |
@@ -55,8 +55,9 @@ The suspected cause is a bitstream desync in the first partition / token partiti
 
 H.264 decoder coverage:
 
-- **Supported:** CAVLC entropy coding, I/SI and P slices, intra 4x4 / 16x16 / chroma prediction, quarter-pel luma and bilinear chroma motion compensation, multi-reference MV prediction, the deblocking filter.
-- **Not supported (returns an error):** CABAC, B slices, 8x8 transform (High profile), multiple slice groups. 8x8 support is partially built (`h264/predfunc8x8.go`, 8x8 IDCT/dequant) but is not wired into the decode path.
+- **Supported:** CAVLC and CABAC entropy coding; I/SI, P, and B slices (spatial direct mode, bi-prediction with implicit and explicit weighting, B-pyramid); intra 4x4 / 8x8 / 16x16 / chroma prediction; the 8x8 transform (High profile); quarter-pel luma and bilinear chroma motion compensation; multi-reference MV prediction; reference picture list modification; MMCO short-term marking; explicit weighted prediction; picture-order display reordering; the deblocking filter (including 8x8-transform and B-slice bS rules). Everything x264 emits by default — `ffmpeg -c:v libx264` with no flags — decodes bit-exact, verified against ffmpeg on 120-frame 720p real content (`TestDecodeBGDefaultMP4VsReference`) plus the committed staged fixtures.
+- **Not supported (returns an error):** temporal direct mode (x264 `direct=temporal`/`auto`; the default `spatial` works), multiple slice groups, long-term references / MMCO ops 2-6, I_PCM inside CABAC slices, interlaced (field/MBAFF) coding. Custom (non-flat) scaling matrices are parsed but not applied — x264's default flat CQM decodes correctly.
+- **B-frame note:** with B-frames the decoder emits frames in display order with a small delay (from the stream's VUI `max_num_reorder_frames`). `Player`/`AsyncPlayer` handle this transparently; at end-of-stream the last few frames are only reachable via `(*h264.Codec).Drain`.
 
 AV1 decoder coverage: intra frames only — there is no inter prediction, no film grain, no loop restoration.
 
@@ -65,9 +66,12 @@ AV1 decoder coverage: intra frames only — there is no inter prediction, no fil
 `h264/bench_decode_test.go` on 1280x720, 120 frames (this machine, one run — not a controlled benchmark):
 
 ```
-codec                             total   ms/frame        fps
-govid h264 (pure Go)             1657ms     13.81ms       72.4
-gen2brain/mpeg (MPEG-1)           113ms      0.94ms     1063.6
+codec                               total   ms/frame        fps
+govid h264 Baseline (pure Go)      1600ms    13.33ms       75.0
+govid h264 High 8x8 CAVLC          1379ms    11.49ms       87.0
+govid h264 High CABAC              1378ms    11.48ms       87.1
+govid h264 x264 defaults (+B)      1792ms    15.19ms       65.8
+gen2brain/mpeg (MPEG-1)             104ms     0.87ms     1152.0
 ```
 
 Enough for 720p30 real-time playback in a game loop; MPEG-1 is far cheaper if you control the encoding.
@@ -167,11 +171,13 @@ func main() {
 }
 ```
 
-Encode input with a Baseline-profile, CAVLC, no-B-frame configuration:
+Encode input with plain x264 defaults — no special flags needed:
 
 ```bash
-ffmpeg -i input.mov -c:v libx264 -profile:v baseline -bf 0 -pix_fmt yuv420p out.mp4
+ffmpeg -i input.mov -c:v libx264 -pix_fmt yuv420p out.mp4
 ```
+
+On the bg test clip at matched crf, default x264 (CABAC + B-frames) is ~11% smaller than CABAC without B-frames and ~17% smaller than Baseline. If you want zero-latency decoding (no display reordering), add `-bf 0`.
 
 ### Decoding off the game thread
 
@@ -295,9 +301,8 @@ Test fixtures under each package's `testdata/` (short clips plus ffmpeg-generate
 ## Roadmap
 
 - Fix the VP8 first-partition desync so inter frames stop drifting
-- Wire up H.264 8x8 transform + intra 8x8 to unlock High profile
 - Get AV1 intra reconstruction correct before adding inter prediction
-- CABAC and B-slice support for H.264
+- H.264 leftovers if ever needed: temporal direct mode, long-term references, interlaced coding
 
 ## License
 

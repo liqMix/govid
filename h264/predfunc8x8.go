@@ -301,9 +301,8 @@ func predIntra8x8HU(d *Decoder, y, x int, s *intra8x8Samples) {
 			case zHU < 13 && zHU%2 == 1: // 1,3,5,7,9,11 — 3-tap
 				idx := j + (i >> 1)
 				v = int(s.left[idx]) + 2*int(s.left[idx+1]) + int(s.left[idx+2]) + 2
-			case zHU == 13:
-				v = int(s.left[5]) + 3*int(s.left[6]) + 2*int(s.left[7]) + 2
-				// v will be divided by 4 below with the default case; branch-specific shift:
+			case zHU == 13: // spec 8.3.2.2.10: (p'[-1,6] + 3*p'[-1,7] + 2) >> 2
+				v = int(s.left[6]) + 3*int(s.left[7]) + 2
 				d.ybr[y+j][x+i] = uint8(v >> 2)
 				continue
 			default: // zHU > 13 — all-bottom-left replicate

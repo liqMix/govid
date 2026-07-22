@@ -86,6 +86,145 @@ The spec says chroma DC prediction only uses MB-boundary samples. Specific rules
 - **Spec ref:** 6.4.11.7 (Availability of neighbouring partitions)
 - **Symptom:** Intermittent MV prediction errors for MBs whose upper-right neighbor hadn't been decoded yet.
 
+### 8x8 Transform (High profile)
+
+These five bugs kept the 8x8 transform paths disabled behind hard-stops; all were found in one session using two purpose-built fixtures (`test_high8x8.mp4` — IDR + 29 P frames, 57.7% inter 8x8; `test_high8x8_intra.mp4` — 5 all-intra frames, blurred source to force all 9 Intra_8x8 modes).
+
+**Bug 1:** 8x8 CAVLC sub-block coefficient scatter used contiguous zigzag slices (`scanPos = 16*s + k`) instead of the spec interleave.
+
+The 8x8 residual is coded as four ordinary 4x4 residual blocks whose coefficients interleave into the 8x8 zigzag scan: `level8x8[4*i + i4x4] = level4x4[i4x4][i]`. FFmpeg's `ff_zigzag_scan8x8_cavlc` table encodes exactly this interleave (entry `[16*i4x4 + i]` equals `zigzag_direct[4*i + i4x4]`). A comment in the old code asserted the opposite and was wrong.
+
+- **Spec ref:** 7.3.5.3.2 (Residual luma syntax), 8.5.6
+- **Symptom:** Wrong pixels but NO bitstream desync — the same bits are read either way, only their placement differs.
+
+**Bug 2:** All four CAVLC sub-blocks of an 8x8 block shared one nC (computed at the partition's top-left), and afterwards all four scan positions were stamped 16-or-0.
+
+Each sub-block is a normal 4x4 residual block at scan index `p*4 + s` with its own neighbor-derived nC, and its actual TotalCoeff must be stored immediately so following sub-blocks (and neighbor MBs) derive correct nC. The 16/0 stamping corrupted every subsequent nC derivation.
+
+- **Spec ref:** 9.2.1 (Parsing process for total_coeff and trailing_ones)
+- **Symptom:** Bit desync on streams where sub-block coefficient counts differ — the "~12% of real x264 streams" failure that kept the path disabled.
+
+**Bug 3:** `levelScale8x8` used a 3-class scaling pattern extrapolated from the 4x4 table. The 8x8 scaling function has SIX distinct classes with different values (e.g. class 2 value 32–58 was entirely missing, and two of the three present values were wrong at m=4/m=5).
+
+- **Spec ref:** 8.5.9 / Table 8-14 (normAdjust8x8)
+- **Symptom:** Residual-carrying 8x8 blocks off by small-to-moderate amounts; error scaled with coefficient magnitude. Cross-check: FFmpeg's `dequant8_coeff_init[6][6]` + `dequant8_coeff_init_scan`.
+
+**Bug 4:** `idct8x8` butterfly had `b5 = a5 - (a3>>2)`; the spec defines `f[5] = (c[3]>>2) - c[5]`. The sign flip effectively swaps output rows 1 and 6 of each 1-D pass.
+
+- **Spec ref:** 8.5.13.3 (8x8 transform)
+- **Symptom:** Blocks with mid-frequency vertical content decoded with bands exchanged; intra 8x8 MBs showed errors up to ~90 that cascaded into neighboring intra prediction.
+
+**Bug 5:** Intra_8x8 Horizontal-Up at `zHU == 13` computed `left[5] + 3*left[6] + 2*left[7]` (weights sum 6); the spec says `(p'[-1,6] + 3*p'[-1,7] + 2) >> 2`.
+
+- **Spec ref:** 8.3.2.2.10 (Intra_8x8_Horizontal_Up)
+- **Symptom:** Single-sample-diagonal errors in HU-predicted 8x8 partitions.
+
+Deblocking also needed two 8x8-aware changes (not bugs, missing features): internal luma edges 1 and 3 are not filtered in 8x8-transform MBs, and the bS=2 coefficient test applies to the containing 8x8 transform block (spec 8.7.2.1).
+
+### Reference List Construction & Weighted Prediction
+
+Found via the High-profile fixture, but independent of the 8x8 transform: x264 (weightp=2, the default) emits `ref_pic_list_modification` in every P slice to alias the previous frame at two reference indices, one carrying explicit weights (`luma_offset_l0 = -1`).
+
+**Bug 1:** `ref_pic_list_modification` was parsed but ignored. A modified list can repeat pictures — that is how `num_ref_idx_l0_active` (4) legally exceeds `max_num_ref_frames` (3).
+
+- **Spec ref:** 8.2.4.3 (Modification process for reference picture lists)
+- **Symptom:** "reference frame 3 not found" once the stream referenced the 4th list entry; before that, wrong-but-similar reference picks.
+
+**Bug 2:** `pred_weight_table` was skipped, decoding unweighted.
+
+- **Spec ref:** 8.4.2.3.2 (Weighted sample prediction)
+- **Symptom:** Uniform ±1 drift accumulating from frame 2 on — the duplicate reference entry carries `weight=1, denom=0, offset=-1`, i.e. "prediction minus one".
+
+**Bug 3:** Deblocking bS=1 "different reference" test compared reference indices. The spec compares the reference *pictures*; with a duplicated list, indices 0 and 1 are the same picture.
+
+- **Spec ref:** 8.7.2.1
+- **Symptom:** After reconstruction was bit-exact with deblocking disabled, the deblocked output still drifted ±1-6 — edges were filtered at bS=1 that the reference decoder left alone.
+- **Discovery:** The staged no-deblock test (`TestDecodeHigh8x8MultiFrameNoDeblock`) passing while the deblocked test failed pinned the divergence to bS derivation.
+
+### CABAC
+
+Implemented in one pass (engine + 1024-context init tables + all syntax
+element decoders + CABAC MB layer for I and P slices), ported against FFmpeg's
+`h264_cabac.c` with tables extracted mechanically from FFmpeg/x264 sources
+rather than typed by hand. The staged fixtures (intra-no-8x8 → all-intra →
+IDR+P) were bit-exact almost immediately; two bugs surfaced later, both
+instructive about *how CABAC fails*:
+
+**Bug 1:** The P_8x8 reference/mvd context lookups passed FFmpeg's Z-scan
+block index (`4*p`) where our neighbor helpers expect raster 4x4 cells
+(partition 1's top-left cell is raster 2, not 4).
+
+- **Spec ref:** 9.3.3.1.1.6-7 (ref_idx / mvd contexts)
+- **Symptom:** Bit desync at the *first P_8x8 macroblock* in the stream;
+  every constrained fixture without sub-partitions passed.
+- **Discovery:** `ffmpeg -debug mb_type` gives a per-MB ground-truth grid;
+  our decoded mb_types matched right up to the first `>+` (P_8x8) MB.
+
+**Bug 2:** `lastCoeffFlagOffset8x8` was transcribed with 62 entries in a
+`[63]` array (a dropped `7`), so Go zero-filled the tail and scan positions
+59+ used wrong last-flag contexts.
+
+- **Spec ref:** Table 9-43 (last_significant_coeff_flag 8x8 mapping)
+- **Symptom:** Every synthetic fixture passed; a real 720p scenecut IDR
+  (dense 8x8 blocks reaching scan positions 59+, ~1800 level escapes)
+  produced a hard desync mid-frame. Wrong *context selection* corrupts
+  CABAC gradually — bins keep decoding correctly for a while because the
+  wrong context's state is similar, then diverge — so the observable
+  failure point can be far from the wrong table entry.
+- **Discovery chain worth reusing:** (1) `ffmpeg -debug qp` per-MB QP grid
+  proved parse alignment right up to the failing MB; (2) a mode-sweep test
+  reconstructed the failing 8x8 partition from *reference* neighbors under
+  all 9 intra modes with our parsed residual — no mode fit, proving the
+  residual bins themselves were wrong; (3) that narrowed it to the one
+  table only dense blocks reach, where diffing against the FFmpeg source
+  found the missing entry.
+
+Verification note: transcription errors in big constant tables are the
+dominant CABAC risk. Extract tables mechanically (curl + awk from FFmpeg /
+x264 sources), verify element counts, and diff the final arrays against the
+source dump — a `[63]` Go array silently zero-fills a 62-entry literal.
+
+### B slices
+
+POC computation, two POC-ordered reference lists, spatial direct mode with
+`direct_8x8_inference`, bi-prediction with implicit (POC-scaled) and
+explicit weighting, per-list mvd/ref CABAC contexts, B-aware deblocking bS,
+MMCO short-term marking, and display-order reordering landed together; the
+staged fixtures (CAVLC bframes=1 → CABAC → full x264 defaults with pyramid)
+were bit-exact on first run. Real default-x264 720p content then exposed
+two bugs, both instructive:
+
+**Bug 1:** The CABAC intra path cleared only the list-0 `mvdAbs` cache.
+Intra MBs inside B slices left stale list-1 mvd values from the co-located
+MB of an earlier frame, so the *next* MB's `mvd_l1` context picked the
+wrong threshold bucket.
+
+- **Spec ref:** 9.3.3.1.1.7 (mvd contexts)
+- **Symptom:** Desync always beginning at the MB immediately after the
+  first intra-in-B macroblock; the tiny fixtures had no intra MBs in B
+  slices at all.
+- **Discovery:** Per-MB QP grids (`ffmpeg -debug qp`) diffed against our
+  `mbInfo[].qp` pinned the first divergent MB; `ffmpeg -debug mb_type`
+  showed our mb_types matched right up to an `i` cell. Beware `head`
+  truncation when eyeballing traces — one earlier "divergence" was just a
+  clipped log.
+
+**Bug 2:** MMCO was parsed but not applied. x264 emits
+`memory_management_control_operation` 1 on pyramid B-refs to prune specific
+short-term references instead of sliding-window eviction; ignoring it makes
+the DPB (and thus every later reference list) silently diverge.
+
+- **Spec ref:** 8.2.5.4 (Adaptive memory control marking)
+- **Symptom:** No desync — QP grids fully aligned — but pixel errors on the
+  frames after the first MMCO, because motion compensation read the wrong
+  reference pictures.
+
+Also worth recording: B MBs mark all 16 4x4 cells "decoded" up front and
+gate per-list availability on a predMask instead (a partition that does not
+use a list reports "available with refIdx -1", matching FFmpeg's cache
+model); and ffmpeg's `-debug mb_type`/`-debug qp` grids print in *display*
+order, which is what makes them lineable against POC-derived frame indices.
+
 ---
 
 ## Part 2: Generalized Codec Verification Playbook

@@ -13,9 +13,9 @@ type Decoder struct {
 	activePPS *PPS
 
 	img   *image.YCbCr
-	mbw   int // macroblocks per row
-	mbh   int // macroblocks per column
-	qp    int // current QP
+	mbw   int    // macroblocks per row
+	mbh   int    // macroblocks per column
+	qp    int    // current QP
 	curMB [2]int // current macroblock (x, y) for prediction availability
 
 	// Per-MB state for CAVLC context: nzCoeff[mbIdx*24 + blkIdx].
@@ -33,8 +33,27 @@ type Decoder struct {
 	// NAL length prefix size.
 	lengthSize int
 
-	// Reference frame storage (Phase 3).
-	refFrames []*image.YCbCr
+	// Reference frame storage: short-term DPB entries plus the per-slice
+	// reference picture lists (spec 8.2.4). curRefList[0] is L0, [1] is L1.
+	refFrames  []*refFrame
+	nextRefID  int
+	curRefList [2][]*refFrame
+
+	// Picture order count state (spec 8.2.1). curPOC is the POC of the
+	// picture currently being decoded; the prev* fields carry state between
+	// pictures for POC types 0 and 2.
+	curPOC             int
+	prevPOCMsb         int
+	prevPOCLsb         int
+	prevFrameNumOffset int
+	prevFrameNum       int
+
+	// curIsIDR / curIsB / maxReorder feed the Codec's display reordering.
+	curIsIDR bool
+	sawB     bool
+
+	// biBuf holds the saved list-0 prediction during B bi-prediction.
+	biBuf mcBuf
 
 	// Per-MB inter prediction info for MV prediction and deblocking.
 	mbInfo []mbInterInfo
@@ -45,6 +64,10 @@ type Decoder struct {
 
 	// disableDeblock skips the deblocking filter (for testing).
 	disableDeblock bool
+
+	// lastQPDeltaNonZero tracks whether the previously decoded MB in the
+	// current slice had a non-zero mb_qp_delta (CABAC dqp context).
+	lastQPDeltaNonZero bool
 }
 
 // ybr workspace layout constants.
@@ -107,10 +130,10 @@ var blkTo8x8 = [16]int{
 // are not available for intra 4x4 prediction (spec Section 6.4.12.2 + block 15
 // whose upper-right is outside the MB and in an undecoded neighbor).
 var blk4x4UpperRightUnavail = [16]bool{
-	false, false, false, true,  // scan 3: (4,4) upper-right not yet decoded
-	false, false, false, true,  // scan 7: (4,12) upper-right outside MB
-	false, false, false, true,  // scan 11: (12,4) upper-right not yet decoded
-	false, true, false, true,   // scan 13: (8,12) outside MB; scan 15: (12,12) outside MB
+	false, false, false, true, // scan 3: (4,4) upper-right not yet decoded
+	false, false, false, true, // scan 7: (4,12) upper-right outside MB
+	false, false, false, true, // scan 11: (12,4) upper-right not yet decoded
+	false, true, false, true, // scan 13: (8,12) outside MB; scan 15: (12,12) outside MB
 }
 
 // zigzagToRaster maps zigzag scan position to raster index for 4x4 blocks.
@@ -141,43 +164,40 @@ func reorderCoeffs(coeffs []int16) {
 	}
 }
 
-// read8x8ResidualCAVLC reads the 64 coefficients of an 8x8 transform block
-// via CAVLC. Per FFmpeg's scan8x8_cavlc, the 64 coefficients are read as
-// 4 sub-blocks of 16 coefficients each where sub-block s covers the
-// contiguous slice zigzag[16*s .. 16*s+15]. Sub-block s position k
-// corresponds to zigzag position 16*s + k, mapped to raster via
-// zigzagToRaster8x8.
+// read8x8ResidualCAVLC reads the 64 coefficients of the 8x8 transform block
+// for luma 8x8 partition p (0-3) via CAVLC. Per spec 7.3.5.3.2, the 8x8 block
+// is coded as four ordinary 4x4 residual blocks at scan indices p*4+0..p*4+3,
+// each with its own neighbor-derived nC, and the coefficients interleave into
+// the 8x8 zigzag scan: level8x8[4*i + i4x4] = level4x4[i4x4][i]. The actual
+// per-sub-block TotalCoeff is stored in nzCoeffCur immediately, because spec
+// 9.2.1 treats these sub-blocks as normal 4x4 blocks when later blocks (in
+// this MB or a neighbor) derive their nC.
 //
-// This is NOT the `4*k+s` interleave you'd naïvely assume from reading the
-// spec — the CAVLC sub-block scan groups low-frequency coefficients together
-// so the context-adaptive coeff_token tables exploit the typical DC-heavy
-// low / AC-heavy high frequency separation.
-//
-// coeffs must be length >= 64 and will be written in raster order.
+// coeffs must be length >= 64 and is written in raster order.
 // Returns the total non-zero count across all sub-blocks.
-func read8x8ResidualCAVLC(br *BitReader, coeffs []int16, nCs [4]int) (int, error) {
+func (d *Decoder) read8x8ResidualCAVLC(br *BitReader, coeffs []int16, mbx, mby, p int) (int, error) {
 	for i := 0; i < 64; i++ {
 		coeffs[i] = 0
 	}
 	var subBlock [16]int16
 	totalNZ := 0
 	for s := 0; s < 4; s++ {
-		for i := 0; i < 16; i++ {
+		for i := range subBlock {
 			subBlock[i] = 0
 		}
-		nz, err := readResidualBlock(br, subBlock[:], 16, nCs[s])
+		blkIdx := p*4 + s
+		nC := d.calcNC(mbx, mby, blkIdx)
+		nz, err := readResidualBlock(br, subBlock[:], 16, nC)
 		if err != nil {
 			return 0, err
 		}
+		d.nzCoeffCur[blkIdx] = nz
 		totalNZ += nz
-		// Scatter sub-block coefficients into the 8x8 block in raster order.
-		// subBlock[k] carries zigzag position 16*s + k.
 		for k := 0; k < 16; k++ {
 			if subBlock[k] == 0 {
 				continue
 			}
-			scanPos := 16*s + k
-			coeffs[zigzagToRaster8x8[scanPos]] = subBlock[k]
+			coeffs[zigzagToRaster8x8[4*k+s]] = subBlock[k]
 		}
 	}
 	return totalNZ, nil
@@ -250,10 +270,6 @@ func (d *Decoder) decodeSlice(nalu NALUnit) (*image.YCbCr, error) {
 	d.activeSPS = sps
 	d.activePPS = pps
 
-	if pps.EntropyCodingModeFlag {
-		return nil, fmt.Errorf("h264: CABAC entropy coding not supported (only CAVLC)")
-	}
-
 	// Re-parse from beginning.
 	br = NewBitReader(nalu.Data)
 	sh, err := parseSliceHeader(br, sps, pps, nalu.Type, nalu.RefIDC)
@@ -270,28 +286,100 @@ func (d *Decoder) decodeSlice(nalu NALUnit) (*image.YCbCr, error) {
 	d.initDPB()
 	d.qp = 26 + int(pps.PicInitQPMinus26) + int(sh.sliceQPDelta)
 
-	if nalu.Type == NALSliceIDR {
+	d.curIsIDR = nalu.Type == NALSliceIDR
+	if d.curIsIDR {
 		d.resetDPB()
 	}
+	if err := d.computePOC(sh, nalu); err != nil {
+		return nil, err
+	}
 
-	if sh.sliceType == sliceTypeI || sh.sliceType == sliceTypeSI {
-		img, err := d.decodeISlice(br, sh)
-		if err != nil {
-			return nil, err
+	cabac := pps.EntropyCodingModeFlag
+
+	var img *image.YCbCr
+	switch sh.sliceType {
+	case sliceTypeI, sliceTypeSI:
+		if cabac {
+			img, err = d.decodeISliceCABAC(br, sh)
+		} else {
+			img, err = d.decodeISlice(br, sh)
 		}
-		d.storeRefFrame()
-		return img, nil
+	case sliceTypeP:
+		if cabac {
+			img, err = d.decodePSliceCABAC(br, sh)
+		} else {
+			img, err = d.decodePSliceImpl(br, sh)
+		}
+	case sliceTypeB:
+		d.sawB = true
+		if cabac {
+			img, err = d.decodeBSliceCABAC(br, sh)
+		} else {
+			img, err = d.decodeBSliceImpl(br, sh)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported slice type %d", sh.sliceType)
 	}
-	if sh.sliceType == sliceTypeP {
-		img, err := d.decodePSliceImpl(br, sh)
-		if err != nil {
-			return nil, err
-		}
+	if err != nil {
+		return nil, err
+	}
+	if sh.sliceType != sliceTypeI && sh.sliceType != sliceTypeSI {
 		d.deblockFrame(sh)
-		d.storeRefFrame()
-		return img, nil
 	}
-	return nil, fmt.Errorf("unsupported slice type %d", sh.sliceType)
+	if nalu.RefIDC != 0 {
+		if err := d.storeRefFrame(sh.frameNum, sh.mmco); err != nil {
+			return nil, err
+		}
+	}
+	return img, nil
+}
+
+// computePOC derives the picture order count of the current picture
+// (spec 8.2.1) for pic_order_cnt_type 0 and 2.
+func (d *Decoder) computePOC(sh *sliceHeader, nalu NALUnit) error {
+	sps := d.activeSPS
+	switch sps.PicOrderCntType {
+	case 0:
+		if d.curIsIDR {
+			d.prevPOCMsb = 0
+			d.prevPOCLsb = 0
+		}
+		maxLsb := 1 << uint(sps.Log2MaxPicOrderCntLsb)
+		lsb := int(sh.picOrderCntLsb)
+		msb := d.prevPOCMsb
+		if lsb < d.prevPOCLsb && d.prevPOCLsb-lsb >= maxLsb/2 {
+			msb = d.prevPOCMsb + maxLsb
+		} else if lsb > d.prevPOCLsb && lsb-d.prevPOCLsb > maxLsb/2 {
+			msb = d.prevPOCMsb - maxLsb
+		}
+		d.curPOC = msb + lsb
+		if nalu.RefIDC != 0 {
+			d.prevPOCMsb = msb
+			d.prevPOCLsb = lsb
+		}
+	case 2:
+		maxFrameNum := 1 << uint(sps.Log2MaxFrameNum)
+		fn := int(sh.frameNum)
+		var offset int
+		switch {
+		case d.curIsIDR:
+			offset = 0
+		case d.prevFrameNum > fn:
+			offset = d.prevFrameNumOffset + maxFrameNum
+		default:
+			offset = d.prevFrameNumOffset
+		}
+		poc := 2 * (offset + fn)
+		if nalu.RefIDC == 0 {
+			poc--
+		}
+		d.curPOC = poc
+		d.prevFrameNumOffset = offset
+		d.prevFrameNum = fn
+	default:
+		return fmt.Errorf("pic_order_cnt_type %d not supported", sps.PicOrderCntType)
+	}
+	return nil
 }
 
 func (d *Decoder) ensureImg() {
@@ -337,6 +425,8 @@ func (d *Decoder) decodeISlice(br *BitReader, sh *sliceHeader) (*image.YCbCr, er
 			}
 			for k := range d.mbInfo[idx].refIdx {
 				d.mbInfo[idx].refIdx[k] = -1
+				d.mbInfo[idx].refIdxL1[k] = -1
+				d.mbInfo[idx].predMask[k] = 0
 			}
 		}
 	}
@@ -354,6 +444,10 @@ var DebugBlkLog func(mbx, mby, blk, nz int, coeffs []int16, predMode int, nC int
 // DebugI4x4Modes, if non-nil, is called with all 16 prediction modes after parsing.
 var DebugI4x4Modes func(mbx, mby int, modes [16]int, cbpLuma, cbpChroma int)
 
+// DebugI8x8Modes, if non-nil, is called with the 4 partition prediction modes
+// of each I_NxN MB decoded with transform_size_8x8_flag=1.
+var DebugI8x8Modes func(mbx, mby int, modes [4]int, cbpLuma, cbpChroma int)
+
 func (d *Decoder) decodeMBIntra(br *BitReader, mbx, mby int) error {
 	bitsBefore := br.BitsRead()
 	mbType, err := br.ReadUE()
@@ -369,6 +463,9 @@ func (d *Decoder) decodeMBIntra(br *BitReader, mbx, mby int) error {
 func (d *Decoder) decodeMBIntraWithType(br *BitReader, mbx, mby, mbType int) error {
 	d.curMB = [2]int{mbx, mby}
 	d.prepareYBR(mbx, mby)
+	// mbInfo persists across frames; reset the transform flag so a stale value
+	// from the previous frame's co-located MB cannot leak into deblocking.
+	d.mbInfo[mby*d.mbw+mbx].transform8x8 = false
 	for i := range d.coeff {
 		d.coeff[i] = 0
 	}
@@ -389,11 +486,8 @@ func (d *Decoder) decodeMBIntraWithType(br *BitReader, mbx, mby, mbType int) err
 				return fmt.Errorf("transform_size_8x8_flag: %w", err)
 			}
 			if t8x8 {
-				// decodeMBI8x8 exists but is disabled pending bit-exactness
-				// debug; it shared a bit-desync with the inter 8x8 path that
-				// was not resolved this session. Keep the hard-stop until
-				// an isolated fixture proves both paths match FFmpeg.
-				return fmt.Errorf("h264: 8x8 intra transform not supported")
+				d.mbInfo[mby*d.mbw+mbx].transform8x8 = true
+				return d.decodeMBI8x8(br, mbx, mby)
 			}
 		}
 		return d.decodeMBI4x4(br, mbx, mby)
@@ -437,6 +531,51 @@ func (d *Decoder) decodeMBPCM(br *BitReader, mbx, mby int) error {
 	d.storeNZCoeff(mbx, mby)
 	d.copyMBToImg(mbx, mby)
 	return nil
+}
+
+// predIntra4x4 runs Intra_4x4 prediction for the block at ybr (y, x),
+// applying the spec 8.3.1.2.1 upper-right sample substitution first: when the
+// upper-right 4x4 samples are not available (scan indices {3, 7, 11, 13, 15}
+// — either not yet decoded or outside the MB), replicate the rightmost
+// available above sample.
+func (d *Decoder) predIntra4x4(y, x, mode, blk int) {
+	if blk4x4UpperRightUnavail[blk] {
+		for k := 4; k < 8; k++ {
+			d.ybr[y-1][x+k] = d.ybr[y-1][x+3]
+		}
+	}
+	predIntra4x4Func[mode](d, y, x)
+}
+
+// predIntra8x8Part runs Intra_8x8 prediction for partition p (Z order) at
+// ybr (y, x), deriving neighbor availability per spec 6.4.9/8.3.2.2.
+func (d *Decoder) predIntra8x8Part(y, x, p, mode, mbx, mby int) {
+	partY := (p / 2) * 8
+	partX := (p % 2) * 8
+	hasTop := partY > 0 || mby > 0
+	hasLeft := partX > 0 || mbx > 0
+	hasCorner := (partY > 0 && partX > 0) ||
+		(partY > 0 && mbx > 0) ||
+		(partX > 0 && mby > 0) ||
+		(mbx > 0 && mby > 0)
+
+	// above-right for each partition:
+	//  p=0: columns 8..15 of y=-1 come from above MB (if mby > 0).
+	//  p=1: columns 16..23 of y=-1 come from above-right MB (mbx+1, mby-1).
+	//  p=2: partition 1 is already decoded; its bottom row is our above-right.
+	//  p=3: past right edge; right MB not yet decoded.
+	aboveRightAvail := false
+	switch p {
+	case 0:
+		aboveRightAvail = mby > 0
+	case 1:
+		aboveRightAvail = mby > 0 && mbx < d.mbw-1
+	case 2:
+		aboveRightAvail = true
+	}
+
+	samples := d.prepareIntra8x8Samples(y, x, hasTop, hasLeft, hasCorner, aboveRightAvail)
+	predIntra8x8Func[mode](d, y, x, &samples)
 }
 
 func (d *Decoder) decodeMBI4x4(br *BitReader, mbx, mby int) error {
@@ -498,16 +637,7 @@ func (d *Decoder) decodeMBI4x4(br *BitReader, mbx, mby int) error {
 		pos := blk4x4Pos[blk]
 		y := ybrYY + pos[0]
 		x := ybrYX + pos[1]
-		// H.264 spec 8.3.1.2.1: when upper-right 4x4 samples are not available,
-		// substitute with the rightmost available above sample.
-		// Unavailable for scan indices {3, 7, 11, 13, 15}: either the upper-right
-		// block hasn't been decoded yet (3, 11) or is outside the MB (7, 13, 15).
-		if blk4x4UpperRightUnavail[blk] {
-			for k := 4; k < 8; k++ {
-				d.ybr[y-1][x+k] = d.ybr[y-1][x+3]
-			}
-		}
-		predIntra4x4Func[predModes[blk]](d, y, x)
+		d.predIntra4x4(y, x, predModes[blk], blk)
 
 		group8x8 := blkTo8x8[blk]
 		if cbpLuma&(1<<uint(group8x8)) != 0 {
@@ -603,6 +733,10 @@ func (d *Decoder) decodeMBI8x8(br *BitReader, mbx, mby int) error {
 	cbpLuma := cbp % 16
 	cbpChroma := cbp / 16
 
+	if DebugI8x8Modes != nil {
+		DebugI8x8Modes(mbx, mby, predModes, cbpLuma, cbpChroma)
+	}
+
 	if cbp > 0 {
 		qpDelta, err := br.ReadSE()
 		if err != nil {
@@ -617,44 +751,10 @@ func (d *Decoder) decodeMBI8x8(br *BitReader, mbx, mby int) error {
 		partX := (p % 2) * 8
 		y := ybrYY + partY
 		x := ybrYX + partX
-
-		// Neighbor availability for this 8x8 partition's intra prediction.
-		hasTop := partY > 0 || mby > 0
-		hasLeft := partX > 0 || mbx > 0
-		hasCorner := (partY > 0 && partX > 0) ||
-			(partY > 0 && mbx > 0) ||
-			(partX > 0 && mby > 0) ||
-			(mbx > 0 && mby > 0)
-
-		// above-right for each partition:
-		//  p=0: columns 8..15 of y=-1 come from above MB (if mby > 0).
-		//  p=1: columns 16..23 of y=-1 come from above-right MB (mbx+1, mby-1).
-		//  p=2: partition 1 is already decoded; its bottom row is our above-right.
-		//  p=3: past right edge; right MB not yet decoded.
-		aboveRightAvail := false
-		switch p {
-		case 0:
-			aboveRightAvail = mby > 0
-		case 1:
-			aboveRightAvail = mby > 0 && mbx < d.mbw-1
-		case 2:
-			aboveRightAvail = true
-		case 3:
-			aboveRightAvail = false
-		}
-
-		samples := d.prepareIntra8x8Samples(y, x, hasTop, hasLeft, hasCorner, aboveRightAvail)
-		predIntra8x8Func[predModes[p]](d, y, x, &samples)
+		d.predIntra8x8Part(y, x, p, predModes[p], mbx, mby)
 
 		if cbpLuma&(1<<uint(p)) != 0 {
-			for i := range blk {
-				blk[i] = 0
-			}
-			// nC at the 8x8 partition's top-left 4x4 scan index, reused for
-			// all 4 CAVLC sub-blocks — matches reference decoders (FFmpeg /
-			// JM). Using nC=0 here desyncs bit consumption from encoder.
-			nC := d.calcNC(mbx, mby, p*4)
-			nz, err := read8x8ResidualCAVLC(br, blk[:], [4]int{nC, nC, nC, nC})
+			nz, err := d.read8x8ResidualCAVLC(br, blk[:], mbx, mby, p)
 			if err != nil {
 				return err
 			}
@@ -662,15 +762,6 @@ func (d *Decoder) decodeMBI8x8(br *BitReader, mbx, mby int) error {
 				dequant8x8(blk[:], d.qp)
 				idct8x8(blk[:])
 				d.addResidual8x8(y, x, blk[:])
-			}
-			// Spec-aligned nz tracking for 8x8 (matches FFmpeg): all 4 4x4
-			// scan positions within the 8x8 get 16 if any nz, else 0.
-			mark := 0
-			if nz > 0 {
-				mark = 16
-			}
-			for k := 0; k < 4; k++ {
-				d.nzCoeffCur[p*4+k] = mark
 			}
 		}
 	}

@@ -134,4 +134,3 @@ func (br *BitReader) ByteAlign() {
 func (br *BitReader) BitsRead() int {
 	return br.bytePos*8 + int(br.bitPos)
 }
-

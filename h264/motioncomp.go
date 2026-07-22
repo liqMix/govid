@@ -531,3 +531,39 @@ func bilinearChroma(pix []byte, stride, w, h, x, y, fracX, fracY int) uint8 {
 		fracX*fracY*dd
 	return uint8((val + 32) >> 6)
 }
+
+// applyWeightRegion applies the explicit weighted prediction formula
+// (spec 8.4.2.3.2) in place to a w×h region of the ybr workspace:
+// pred = Clip1(((pred*weight + 2^(logWD-1)) >> logWD) + offset).
+func (d *Decoder) applyWeightRegion(y, x, w, h int, wo weightOffset, logWD int) {
+	round := 0
+	if logWD > 0 {
+		round = 1 << uint(logWD-1)
+	}
+	for j := 0; j < h; j++ {
+		for i := 0; i < w; i++ {
+			p := int(d.ybr[y+j][x+i])
+			v := (p*wo.weight+round)>>uint(logWD) + wo.offset
+			d.ybr[y+j][x+i] = uint8(clampInt(v, 0, 255))
+		}
+	}
+}
+
+// applyWeights applies explicit weighted prediction to a just-motion-
+// compensated partition: luma region (lumaY, lumaX, lw, lh) in ybr coords
+// and the corresponding lw/2 × lh/2 chroma regions at chroma-sample offset
+// (cOffX, cOffY) within the MB. No-op for reference indices whose weights
+// were left at their defaults (the formula is exact identity there).
+func (d *Decoder) applyWeights(sh *sliceHeader, refIdx, lumaY, lumaX, lw, lh, cOffX, cOffY int) {
+	pw := sh.weights
+	if pw == nil || refIdx < 0 || refIdx >= len(pw.luma) {
+		return
+	}
+	if pw.luma[refIdx].explicit {
+		d.applyWeightRegion(lumaY, lumaX, lw, lh, pw.luma[refIdx], pw.lumaLog2Denom)
+	}
+	if pw.chroma[refIdx][0].explicit {
+		d.applyWeightRegion(ybrBY+cOffY, ybrBX+cOffX, lw/2, lh/2, pw.chroma[refIdx][0], pw.chromaLog2Denom)
+		d.applyWeightRegion(ybrRY+cOffY, ybrRX+cOffX, lw/2, lh/2, pw.chroma[refIdx][1], pw.chromaLog2Denom)
+	}
+}
