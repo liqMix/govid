@@ -566,7 +566,7 @@ func (d *Decoder) decodeISliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbC
 		info := &d.mbInfo[idx]
 		info.isIntra = true
 		info.mbType = -2
-		info.qp = d.qp
+		info.qp = d.pcmAwareQP(idx)
 		for k := range info.mv {
 			info.mv[k] = [2]int16{0, 0}
 		}
@@ -631,7 +631,7 @@ func (d *Decoder) decodePSliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbC
 					info := &d.mbInfo[idx]
 					info.isIntra = true
 					info.mbType = -2
-					info.qp = d.qp
+					info.qp = d.pcmAwareQP(idx)
 					for k := range info.mv {
 						info.mv[k] = [2]int16{0, 0}
 					}
@@ -676,6 +676,7 @@ func (d *Decoder) decodeMBIntraCABACWithType(cd *cabacDecoder, mbx, mby, mbType 
 	info.cbpCabac = 0
 	info.chromaPredMode = 0
 	info.i16OrPCM = mbType != 0
+	info.isPCM = false
 	info.mvdAbs = [16][2]uint8{}
 	info.mvdAbsL1 = [16][2]uint8{}
 	info.isDirectMB = false
@@ -691,9 +692,7 @@ func (d *Decoder) decodeMBIntraCABACWithType(cd *cabacDecoder, mbx, mby, mbType 
 	}
 
 	if mbType == mbTypeIPCM {
-		// I_PCM in CABAC requires re-aligning the raw bitstream from the
-		// arithmetic decoder state; x264 does not emit it in practice.
-		return fmt.Errorf("h264: I_PCM in CABAC not supported")
+		return d.decodeMBPCMCABAC(cd, mbx, mby)
 	}
 	if mbType == mbTypeINxN {
 		use8x8 := false
@@ -707,6 +706,29 @@ func (d *Decoder) decodeMBIntraCABACWithType(cd *cabacDecoder, mbx, mby, mbType 
 		return d.decodeMBI4x4CABAC(cd, mbx, mby)
 	}
 	return d.decodeMBI16x16CABAC(cd, mbx, mby, mbType)
+}
+
+// decodeMBPCMCABAC decodes an I_PCM macroblock inside a CABAC slice. Because
+// the arithmetic engine here is the spec's bit-serial model (init reads 9
+// bits, each renormalization reads one), the BitReader position after the
+// I_PCM terminate bin is exactly the conceptual RBSP position: the sample
+// data starts at the next byte boundary (pcm_alignment_zero_bit, spec 7.3.5)
+// with no pointer adjustment, and the decoding engine is re-initialized after
+// the samples (spec 9.3.1.2). Context variables are NOT re-initialized.
+func (d *Decoder) decodeMBPCMCABAC(cd *cabacDecoder, mbx, mby int) error {
+	if err := cd.checkErr(); err != nil {
+		return err
+	}
+	cd.br.ByteAlign()
+	if err := d.readPCMSamples(cd.br); err != nil {
+		return err
+	}
+	d.finishPCM(mbx, mby)
+	// I_PCM has no mb_qp_delta; the dqp context resets (FFmpeg
+	// last_qscale_diff = 0).
+	d.lastQPDeltaNonZero = false
+	cd.initEngine()
+	return cd.checkErr()
 }
 
 func (d *Decoder) decodeMBI4x4CABAC(cd *cabacDecoder, mbx, mby int) error {
@@ -746,7 +768,7 @@ func (d *Decoder) decodeMBI4x4CABAC(cd *cabacDecoder, mbx, mby int) error {
 			nz := d.cabacResidual(cd, catLuma4x4, blk, c, 16, mbx, mby, true)
 			if nz > 0 {
 				reorderCoeffs(c)
-				dequant4x4(c, d.qp)
+				dequant4x4(c, d.qp, d.wsLuma4(true))
 				idct4x4(c)
 				d.addResidual4x4(y, x, c)
 			}
@@ -813,7 +835,7 @@ func (d *Decoder) decodeMBI8x8CABAC(cd *cabacDecoder, mbx, mby int) error {
 						blk[zigzagToRaster8x8[i]] = v
 					}
 				}
-				dequant8x8(blk[:], d.qp)
+				dequant8x8(blk[:], d.qp, d.wsLuma8(true))
 				idct8x8(blk[:])
 				d.addResidual8x8(y, x, blk[:])
 			}
@@ -848,7 +870,7 @@ func (d *Decoder) decodeMBI16x16CABAC(cd *cabacDecoder, mbx, mby, mbType int) er
 	d.cabacResidual(cd, catLumaDC, 0, dcCoeffs, 16, mbx, mby, true)
 	reorderCoeffs(dcCoeffs)
 	hadamard4x4(dcCoeffs)
-	dequantLumaDC(dcCoeffs, d.qp)
+	dequantLumaDC(dcCoeffs, d.qp, d.scalingWS4[0][0])
 
 	for blk := 0; blk < 16; blk++ {
 		dcIdx := blkScanToDCIdx[blk]
@@ -862,7 +884,7 @@ func (d *Decoder) decodeMBI16x16CABAC(cd *cabacDecoder, mbx, mby, mbType int) er
 			}
 		}
 		if c[0] != 0 || d.nzCoeffCur[blk] > 0 {
-			dequant4x4(c, d.qp)
+			dequant4x4(c, d.qp, d.wsLuma4(true))
 			c[0] = dcCoeffs[dcIdx]
 			idct4x4(c)
 			pos := blk4x4Pos[blk]
@@ -898,10 +920,14 @@ func (d *Decoder) decodeChromaCABAC(cd *cabacDecoder, mbx, mby, chromaPredMode, 
 	d.cabacResidual(cd, catChromaDC, 0, cbDC, 4, mbx, mby, curIntra)
 	d.cabacResidual(cd, catChromaDC, 1, crDC, 4, mbx, mby, curIntra)
 
+	cbW, crW := d.scalingWS4[4][0], d.scalingWS4[5][0]
+	if curIntra {
+		cbW, crW = d.scalingWS4[1][0], d.scalingWS4[2][0]
+	}
 	hadamard2x2(cbDC)
-	dequantChromaDC(cbDC, qpC)
+	dequantChromaDC(cbDC, qpC, cbW)
 	hadamard2x2(crDC)
-	dequantChromaDC(crDC, qpC)
+	dequantChromaDC(crDC, qpC, crW)
 
 	for plane := 0; plane < 2; plane++ {
 		dc := cbDC
@@ -922,7 +948,7 @@ func (d *Decoder) decodeChromaCABAC(cd *cabacDecoder, mbx, mby, chromaPredMode, 
 				}
 			}
 			if c[0] != 0 || d.nzCoeffCur[16+plane*4+blk] > 0 {
-				dequant4x4(c, qpC)
+				dequant4x4(c, qpC, d.wsChroma4(curIntra, plane == 1))
 				c[0] = dc[blk]
 				idct4x4(c)
 				j4 := blk / 2
@@ -947,6 +973,7 @@ func (d *Decoder) decodeMBInterCABAC(cd *cabacDecoder, mbx, mby int, sh *sliceHe
 	info.cbpCabac = 0
 	info.chromaPredMode = 0
 	info.i16OrPCM = false
+	info.isPCM = false
 	info.transform8x8 = false
 	info.mvdAbs = [16][2]uint8{}
 	info.isDirectMB = false
@@ -1359,9 +1386,6 @@ func (d *Decoder) decodeBSliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbC
 	if len(d.refFrames) == 0 {
 		return nil, fmt.Errorf("B-slice: no reference frames available")
 	}
-	if !sh.directSpatialMvPred {
-		return nil, fmt.Errorf("temporal direct mode not supported")
-	}
 	if err := d.buildRefLists(sh); err != nil {
 		return nil, fmt.Errorf("B-slice: %w", err)
 	}
@@ -1392,7 +1416,7 @@ func (d *Decoder) decodeBSliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbC
 					info := &d.mbInfo[idx]
 					info.isIntra = true
 					info.mbType = -2
-					info.qp = d.qp
+					info.qp = d.pcmAwareQP(idx)
 					info.isDirectMB = false
 					info.directMask = 0
 					for k := range info.mv {
@@ -1437,13 +1461,15 @@ func (d *Decoder) decodeMBInterBCABAC(cd *cabacDecoder, mbx, mby int, sh *sliceH
 	if shape.direct {
 		info.isDirectMB = true
 		info.directMask = 0xFFFF
-		ctx := d.deriveDirectSpatialMB(mbx, mby)
+		ctx := d.deriveDirectMB(sh, mbx, mby)
 		for p := 0; p < 4; p++ {
-			part := d.directPart(&ctx, mbx, mby, p)
-			if err := d.execBPart(sh, mbx, mby, &part); err != nil {
-				return err
+			var buf [4]bPart
+			for _, part := range d.directParts(&ctx, mbx, mby, p, buf[:0]) {
+				if err := d.execBPart(sh, mbx, mby, &part); err != nil {
+					return err
+				}
+				d.storeBPart(info, &part)
 			}
-			d.storeBPart(info, &part)
 		}
 	} else if shape.parts <= 2 {
 		n := shape.parts
@@ -1525,18 +1551,20 @@ func (d *Decoder) decodeMBInterBCABAC(cd *cabacDecoder, mbx, mby int, sh *sliceH
 				continue
 			}
 			if !haveDirectCtx {
-				dctx = d.deriveDirectSpatialMB(mbx, mby)
+				dctx = d.deriveDirectMB(sh, mbx, mby)
 				haveDirectCtx = true
 			}
-			part := d.directPart(&dctx, mbx, mby, p)
-			d.storeBPart(info, &part)
-			for by := part.y / 4; by < (part.y+8)/4; by++ {
-				for bx := part.x / 4; bx < (part.x+8)/4; bx++ {
-					info.directMask |= uint16(1) << uint(by*4+bx)
+			var buf [4]bPart
+			for _, part := range d.directParts(&dctx, mbx, mby, p, buf[:0]) {
+				d.storeBPart(info, &part)
+				for by := part.y / 4; by < (part.y+part.h)/4; by++ {
+					for bx := part.x / 4; bx < (part.x+part.w)/4; bx++ {
+						info.directMask |= uint16(1) << uint(by*4+bx)
+					}
 				}
-			}
-			if err := d.execBPart(sh, mbx, mby, &part); err != nil {
-				return err
+				if err := d.execBPart(sh, mbx, mby, &part); err != nil {
+					return err
+				}
 			}
 		}
 		var refs [4][2]int
@@ -1574,7 +1602,9 @@ func (d *Decoder) decodeMBInterBCABAC(cd *cabacDecoder, mbx, mby int, sh *sliceH
 					sy := part8x8Pos[p][1] + (sp/(8/s.w))*s.h
 					cell := (sy/4)*4 + sx/4
 					mvdX, mvdY, capd := d.decodeCabacMVDB(cd, list, mbx, mby, cell)
+					info.decodedMask = bSubDecodedMask(&subShapes, p, sp)
 					mvp := d.predictMVList(list, mbx, mby, sx, sy, s.w, s.h, refs[p][list])
+					info.decodedMask = 0xFFFF
 					mv := [2]int16{mvp[0] + int16(mvdX), mvp[1] + int16(mvdY)}
 					for by := sy / 4; by < (sy+s.h)/4; by++ {
 						for bx := sx / 4; bx < (sx+s.w)/4; bx++ {
@@ -1668,7 +1698,7 @@ func (d *Decoder) decodeInterResidualCABAC(cd *cabacDecoder, mbx, mby int, use8x
 							blk[zigzagToRaster8x8[i]] = v
 						}
 					}
-					dequant8x8(blk[:], d.qp)
+					dequant8x8(blk[:], d.qp, d.wsLuma8(false))
 					idct8x8(blk[:])
 					partY := (p / 2) * 8
 					partX := (p % 2) * 8
@@ -1685,7 +1715,7 @@ func (d *Decoder) decodeInterResidualCABAC(cd *cabacDecoder, mbx, mby int, use8x
 				if nz > 0 {
 					hasCoef = true
 					reorderCoeffs(c)
-					dequant4x4(c, d.qp)
+					dequant4x4(c, d.qp, d.wsLuma4(false))
 					idct4x4(c)
 					pos := blk4x4Pos[blk]
 					d.addResidual4x4(ybrYY+pos[0], ybrYX+pos[1], c)

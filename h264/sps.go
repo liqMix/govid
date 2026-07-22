@@ -14,6 +14,7 @@ type SPS struct {
 	BitDepthChroma              uint32
 	QpprimeYZeroTransformBypass bool
 	SeqScalingMatrixPresent     bool
+	ScalingLists                [12]scalingListEntry
 	Log2MaxFrameNum             uint32
 	PicOrderCntType             uint32
 	Log2MaxPicOrderCntLsb       uint32
@@ -125,7 +126,7 @@ func ParseSPS(rbsp []byte) (*SPS, error) {
 					if i >= 6 {
 						size = 64
 					}
-					if err := skipScalingList(br, size); err != nil {
+					if err := parseScalingList(br, &s.ScalingLists[i], size); err != nil {
 						return nil, err
 					}
 				}
@@ -405,24 +406,6 @@ func parseVUIReorderFrames(br *BitReader) (int, error) {
 		return -1, err
 	}
 	return int(reorder), nil
-}
-
-func skipScalingList(br *BitReader, size int) error {
-	lastScale := int32(8)
-	nextScale := int32(8)
-	for j := 0; j < size; j++ {
-		if nextScale != 0 {
-			delta, err := br.ReadSE()
-			if err != nil {
-				return err
-			}
-			nextScale = (lastScale + delta + 256) % 256
-		}
-		if nextScale != 0 {
-			lastScale = nextScale
-		}
-	}
-	return nil
 }
 
 func boolToUint32(b bool) uint32 {

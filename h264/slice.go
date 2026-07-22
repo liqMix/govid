@@ -41,6 +41,7 @@ type sliceHeader struct {
 	weightsL1               *predWeights
 	cabacInitIdc            uint32
 	mmco                    []mmcoOp
+	idrLongTerm             bool // IDR long_term_reference_flag
 }
 
 // mmcoOp is one memory_management_control_operation (spec 7.4.3.3).
@@ -69,7 +70,7 @@ type weightOffset struct {
 
 // refListModOp is one ref_pic_list_modification operation (spec 7.4.3.1).
 // idc 0/1 reorder a short-term picture by abs_diff_pic_num_minus1 (val);
-// idc 2 selects a long-term picture by long_term_pic_num (unsupported).
+// idc 2 selects a long-term picture by long_term_pic_num.
 type refListModOp struct {
 	idc uint32
 	val uint32
@@ -224,7 +225,7 @@ func parseSliceHeader(br *BitReader, sps *SPS, pps *PPS, nalType uint8, nalRefID
 
 	// dec_ref_pic_marking
 	if nalType == NALSliceIDR || nalRefIDC > 0 {
-		sh.mmco, err = parseDecRefPicMarking(br, nalType)
+		sh.mmco, sh.idrLongTerm, err = parseDecRefPicMarking(br, nalType)
 		if err != nil {
 			return nil, err
 		}
@@ -303,29 +304,29 @@ func parseRefPicListModification(br *BitReader) ([]refListModOp, error) {
 	}
 }
 
-func parseDecRefPicMarking(br *BitReader, nalType uint8) ([]mmcoOp, error) {
+func parseDecRefPicMarking(br *BitReader, nalType uint8) ([]mmcoOp, bool, error) {
 	if nalType == NALSliceIDR {
 		if _, err := br.ReadBool(); err != nil { // no_output_of_prior_pics_flag
-			return nil, err
+			return nil, false, err
 		}
-		_, err := br.ReadBool() // long_term_reference_flag
-		return nil, err
+		lt, err := br.ReadBool() // long_term_reference_flag
+		return nil, lt, err
 	}
 	flag, err := br.ReadBool() // adaptive_ref_pic_marking_mode_flag
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !flag {
-		return nil, nil
+		return nil, false, nil
 	}
 	var ops []mmcoOp
 	for {
 		op, err := br.ReadUE()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if op == 0 {
-			return ops, nil
+			return ops, false, nil
 		}
 		m := mmcoOp{op: op}
 		switch op {
@@ -334,16 +335,16 @@ func parseDecRefPicMarking(br *BitReader, nalType uint8) ([]mmcoOp, error) {
 		case 3:
 			m.arg1, err = br.ReadUE()
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			m.arg2, err = br.ReadUE()
 		case 5:
 			// No parameters.
 		default:
-			return nil, fmt.Errorf("unknown MMCO operation %d", op)
+			return nil, false, fmt.Errorf("unknown MMCO operation %d", op)
 		}
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		ops = append(ops, m)
 	}

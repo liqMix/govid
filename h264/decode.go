@@ -49,8 +49,11 @@ type Decoder struct {
 	prevFrameNum       int
 
 	// curIsIDR / curIsB / maxReorder feed the Codec's display reordering.
+	// sawMMCO5 is set when an MMCO op 5 reset renumbered the current picture
+	// (the Codec treats it like an IDR for output-order keys).
 	curIsIDR bool
 	sawB     bool
+	sawMMCO5 bool
 
 	// biBuf holds the saved list-0 prediction during B bi-prediction.
 	biBuf mcBuf
@@ -68,6 +71,14 @@ type Decoder struct {
 	// lastQPDeltaNonZero tracks whether the previously decoded MB in the
 	// current slice had a non-zero mb_qp_delta (CABAC dqp context).
 	lastQPDeltaNonZero bool
+
+	// Active weightScale matrices (raster order) for inverse quantization,
+	// derived from the bound SPS/PPS pair by updateScalingMatrices. Lists:
+	// 4x4 = Intra Y/Cb/Cr, Inter Y/Cb/Cr; 8x8 = Intra Y, Inter Y.
+	scalingWS4 [6][16]int
+	scalingWS8 [2][64]int
+	scalingSPS *SPS
+	scalingPPS *PPS
 }
 
 // ybr workspace layout constants.
@@ -269,6 +280,9 @@ func (d *Decoder) decodeSlice(nalu NALUnit) (*image.YCbCr, error) {
 	}
 	d.activeSPS = sps
 	d.activePPS = pps
+	if d.scalingSPS != sps || d.scalingPPS != pps {
+		d.updateScalingMatrices(sps, pps)
+	}
 
 	// Re-parse from beginning.
 	br = NewBitReader(nalu.Data)
@@ -327,7 +341,7 @@ func (d *Decoder) decodeSlice(nalu NALUnit) (*image.YCbCr, error) {
 		d.deblockFrame(sh)
 	}
 	if nalu.RefIDC != 0 {
-		if err := d.storeRefFrame(sh.frameNum, sh.mmco); err != nil {
+		if err := d.storeRefFrame(sh); err != nil {
 			return nil, err
 		}
 	}
@@ -419,7 +433,7 @@ func (d *Decoder) decodeISlice(br *BitReader, sh *sliceHeader) (*image.YCbCr, er
 			// Mark as intra in mbInfo for P-slice MV prediction context.
 			idx := mby*d.mbw + mbx
 			d.mbInfo[idx].isIntra = true
-			d.mbInfo[idx].qp = d.qp
+			d.mbInfo[idx].qp = d.pcmAwareQP(idx)
 			for k := range d.mbInfo[idx].mv {
 				d.mbInfo[idx].mv[k] = [2]int16{0, 0}
 			}
@@ -476,6 +490,7 @@ func (d *Decoder) decodeMBIntraWithType(br *BitReader, mbx, mby, mbType int) err
 		d.intraModeCur[i] = -1
 	}
 
+	d.mbInfo[mby*d.mbw+mbx].isPCM = false
 	if mbType == mbTypeIPCM {
 		return d.decodeMBPCM(br, mbx, mby)
 	}
@@ -497,6 +512,16 @@ func (d *Decoder) decodeMBIntraWithType(br *BitReader, mbx, mby, mbType int) err
 
 func (d *Decoder) decodeMBPCM(br *BitReader, mbx, mby int) error {
 	br.ByteAlign()
+	if err := d.readPCMSamples(br); err != nil {
+		return err
+	}
+	d.finishPCM(mbx, mby)
+	return nil
+}
+
+// readPCMSamples reads the raw pcm_sample_luma / pcm_sample_chroma bytes into
+// the reconstruction workspace. br must already be byte-aligned.
+func (d *Decoder) readPCMSamples(br *BitReader) error {
 	for j := 0; j < 16; j++ {
 		for i := 0; i < 16; i++ {
 			v, err := br.ReadBits(8)
@@ -524,13 +549,32 @@ func (d *Decoder) decodeMBPCM(br *BitReader, mbx, mby int) error {
 			d.ybr[ybrRY+j][ybrRX+i] = uint8(v)
 		}
 	}
+	return nil
+}
+
+// pcmAwareQP returns the QP to store for deblocking of the MB at idx: 0 for
+// I_PCM macroblocks (spec 8.7), else the current decoder QP.
+func (d *Decoder) pcmAwareQP(idx int) int {
+	if d.mbInfo[idx].isPCM {
+		return 0
+	}
+	return d.qp
+}
+
+// finishPCM records the per-MB side state shared by CAVLC and CABAC I_PCM:
+// every block counts as fully coded for neighbor contexts (TotalCoeff 16,
+// FFmpeg cbp_table 0x1EF), and the MB is marked so deblocking uses QP 0
+// (spec 8.7: QPY of an I_PCM macroblock is 0).
+func (d *Decoder) finishPCM(mbx, mby int) {
 	for i := range d.nzCoeffCur {
 		d.nzCoeffCur[i] = 16
 	}
+	info := &d.mbInfo[mby*d.mbw+mbx]
+	info.isPCM = true
+	info.cbpCabac = 0x1EF
 	d.storeIntraModes(mbx, mby)
 	d.storeNZCoeff(mbx, mby)
 	d.copyMBToImg(mbx, mby)
-	return nil
 }
 
 // predIntra4x4 runs Intra_4x4 prediction for the block at ybr (y, x),
@@ -654,7 +698,7 @@ func (d *Decoder) decodeMBI4x4(br *BitReader, mbx, mby int) error {
 			}
 			if nz > 0 {
 				reorderCoeffs(d.coeff[blk*16 : blk*16+16])
-				dequant4x4(d.coeff[blk*16:blk*16+16], d.qp)
+				dequant4x4(d.coeff[blk*16:blk*16+16], d.qp, d.wsLuma4(true))
 				idct4x4(d.coeff[blk*16 : blk*16+16])
 				d.addResidual4x4(y, x, d.coeff[blk*16:blk*16+16])
 			}
@@ -759,7 +803,7 @@ func (d *Decoder) decodeMBI8x8(br *BitReader, mbx, mby int) error {
 				return err
 			}
 			if nz > 0 {
-				dequant8x8(blk[:], d.qp)
+				dequant8x8(blk[:], d.qp, d.wsLuma8(true))
 				idct8x8(blk[:])
 				d.addResidual8x8(y, x, blk[:])
 			}
@@ -804,7 +848,7 @@ func (d *Decoder) decodeMBI16x16(br *BitReader, mbx, mby, mbType int) error {
 
 	reorderCoeffs(dcCoeffs) // CAVLC outputs zigzag order; Hadamard needs raster order
 	hadamard4x4(dcCoeffs)
-	dequantLumaDC(dcCoeffs, d.qp)
+	dequantLumaDC(dcCoeffs, d.qp, d.scalingWS4[0][0])
 
 	// Luma AC: for each 4x4 block in scan order, read AC residuals.
 	for blk := 0; blk < 16; blk++ {
@@ -822,7 +866,7 @@ func (d *Decoder) decodeMBI16x16(br *BitReader, mbx, mby, mbType int) error {
 		}
 
 		if d.coeff[blk*16] != 0 || d.nzCoeffCur[blk] > 0 {
-			dequant4x4(d.coeff[blk*16:blk*16+16], d.qp)
+			dequant4x4(d.coeff[blk*16:blk*16+16], d.qp, d.wsLuma4(true))
 			d.coeff[blk*16] = dcCoeffs[dcIdx] // restore already-dequanted DC
 			idct4x4(d.coeff[blk*16 : blk*16+16])
 			pos := blk4x4Pos[blk]
@@ -862,9 +906,9 @@ func (d *Decoder) decodeChroma(br *BitReader, mbx, mby, chromaPredMode, cbpChrom
 	}
 
 	hadamard2x2(cbDC)
-	dequantChromaDC(cbDC, qpC)
+	dequantChromaDC(cbDC, qpC, d.scalingWS4[1][0])
 	hadamard2x2(crDC)
-	dequantChromaDC(crDC, qpC)
+	dequantChromaDC(crDC, qpC, d.scalingWS4[2][0])
 
 	// Cb AC (4 blocks of 4x4).
 	for blk := 0; blk < 4; blk++ {
@@ -882,7 +926,7 @@ func (d *Decoder) decodeChroma(br *BitReader, mbx, mby, chromaPredMode, cbpChrom
 		}
 
 		if d.coeff[base] != 0 || d.nzCoeffCur[16+blk] > 0 {
-			dequant4x4(d.coeff[base:base+16], qpC)
+			dequant4x4(d.coeff[base:base+16], qpC, d.wsChroma4(true, false))
 			d.coeff[base] = cbDC[blk]
 			idct4x4(d.coeff[base : base+16])
 			j4 := blk / 2
@@ -907,7 +951,7 @@ func (d *Decoder) decodeChroma(br *BitReader, mbx, mby, chromaPredMode, cbpChrom
 		}
 
 		if d.coeff[base] != 0 || d.nzCoeffCur[20+blk] > 0 {
-			dequant4x4(d.coeff[base:base+16], qpC)
+			dequant4x4(d.coeff[base:base+16], qpC, d.wsChroma4(true, true))
 			d.coeff[base] = crDC[blk]
 			idct4x4(d.coeff[base : base+16])
 			j4 := blk / 2

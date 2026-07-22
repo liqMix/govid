@@ -179,7 +179,10 @@ func (d *Decoder) combineBiPred(sh *sliceHeader, x, y, w, h, ref0, ref1 int) {
 		p0 := d.getRefFrameEntry(0, ref0)
 		p1 := d.getRefFrameEntry(1, ref1)
 		if p0 != nil && p1 != nil {
-			w0 := implicitWeightL0(d.curPOC, p0.poc, p1.poc)
+			w0 := 32 // long-term references use the default half weights
+			if !p0.longTerm && !p1.longTerm {
+				w0 = implicitWeightL0(d.curPOC, p0.poc, p1.poc)
+			}
 			wt := [2]int{w0, 64 - w0}
 			combinePlane(buf0Luma(d), ybrYY+y, ybrYX+x, w, h, wt, [2]int{0, 0}, 5, true)
 			combinePlane(buf0Cb(d), ybrBY+cy, ybrBX+cx, cw, ch, wt, [2]int{0, 0}, 5, true)
@@ -259,6 +262,9 @@ func (d *Decoder) applyWeightsB(sh *sliceHeader, list, refIdx, lumaY, lumaX, lw,
 // execBPart runs motion compensation for one B partition: single-list MC with
 // optional explicit weighting, or two MC passes combined by combineBiPred.
 func (d *Decoder) execBPart(sh *sliceHeader, mbx, mby int, p *bPart) error {
+	if DebugBPartExec != nil {
+		DebugBPartExec(mbx, mby, p)
+	}
 	mcOne := func(list int) error {
 		rf := d.getRefFrameEntry(list, p.ref[list])
 		if rf == nil {
@@ -288,6 +294,36 @@ func (d *Decoder) execBPart(sh *sliceHeader, mbx, mby int, p *bPart) error {
 		return fmt.Errorf("B partition with empty prediction mask")
 	}
 	return nil
+}
+
+// DebugBPartExec, if non-nil, receives every executed B partition (geometry,
+// list mask, refs, MVs) just before motion compensation. Test-only hook.
+var DebugBPartExec func(mbx, mby int, p *bPart)
+
+// bSubDecodedMask returns the spec 6.4.8 positional availability mask in
+// effect while predicting sub-partition sp of quadrant p of a B_8x8 MB:
+// cells of quadrants before p plus earlier sub-partitions within p. Later
+// partitions must read as undecoded so the above-right neighbor falls back to
+// above-left. (prepareBMB's all-decoded mask is correct for every other B MB
+// kind: with 8x8-or-larger partitions no within-MB query ever reaches a later
+// partition, but an 8x4/4x8/4x4 second row's above-right neighbor does.)
+func bSubDecodedMask(shapes *[4]bSubShape, p, sp int) uint16 {
+	var m uint16
+	for q := 0; q < p; q++ {
+		base := (part8x8Pos[q][1]/4)*4 + part8x8Pos[q][0]/4
+		m |= 0x33 << uint(base) // the quadrant's 2x2 cells
+	}
+	s := shapes[p]
+	for k := 0; k < sp; k++ {
+		sx := part8x8Pos[p][0] + (k%(8/s.w))*s.w
+		sy := part8x8Pos[p][1] + (k/(8/s.w))*s.h
+		for by := sy / 4; by < (sy+s.h)/4; by++ {
+			for bx := sx / 4; bx < (sx+s.w)/4; bx++ {
+				m |= 1 << uint(by*4+bx)
+			}
+		}
+	}
+	return m
 }
 
 // storeBPart records a partition's motion into mbInfo (both lists).
@@ -329,10 +365,22 @@ func (d *Decoder) storeBPart(info *mbInterInfo, p *bPart) {
 // --- Spatial direct prediction (spec 8.4.1.2.2) -----------------------------
 
 // bDirectCtx caches the once-per-MB part of the spatial direct derivation.
+// temporal marks the MB as temporal direct (spec 8.4.1.2.3), where the whole
+// derivation is per-quadrant and the spatial fields are unused.
 type bDirectCtx struct {
-	ref  [2]int
-	mvp  [2][2]int16
-	mask uint8
+	ref      [2]int
+	mvp      [2][2]int16
+	mask     uint8
+	temporal bool
+}
+
+// deriveDirectMB prepares the direct-mode context for the current MB
+// according to the slice's direct_spatial_mv_pred_flag.
+func (d *Decoder) deriveDirectMB(sh *sliceHeader, mbx, mby int) bDirectCtx {
+	if sh.directSpatialMvPred {
+		return d.deriveDirectSpatialMB(mbx, mby)
+	}
+	return bDirectCtx{temporal: true}
 }
 
 func minPositive(a, b int) int {
@@ -383,12 +431,18 @@ func (d *Decoder) deriveDirectSpatialMB(mbx, mby int) bDirectCtx {
 // the co-located block in RefPicList1[0] (corner 4x4 with the
 // direct_8x8_inference rule) has refIdx 0 and a near-zero MV.
 func (d *Decoder) directColZero(mbx, mby, p int) bool {
+	corner := [4]int{0, 3, 12, 15}[p]
+	return d.directColZeroAt(mbx, mby, corner)
+}
+
+// directColZeroAt evaluates colZeroFlag for the 4x4 block at raster cell.
+func (d *Decoder) directColZeroAt(mbx, mby, cell int) bool {
 	col := d.getRefFrameEntry(1, 0)
-	if col == nil {
+	if col == nil || col.longTerm {
+		// colZeroFlag requires RefPicList1[0] to be short-term.
 		return false
 	}
-	corner := [4]int{0, 3, 12, 15}[p]
-	idx := (mby*d.mbw+mbx)*16 + corner
+	idx := (mby*d.mbw+mbx)*16 + cell
 	if col.colRef[idx] != 0 {
 		return false
 	}
@@ -396,17 +450,114 @@ func (d *Decoder) directColZero(mbx, mby, p int) bool {
 	return mv[0] >= -1 && mv[0] <= 1 && mv[1] >= -1 && mv[1] <= 1
 }
 
-// directPart builds the bPart for 8x8 quadrant p under spatial direct mode.
-func (d *Decoder) directPart(ctx *bDirectCtx, mbx, mby, p int) bPart {
+// directPartTemporalAt builds one temporal-direct bPart of the given geometry
+// from the co-located 4x4 block at raster cell cellIdx (spec 8.4.1.2.3): the
+// co-located block's motion in RefPicList1[0] is scaled by the POC distance
+// ratio tb/td; list 0 references the picture the co-located block referenced
+// (MapColToList0) and list 1 references RefPicList1[0].
+func (d *Decoder) directPartTemporalAt(col *refFrame, mbx, mby, cellIdx, x, y, w, h int) bPart {
+	part := bPart{x: x, y: y, w: w, h: h, mask: 3}
+	if col == nil {
+		return part // defensive: conforming B slices always have L1[0]
+	}
+	idx := (mby*d.mbw+mbx)*16 + cellIdx
+	mvCol := col.colMV[idx]
+	refID := col.colRefID[idx]
+	if refID < 0 {
+		// Intra co-located block: mvCol = 0, refIdxL0 = 0 (spec 8.4.1.2.2).
+		return part
+	}
+	// MapColToList0: lowest current L0 index referring to the same picture.
+	refIdxL0 := -1
+	refPOC := 0
+	refLongTerm := false
+	for i, rf := range d.curRefList[0] {
+		if rf != nil && rf.id == int(refID) {
+			refIdxL0 = i
+			refPOC = rf.poc
+			refLongTerm = rf.longTerm
+			break
+		}
+	}
+	if refIdxL0 < 0 {
+		// Referenced picture not in the current L0 (non-conforming stream);
+		// fall back to copying the co-located motion at index 0.
+		part.mv[0] = mvCol
+		return part
+	}
+	part.ref[0] = refIdxL0
+	td := clampInt(col.poc-refPOC, -128, 127)
+	if td == 0 || refLongTerm {
+		// Long-term reference or same-POC references (spec 8.4.1.2.3):
+		// mvL0 = mvCol, mvL1 = 0.
+		part.mv[0] = mvCol
+		return part
+	}
+	tb := clampInt(d.curPOC-refPOC, -128, 127)
+	absTD := td
+	if absTD < 0 {
+		absTD = -absTD
+	}
+	tx := (16384 + absTD/2) / td
+	dsf := clampInt((tb*tx+32)>>6, -1024, 1023)
+	mv0 := [2]int16{
+		int16((dsf*int(mvCol[0]) + 128) >> 8),
+		int16((dsf*int(mvCol[1]) + 128) >> 8),
+	}
+	part.mv[0] = mv0
+	part.mv[1] = [2]int16{mv0[0] - mvCol[0], mv0[1] - mvCol[1]}
+	return part
+}
+
+// directParts appends the direct-mode partitions for 8x8 quadrant p to out.
+// Spatial direct and temporal direct with direct_8x8_inference produce one
+// 8x8 part (from the quadrant's corner 4x4 for temporal); temporal direct
+// WITHOUT the inference flag derives motion independently for each of the
+// quadrant's four 4x4 blocks (spec 8.4.1.2.2).
+func (d *Decoder) directParts(ctx *bDirectCtx, mbx, mby, p int, out []bPart) []bPart {
+	if ctx.temporal {
+		col := d.getRefFrameEntry(1, 0)
+		bx, by := part8x8Pos[p][0], part8x8Pos[p][1]
+		if d.activeSPS == nil || d.activeSPS.Direct8x8Inference {
+			corner := [4]int{0, 3, 12, 15}[p]
+			return append(out, d.directPartTemporalAt(col, mbx, mby, corner, bx, by, 8, 8))
+		}
+		base := (by/4)*4 + bx/4
+		for _, cell := range [4]int{base, base + 1, base + 4, base + 5} {
+			x := (cell % 4) * 4
+			y := (cell / 4) * 4
+			out = append(out, d.directPartTemporalAt(col, mbx, mby, cell, x, y, 4, 4))
+		}
+		return out
+	}
+	if d.activeSPS == nil || d.activeSPS.Direct8x8Inference {
+		return append(out, d.directPartSpatial(ctx, part8x8Pos[p][0], part8x8Pos[p][1], 8, 8, d.directColZero(mbx, mby, p)))
+	}
+	// Spatial direct without the inference flag: the MB-level MV applies, but
+	// colZeroFlag is evaluated per 4x4 (spec 8.4.1.2.2). Untested by our
+	// fixtures — x264 and the conformance streams here always pair spatial
+	// direct with direct_8x8_inference — but mirrors the verified temporal
+	// per-4x4 structure.
+	bx, by := part8x8Pos[p][0], part8x8Pos[p][1]
+	base := (by/4)*4 + bx/4
+	for _, cell := range [4]int{base, base + 1, base + 4, base + 5} {
+		x := (cell % 4) * 4
+		y := (cell / 4) * 4
+		out = append(out, d.directPartSpatial(ctx, x, y, 4, 4, d.directColZeroAt(mbx, mby, cell)))
+	}
+	return out
+}
+
+// directPartSpatial builds one spatial-direct bPart of the given geometry.
+func (d *Decoder) directPartSpatial(ctx *bDirectCtx, x, y, w, h int, colZero bool) bPart {
 	part := bPart{
-		x:    part8x8Pos[p][0],
-		y:    part8x8Pos[p][1],
-		w:    8,
-		h:    8,
+		x:    x,
+		y:    y,
+		w:    w,
+		h:    h,
 		mask: ctx.mask,
 		ref:  ctx.ref,
 	}
-	colZero := d.directColZero(mbx, mby, p)
 	if ctx.mask&1 != 0 {
 		part.mv[0] = ctx.mvp[0]
 		if ctx.ref[0] == 0 && colZero {
@@ -438,6 +589,7 @@ func (d *Decoder) prepareBMB(mbx, mby int, mbType int) *mbInterInfo {
 	info.cbpCabac = 0
 	info.chromaPredMode = 0
 	info.i16OrPCM = false
+	info.isPCM = false
 	info.isDirectMB = false
 	info.directMask = 0
 	info.mvdAbs = [16][2]uint8{}
@@ -472,13 +624,15 @@ func (d *Decoder) decodeMBDirect(sh *sliceHeader, mbx, mby int, skip bool) error
 	info := d.prepareBMB(mbx, mby, mbType)
 	info.isDirectMB = true
 	info.directMask = 0xFFFF
-	ctx := d.deriveDirectSpatialMB(mbx, mby)
+	ctx := d.deriveDirectMB(sh, mbx, mby)
 	for p := 0; p < 4; p++ {
-		part := d.directPart(&ctx, mbx, mby, p)
-		if err := d.execBPart(sh, mbx, mby, &part); err != nil {
-			return err
+		var buf [4]bPart
+		for _, part := range d.directParts(&ctx, mbx, mby, p, buf[:0]) {
+			if err := d.execBPart(sh, mbx, mby, &part); err != nil {
+				return err
+			}
+			d.storeBPart(info, &part)
 		}
-		d.storeBPart(info, &part)
 	}
 	info.qp = d.qp
 	info.hasCoef = false
@@ -495,9 +649,6 @@ func (d *Decoder) decodeMBDirect(sh *sliceHeader, mbx, mby int, skip bool) error
 func (d *Decoder) decodeBSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
 	if len(d.refFrames) == 0 {
 		return nil, fmt.Errorf("B-slice: no reference frames available")
-	}
-	if !sh.directSpatialMvPred {
-		return nil, fmt.Errorf("temporal direct mode not supported")
 	}
 	if err := d.buildRefLists(sh); err != nil {
 		return nil, fmt.Errorf("B-slice: %w", err)
@@ -536,7 +687,7 @@ func (d *Decoder) decodeBSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 			info := &d.mbInfo[idx]
 			info.isIntra = true
 			info.mbType = -2
-			info.qp = d.qp
+			info.qp = d.pcmAwareQP(idx)
 			info.isDirectMB = false
 			info.directMask = 0
 			for k := range info.mv {
@@ -569,14 +720,16 @@ func (d *Decoder) decodeMBInterB(br *BitReader, mbx, mby int, sh *sliceHeader, m
 	if shape.direct {
 		info.isDirectMB = true
 		info.directMask = 0xFFFF
-		ctx := d.deriveDirectSpatialMB(mbx, mby)
+		ctx := d.deriveDirectMB(sh, mbx, mby)
 		for p := 0; p < 4; p++ {
-			part := d.directPart(&ctx, mbx, mby, p)
-			if err := d.execBPart(sh, mbx, mby, &part); err != nil {
-				return err
+			var buf [4]bPart
+			for _, part := range d.directParts(&ctx, mbx, mby, p, buf[:0]) {
+				if err := d.execBPart(sh, mbx, mby, &part); err != nil {
+					return err
+				}
+				d.storeBPart(info, &part)
+				parts = append(parts, part)
 			}
-			d.storeBPart(info, &part)
-			parts = append(parts, part)
 		}
 	} else if shape.parts <= 2 {
 		n := shape.parts
@@ -694,20 +847,22 @@ func (d *Decoder) decodeMBInterB(br *BitReader, mbx, mby int, sh *sliceHeader, m
 				continue
 			}
 			if !haveDirectCtx {
-				dctx = d.deriveDirectSpatialMB(mbx, mby)
+				dctx = d.deriveDirectMB(sh, mbx, mby)
 				haveDirectCtx = true
 			}
-			part := d.directPart(&dctx, mbx, mby, p)
-			d.storeBPart(info, &part)
-			for by := part.y / 4; by < (part.y+8)/4; by++ {
-				for bx := part.x / 4; bx < (part.x+8)/4; bx++ {
-					info.directMask |= uint16(1) << uint(by*4+bx)
+			var buf [4]bPart
+			for _, part := range d.directParts(&dctx, mbx, mby, p, buf[:0]) {
+				d.storeBPart(info, &part)
+				for by := part.y / 4; by < (part.y+part.h)/4; by++ {
+					for bx := part.x / 4; bx < (part.x+part.w)/4; bx++ {
+						info.directMask |= uint16(1) << uint(by*4+bx)
+					}
 				}
+				if err := d.execBPart(sh, mbx, mby, &part); err != nil {
+					return err
+				}
+				parts = append(parts, part)
 			}
-			if err := d.execBPart(sh, mbx, mby, &part); err != nil {
-				return err
-			}
-			parts = append(parts, part)
 		}
 		for list := 0; list < 2; list++ {
 			for p := 0; p < 4; p++ {
@@ -726,7 +881,9 @@ func (d *Decoder) decodeMBInterB(br *BitReader, mbx, mby int, sh *sliceHeader, m
 					if err != nil {
 						return err
 					}
+					info.decodedMask = bSubDecodedMask(&subShapes, p, sp)
 					mvp := d.predictMVList(list, mbx, mby, sx, sy, s.w, s.h, refs[p][list])
+					info.decodedMask = 0xFFFF
 					mv := [2]int16{mvp[0] + int16(mvdX), mvp[1] + int16(mvdY)}
 					for by := sy / 4; by < (sy+s.h)/4; by++ {
 						for bx := sx / 4; bx < (sx+s.w)/4; bx++ {

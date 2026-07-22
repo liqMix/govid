@@ -6,9 +6,9 @@ import (
 	"sort"
 )
 
-// Decoded Picture Buffer (DPB) management for reference frames.
-// Short-term references with sliding window eviction only (no MMCO, no
-// long-term references).
+// Decoded Picture Buffer (DPB) management for reference frames: short-term
+// references with sliding-window eviction, plus adaptive marking (MMCO ops
+// 1-6, spec 8.2.5.4) and long-term references.
 
 // refFrame is one stored short-term reference picture together with the
 // side data needed for reference list construction (frameNum, poc), deblock
@@ -18,12 +18,20 @@ type refFrame struct {
 	frameNum uint32
 	poc      int
 	id       int
-	// colMV / colRef hold, per 4x4 block of the whole frame, the stored
-	// motion used by B direct modes (spec 8.4.1.2.2): the block's L0 motion
-	// when present, else its L1 motion; ref is the index within the stored
-	// frame's own list, -1 for intra blocks.
-	colMV  [][2]int16
-	colRef []int8
+	// colMV / colRef / colRefID hold, per 4x4 block of the whole frame, the
+	// stored motion used by B direct modes (spec 8.4.1.2.2): the block's L0
+	// motion when present, else its L1 motion. colRef is the index within
+	// the stored frame's own list (what spatial direct's colZeroFlag tests);
+	// colRefID is the referenced picture's global identity (what temporal
+	// direct's MapColToList0 needs). Both are -1 for intra blocks.
+	colMV    [][2]int16
+	colRef   []int8
+	colRefID []int32
+
+	// Long-term marking (spec 8.2.5): a long-term reference is exempt from
+	// sliding-window eviction and is addressed by LongTermFrameIdx.
+	longTerm bool
+	ltIdx    int
 }
 
 func (d *Decoder) initDPB() {
@@ -36,37 +44,106 @@ func (d *Decoder) initDPB() {
 	}
 }
 
-func (d *Decoder) storeRefFrame(frameNum uint32, mmco []mmcoOp) error {
+func (d *Decoder) storeRefFrame(sh *sliceHeader) error {
 	maxRef := 1
 	if d.activeSPS != nil && d.activeSPS.MaxNumRefFrames > 0 {
 		maxRef = int(d.activeSPS.MaxNumRefFrames)
 	}
-	if len(mmco) > 0 {
-		// Adaptive marking (spec 8.2.5.4): the listed short-term pictures are
-		// removed instead of sliding-window eviction.
-		maxFrameNum := 1 << uint(d.activeSPS.Log2MaxFrameNum)
-		curr := int(frameNum)
-		for _, m := range mmco {
-			if m.op != 1 {
-				return fmt.Errorf("MMCO operation %d not supported", m.op)
-			}
-			picNumX := curr - int(m.arg1) - 1
-			for i, rf := range d.refFrames {
-				fn := int(rf.frameNum)
-				if fn > curr {
-					fn -= maxFrameNum
-				}
-				if fn == picNumX {
-					d.refFrames = append(d.refFrames[:i], d.refFrames[i+1:]...)
-					break
-				}
+	maxFrameNum := 1 << uint(d.activeSPS.Log2MaxFrameNum)
+	curr := int(sh.frameNum)
+	frameNum := sh.frameNum
+
+	// FrameNumWrap of a stored short-term picture (spec 8.2.4.1).
+	wrap := func(rf *refFrame) int {
+		fn := int(rf.frameNum)
+		if fn > curr {
+			fn -= maxFrameNum
+		}
+		return fn
+	}
+	remove := func(i int) {
+		d.refFrames = append(d.refFrames[:i], d.refFrames[i+1:]...)
+	}
+	removeShortTerm := func(picNumX int) {
+		for i, rf := range d.refFrames {
+			if !rf.longTerm && wrap(rf) == picNumX {
+				remove(i)
+				return
 			}
 		}
 	}
-	// Sliding window: evict oldest (smallest FrameNumWrap ~ oldest stored)
-	// if at capacity.
+	removeLongTerm := func(ltIdx int) {
+		for i, rf := range d.refFrames {
+			if rf.longTerm && rf.ltIdx == ltIdx {
+				remove(i)
+				return
+			}
+		}
+	}
+
+	curLongTerm := false
+	curLTIdx := 0
+	switch {
+	case d.curIsIDR:
+		// resetDPB already emptied the buffer; long_term_reference_flag
+		// marks the IDR picture itself as long-term with index 0.
+		curLongTerm = sh.idrLongTerm
+	case len(sh.mmco) > 0:
+		// Adaptive marking (spec 8.2.5.4) replaces sliding-window eviction.
+		for _, m := range sh.mmco {
+			switch m.op {
+			case 1: // mark short-term unused
+				removeShortTerm(curr - int(m.arg1) - 1)
+			case 2: // mark long-term unused
+				removeLongTerm(int(m.arg1))
+			case 3: // move a short-term picture to long-term
+				removeLongTerm(int(m.arg2))
+				picNumX := curr - int(m.arg1) - 1
+				for _, rf := range d.refFrames {
+					if !rf.longTerm && wrap(rf) == picNumX {
+						rf.longTerm = true
+						rf.ltIdx = int(m.arg2)
+						break
+					}
+				}
+			case 4: // set MaxLongTermFrameIdx; drop long-terms above it
+				maxIdx := int(m.arg1) - 1
+				for i := len(d.refFrames) - 1; i >= 0; i-- {
+					if d.refFrames[i].longTerm && d.refFrames[i].ltIdx > maxIdx {
+						remove(i)
+					}
+				}
+			case 5: // reset: drop everything, current picture renumbers to 0
+				d.refFrames = d.refFrames[:0]
+				curr = 0
+				frameNum = 0
+				d.curPOC = 0
+				d.prevPOCMsb, d.prevPOCLsb = 0, 0
+				d.prevFrameNumOffset, d.prevFrameNum = 0, 0
+				d.sawMMCO5 = true
+			case 6: // mark the current picture long-term
+				removeLongTerm(int(m.arg1))
+				curLongTerm = true
+				curLTIdx = int(m.arg1)
+			}
+		}
+	}
+	// Sliding window (spec 8.2.5.3): evict the short-term picture with the
+	// smallest FrameNumWrap; long-term pictures are exempt.
 	for len(d.refFrames) >= maxRef {
-		d.refFrames = d.refFrames[1:]
+		oldest := -1
+		for i, rf := range d.refFrames {
+			if rf.longTerm {
+				continue
+			}
+			if oldest < 0 || wrap(rf) < wrap(d.refFrames[oldest]) {
+				oldest = i
+			}
+		}
+		if oldest < 0 {
+			break // all long-term; nothing evictable
+		}
+		remove(oldest)
 	}
 
 	// Capture per-4x4 motion for later B direct modes.
@@ -78,6 +155,9 @@ func (d *Decoder) storeRefFrame(frameNum uint32, mmco []mmcoOp) error {
 		id:       d.nextRefID,
 		colMV:    make([][2]int16, n),
 		colRef:   make([]int8, n),
+		colRefID: make([]int32, n),
+		longTerm: curLongTerm,
+		ltIdx:    curLTIdx,
 	}
 	d.nextRefID++
 	for mbIdx := range d.mbInfo {
@@ -88,12 +168,15 @@ func (d *Decoder) storeRefFrame(frameNum uint32, mmco []mmcoOp) error {
 			switch {
 			case info.isIntra:
 				rf.colRef[base+k] = -1
+				rf.colRefID[base+k] = -1
 			case info.predMask[part]&1 != 0:
 				rf.colMV[base+k] = info.mv[k]
 				rf.colRef[base+k] = int8(info.refIdx[part])
+				rf.colRefID[base+k] = int32(info.refPicID[part])
 			default:
 				rf.colMV[base+k] = info.mvL1[k]
 				rf.colRef[base+k] = int8(info.refIdxL1[part])
+				rf.colRefID[base+k] = int32(info.refPicIDL1[part])
 			}
 		}
 	}
@@ -105,10 +188,13 @@ func (d *Decoder) resetDPB() {
 	d.refFrames = d.refFrames[:0]
 }
 
-// sliceRefPic is a working entry during reference list construction.
+// sliceRefPic is a working entry during reference list construction. For
+// short-term pictures picNum is PicNum (FrameNumWrap for frame coding); for
+// long-term pictures it is LongTermPicNum (= LongTermFrameIdx).
 type sliceRefPic struct {
 	rf     *refFrame
 	picNum int
+	lt     bool
 }
 
 // buildRefLists constructs the L0 (and for B slices L1) reference picture
@@ -121,6 +207,10 @@ func (d *Decoder) buildRefLists(sh *sliceHeader) error {
 
 	pics := make([]sliceRefPic, 0, len(d.refFrames))
 	for _, rf := range d.refFrames {
+		if rf.longTerm {
+			pics = append(pics, sliceRefPic{rf: rf, picNum: rf.ltIdx, lt: true})
+			continue
+		}
 		fn := int(rf.frameNum)
 		// FrameNumWrap (spec 8.2.4.1): stored frame_num values above the
 		// current one are from before a frame_num wraparound.
@@ -131,11 +221,19 @@ func (d *Decoder) buildRefLists(sh *sliceHeader) error {
 	}
 
 	if sh.sliceType == sliceTypeB {
-		// Initial L0: POC < curr descending, then POC > curr ascending.
+		// Initial L0: short-term POC < curr descending, then POC > curr
+		// ascending; long-term pictures follow, ascending LongTermFrameIdx.
 		l0 := make([]sliceRefPic, len(pics))
 		copy(l0, pics)
 		sort.SliceStable(l0, func(a, b int) bool {
-			pa, pb := l0[a].rf.poc, l0[b].rf.poc
+			ea, eb := l0[a], l0[b]
+			if ea.lt != eb.lt {
+				return !ea.lt
+			}
+			if ea.lt {
+				return ea.picNum < eb.picNum
+			}
+			pa, pb := ea.rf.poc, eb.rf.poc
 			ba, bb := pa < d.curPOC, pb < d.curPOC
 			if ba != bb {
 				return ba
@@ -145,11 +243,19 @@ func (d *Decoder) buildRefLists(sh *sliceHeader) error {
 			}
 			return pa < pb
 		})
-		// Initial L1: POC > curr ascending, then POC < curr descending.
+		// Initial L1: short-term POC > curr ascending, then POC < curr
+		// descending; long-term pictures follow, ascending LongTermFrameIdx.
 		l1 := make([]sliceRefPic, len(pics))
 		copy(l1, pics)
 		sort.SliceStable(l1, func(a, b int) bool {
-			pa, pb := l1[a].rf.poc, l1[b].rf.poc
+			ea, eb := l1[a], l1[b]
+			if ea.lt != eb.lt {
+				return !ea.lt
+			}
+			if ea.lt {
+				return ea.picNum < eb.picNum
+			}
+			pa, pb := ea.rf.poc, eb.rf.poc
 			ba, bb := pa > d.curPOC, pb > d.curPOC
 			if ba != bb {
 				return ba
@@ -182,10 +288,20 @@ func (d *Decoder) buildRefLists(sh *sliceHeader) error {
 		return err
 	}
 
-	// P slices: initial list is descending PicNum (most recent first).
+	// P slices: short-term pictures by descending PicNum (most recent
+	// first), then long-term pictures by ascending LongTermPicNum.
 	l0 := make([]sliceRefPic, len(pics))
 	copy(l0, pics)
-	sort.SliceStable(l0, func(a, b int) bool { return l0[a].picNum > l0[b].picNum })
+	sort.SliceStable(l0, func(a, b int) bool {
+		ea, eb := l0[a], l0[b]
+		if ea.lt != eb.lt {
+			return !ea.lt
+		}
+		if ea.lt {
+			return ea.picNum < eb.picNum
+		}
+		return ea.picNum > eb.picNum
+	})
 	var err error
 	d.curRefList[0], err = d.applyRefListMods(l0, pics, sh.refPicListModL0, int(sh.numRefIdxL0Active), curr, maxFrameNum)
 	d.curRefList[1] = d.curRefList[1][:0]
@@ -205,39 +321,50 @@ func (d *Decoder) applyRefListMods(initial, pics []sliceRefPic, ops []refListMod
 		refIdx := 0
 		pred := curr
 		for _, op := range ops {
-			if op.idc > 1 {
-				return nil, fmt.Errorf("long-term ref_pic_list_modification not supported")
-			}
-			diff := int(op.val) + 1
-			var noWrap int
-			if op.idc == 0 {
-				noWrap = pred - diff
-				if noWrap < 0 {
-					noWrap += maxFrameNum
-				}
-			} else {
-				noWrap = pred + diff
-				if noWrap >= maxFrameNum {
-					noWrap -= maxFrameNum
-				}
-			}
-			pred = noWrap
-			picNum := noWrap
-			if picNum > curr {
-				picNum -= maxFrameNum
-			}
-
 			var pic sliceRefPic
 			found := false
-			for _, p := range pics {
-				if p.rf != nil && p.picNum == picNum {
-					pic = p
-					found = true
-					break
+			if op.idc == 2 {
+				// Long-term picture selected by long_term_pic_num.
+				for _, p := range pics {
+					if p.rf != nil && p.lt && p.picNum == int(op.val) {
+						pic = p
+						found = true
+						break
+					}
 				}
-			}
-			if !found {
-				return nil, fmt.Errorf("no short-term reference with PicNum %d", picNum)
+				if !found {
+					return nil, fmt.Errorf("no long-term reference with LongTermPicNum %d", op.val)
+				}
+			} else {
+				diff := int(op.val) + 1
+				var noWrap int
+				if op.idc == 0 {
+					noWrap = pred - diff
+					if noWrap < 0 {
+						noWrap += maxFrameNum
+					}
+				} else {
+					noWrap = pred + diff
+					if noWrap >= maxFrameNum {
+						noWrap -= maxFrameNum
+					}
+				}
+				pred = noWrap
+				picNum := noWrap
+				if picNum > curr {
+					picNum -= maxFrameNum
+				}
+
+				for _, p := range pics {
+					if p.rf != nil && !p.lt && p.picNum == picNum {
+						pic = p
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("no short-term reference with PicNum %d", picNum)
+				}
 			}
 
 			for c := numActive; c > refIdx; c-- {
@@ -248,7 +375,7 @@ func (d *Decoder) applyRefListMods(initial, pics []sliceRefPic, ops []refListMod
 			nIdx := refIdx
 			for c := refIdx; c <= numActive; c++ {
 				p := list[c]
-				if p.rf != nil && p.picNum == picNum {
+				if p.rf != nil && p.lt == pic.lt && p.picNum == pic.picNum {
 					continue
 				}
 				list[nIdx] = p

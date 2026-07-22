@@ -30,6 +30,7 @@ type mbInterInfo struct {
 	chromaPredMode uint8
 	iNxN           bool
 	i16OrPCM       bool
+	isPCM          bool
 	mvdAbs         [16][2]uint8
 
 	// List-1 state for B slices, parallel to mv / refIdx / refPicID /

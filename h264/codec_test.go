@@ -5,6 +5,7 @@ import (
 	"image"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -2636,4 +2637,259 @@ func TestPlayerBStreamDeliversAllFrames(t *testing.T) {
 	if len(seen) != 30 {
 		t.Fatalf("player delivered %d distinct frames, want 30", len(seen))
 	}
+}
+
+// TestDecodeCQMDefault covers scaling matrices signaled as "use defaults":
+// x264 cqm=jvt writes a PPS with pic_scaling_matrix_present=1 and every
+// pic_scaling_list_present_flag=0, so all eight lists resolve through
+// fall-back rule B to the spec Table 7-3/7-4 default matrices. High profile
+// CAVLC, 8x8 transform, 2 B-frames. Regenerate from h264/testdata:
+//
+//	ffmpeg -i test.mp4 -f rawvideo src160.yuv
+//	ffmpeg -f rawvideo -pix_fmt yuv420p -s 160x120 -r 30 -i src160.yuv \
+//	  -c:v libx264 -profile:v high -x264-params "cqm=jvt:8x8dct=1:bframes=2:cabac=0" \
+//	  -frames:v 20 -pix_fmt yuv420p test_cqm.mp4
+//	ffmpeg -i test_cqm.mp4 -f rawvideo test_cqm.yuv
+func TestDecodeCQMDefault(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cqm.mp4", "testdata/test_cqm.yuv", 20, false)
+}
+
+// TestDecodeCQMCustomCABAC covers explicit (non-default) scaling lists:
+// transpose-asymmetric custom 4x4 matrices for all six list classes, coded as
+// explicit delta_scale runs in the PPS; the 8x8 lists are x264's flat lists.
+// High profile CABAC, 8x8 transform, 2 B-frames. Regenerate from h264/testdata
+// (cqm4iy/cqm4py/cqm4ic/cqm4pc values in git history or this encode line):
+//
+//	ffmpeg -f rawvideo -pix_fmt yuv420p -s 160x120 -r 30 -i src160.yuv \
+//	  -c:v libx264 -profile:v high -x264-params "cabac=1:8x8dct=1:bframes=2:\
+//	  cqm4iy=12,20,28,36,13,21,29,37,14,22,30,38,15,23,31,39:\
+//	  cqm4py=10,17,24,31,11,18,25,32,12,19,26,33,13,20,27,34:\
+//	  cqm4ic=14,19,24,29,15,20,25,30,16,21,26,31,17,22,27,32:\
+//	  cqm4pc=11,15,19,23,12,16,20,24,13,17,21,25,14,18,22,26" \
+//	  -frames:v 20 -pix_fmt yuv420p test_cqm_cabac.mp4
+//	ffmpeg -i test_cqm_cabac.mp4 -f rawvideo test_cqm_cabac.yuv
+func TestDecodeCQMCustomCABAC(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_cqm_cabac.mp4", "testdata/test_cqm_cabac.yuv", 20, false)
+}
+
+// conformanceAnnexBTest runs a gated bit-exactness test over a JVT
+// conformance stream stored as a raw Annex B elementary stream. The fixtures
+// are local-only (testdata/_* is gitignored); regenerate by downloading
+// https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/<name>.zip
+// and copying the .264/.jsv as testdata/_<base>.264 and the package's decoded
+// reconstruction (*_rec.yuv / *.yuv) as testdata/_<base>.yuv. (ffmpeg's decode
+// of all three streams used here was verified byte-identical to those
+// conformance reconstructions.)
+func conformanceAnnexBTest(t *testing.T, base string, w, h, numFrames int) {
+	conformanceAnnexBTestRef(t, base, "testdata/_"+base+".yuv", w, h, numFrames, false)
+}
+
+func conformanceAnnexBTestRef(t *testing.T, base, yuvPath string, w, h, numFrames int, disableDeblock bool) {
+	t.Helper()
+	es, err := os.ReadFile("testdata/_" + base + ".264")
+	if err != nil {
+		t.Skipf("testdata/_%s.264 not found (local-only conformance fixture)", base)
+	}
+	ref, err := os.ReadFile(yuvPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	codec := NewCodec()
+	codec.dec.disableDeblock = disableDeblock
+	var frames []*govid.Frame
+	for i, pkt := range splitAnnexBAUs(t, es) {
+		frame, err := codec.Decode(govid.Packet{Data: pkt, Timestamp: time.Duration(i)})
+		if err != nil {
+			t.Fatalf("AU %d: %v", i, err)
+		}
+		if frame != nil {
+			frames = append(frames, frame)
+		}
+	}
+	for {
+		frame := codec.Drain()
+		if frame == nil {
+			break
+		}
+		frames = append(frames, frame)
+	}
+	if len(frames) != numFrames {
+		t.Fatalf("got %d frames, want %d", len(frames), numFrames)
+	}
+
+	cw, ch := w/2, h/2
+	frameSize := w*h + 2*cw*ch
+	for i, frame := range frames {
+		refOff := i * frameSize
+		img := frame.YCbCr
+		checkPlane := func(plane string, dec []byte, stride int, rp []byte, pw, ph int) {
+			wrong := 0
+			for j := 0; j < ph; j++ {
+				for x := 0; x < pw; x++ {
+					if dec[j*stride+x] != rp[j*pw+x] {
+						wrong++
+					}
+				}
+			}
+			if wrong > 0 {
+				if plane == "Y" && !t.Failed() {
+					// Per-MB max error grid to localize the failure.
+					for mby := 0; mby*16 < ph; mby++ {
+						line := fmt.Sprintf("  MB row %2d:", mby)
+						for mbx := 0; mbx*16 < pw; mbx++ {
+							mbMax := 0
+							for j := mby * 16; j < mby*16+16 && j < ph; j++ {
+								for x := mbx * 16; x < mbx*16+16 && x < pw; x++ {
+									d := int(dec[j*stride+x]) - int(rp[j*pw+x])
+									if d < 0 {
+										d = -d
+									}
+									if d > mbMax {
+										mbMax = d
+									}
+								}
+							}
+							line += fmt.Sprintf(" %3d", mbMax)
+						}
+						t.Log(line)
+					}
+				}
+				t.Errorf("frame %d %s: %d/%d wrong pixels", i, plane, wrong, pw*ph)
+			}
+		}
+		checkPlane("Y", img.Y, img.YStride, ref[refOff:refOff+w*h], w, h)
+		checkPlane("Cb", img.Cb, img.CStride, ref[refOff+w*h:refOff+w*h+cw*ch], cw, ch)
+		checkPlane("Cr", img.Cr, img.CStride, ref[refOff+w*h+cw*ch:refOff+frameSize], cw, ch)
+	}
+}
+
+// splitAnnexBAUs splits an Annex B elementary stream into AVCC (4-byte NAL
+// length) access-unit packets. Non-VCL NAL units are carried in the packet of
+// the following VCL NAL; the conformance streams used here code one slice per
+// picture, so every VCL NAL ends an access unit.
+func splitAnnexBAUs(t *testing.T, data []byte) [][]byte {
+	t.Helper()
+	var nals [][]byte
+	pos := -1
+	for i := 0; i+2 < len(data); i++ {
+		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+			if pos >= 0 {
+				end := i
+				if end > pos && data[end-1] == 0 { // 4-byte start code
+					end--
+				}
+				for end > pos && data[end-1] == 0 { // trailing_zero_8bits
+					end--
+				}
+				nals = append(nals, data[pos:end])
+			}
+			pos = i + 3
+			i += 2
+		}
+	}
+	if pos >= 0 && pos < len(data) {
+		nals = append(nals, data[pos:])
+	}
+
+	var packets [][]byte
+	var pending []byte
+	appendAVCC := func(dst, nal []byte) []byte {
+		dst = append(dst, byte(len(nal)>>24), byte(len(nal)>>16), byte(len(nal)>>8), byte(len(nal)))
+		return append(dst, nal...)
+	}
+	for _, nal := range nals {
+		if len(nal) == 0 {
+			continue
+		}
+		nalType := nal[0] & 0x1F
+		if nalType == 1 || nalType == 5 {
+			pkt := appendAVCC(pending, nal)
+			packets = append(packets, pkt)
+			pending = nil
+		} else {
+			pending = appendAVCC(pending, nal)
+		}
+	}
+	return packets
+}
+
+// TestDecodeConformancePCMCAVLC: CVPCMNL1_SVA_C — CIF, 30 all-I CAVLC frames
+// with I_PCM macroblocks, non-zero mb_qp_delta (QP tracking across PCM MBs),
+// loop filter off.
+func TestDecodeConformancePCMCAVLC(t *testing.T) {
+	conformanceAnnexBTest(t, "cvpcmnl1", 352, 288, 30)
+}
+
+// TestDecodeConformancePCMCAVLC720p: CVPCMNL2_SVA_C — 1280x720, 2 all-I
+// CAVLC frames with I_PCM, loop filter off.
+func TestDecodeConformancePCMCAVLC720p(t *testing.T) {
+	conformanceAnnexBTest(t, "cvpcmnl2", 1280, 720, 2)
+}
+
+// TestDecodeConformanceCAPM3: CAPM3_Sony_D — QCIF Foreman, 300 frames, CABAC
+// IPB with I_PCM macroblocks, TEMPORAL direct mode, POC type 0, 5 reference
+// frames, loop filter on. Covers CABAC I_PCM (engine re-initialization,
+// neighbor contexts, QP-0 deblocking) and temporal direct MV scaling.
+func TestDecodeConformanceCAPM3(t *testing.T) {
+	conformanceAnnexBTest(t, "capm3", 176, 144, 300)
+}
+
+// TestDecodeConformanceCAPM3NoDeblock is the staged variant: reconstruction
+// only, against an ffmpeg -skip_loop_filter all reference (regenerate with
+// that flag added to the .yuv command above, output _capm3_nodb.yuv).
+func TestDecodeConformanceCAPM3NoDeblock(t *testing.T) {
+	conformanceAnnexBTestRef(t, "capm3", "testdata/_capm3_nodb.yuv", 176, 144, 300, true)
+}
+
+// TestConformanceCAPM3DumpBParts is a gated diagnostic: dumps the executed B
+// partitions (geometry, lists, refs, MVs) of one decode-order picture of the
+// CAPM3 conformance stream, for comparison against ffprobe/JM traces when
+// chasing a B-slice divergence. Select the picture with CAPM3_DUMP=<index>.
+func TestConformanceCAPM3DumpBParts(t *testing.T) {
+	env := os.Getenv("CAPM3_DUMP")
+	if env == "" {
+		t.Skip("set CAPM3_DUMP=<decode-order index> to dump B partitions")
+	}
+	want, err := strconv.Atoi(env)
+	if err != nil {
+		t.Fatalf("CAPM3_DUMP: %v", err)
+	}
+	es, err := os.ReadFile("testdata/_capm3.264")
+	if err != nil {
+		t.Skip("fixture not found")
+	}
+	codec := NewCodec()
+	decodeIdx := 0
+	DebugBPartExec = func(mbx, mby int, p *bPart) {
+		if decodeIdx == want {
+			t.Logf("MB(%2d,%2d) part x%d y%d %dx%d mask%d ref[%d %d] mvL0(%d,%d) mvL1(%d,%d)",
+				mbx, mby, p.x, p.y, p.w, p.h, p.mask, p.ref[0], p.ref[1],
+				p.mv[0][0], p.mv[0][1], p.mv[1][0], p.mv[1][1])
+		}
+	}
+	defer func() { DebugBPartExec = nil }()
+	for i, pkt := range splitAnnexBAUs(t, es) {
+		if i > want {
+			break
+		}
+		decodeIdx = i
+		if _, err := codec.Decode(govid.Packet{Data: pkt, Timestamp: time.Duration(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestDecodeConformanceMR2MW: MR2_MW_A — QCIF Baseline CAVLC, 300 frames,
+// MMCO adaptive marking with LONG-TERM references (ops 2/3/6), POC type 0,
+// 3 reference frames, loop filter on.
+func TestDecodeConformanceMR2MW(t *testing.T) {
+	conformanceAnnexBTest(t, "mr2mw", 176, 144, 300)
+}
+
+// TestDecodeConformanceMR2Tandberg: MR2_TANDBERG_E — QCIF CAVLC IPPP, 300
+// frames, 15 reference frames, ref_pic_list_modification (incl. long-term
+// idc 2), MMCO with long-term references.
+func TestDecodeConformanceMR2Tandberg(t *testing.T) {
+	conformanceAnnexBTest(t, "mr2tandberg", 176, 144, 300)
 }

@@ -35,15 +35,15 @@ func (c *Codec) reorderDepth() int {
 	if sps != nil && sps.MaxNumReorderFrames >= 0 {
 		return sps.MaxNumReorderFrames
 	}
-	if c.dec.sawB {
-		// Stream has B-frames but no VUI restriction: buffer up to the
-		// reference capacity, which bounds any conforming reorder distance.
-		if sps != nil && sps.MaxNumRefFrames > 0 {
-			return int(sps.MaxNumRefFrames)
-		}
-		return 2
+	// No VUI restriction (the spec default is MaxDpbFrames): buffer up to
+	// the reference capacity, which bounds any conforming reorder distance.
+	// Waiting for the first B slice instead would be wrong: the reference
+	// frame ahead of it has already been emitted by then. A stream with no
+	// reference frames has no inter pictures at all, so no reordering.
+	if sps != nil {
+		return int(sps.MaxNumRefFrames)
 	}
-	return 0
+	return 2
 }
 
 // Decode decodes an H.264 packet and returns the next frame in display
@@ -58,8 +58,10 @@ func (c *Codec) Decode(pkt govid.Packet) (*govid.Frame, error) {
 		return nil, nil
 	}
 
-	if c.dec.curIsIDR {
+	if c.dec.curIsIDR || c.dec.sawMMCO5 {
+		// An MMCO 5 reset renumbers POC from 0 like an IDR does.
 		c.epoch++
+		c.dec.sawMMCO5 = false
 	}
 	frame := &govid.Frame{
 		YCbCr:     deepCopyYCbCr(img),

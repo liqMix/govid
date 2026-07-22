@@ -53,8 +53,8 @@ Gated local-fixture tests additionally verify the full 71-frame clip and two 120
 
 H.264 decoder coverage:
 
-- **Supported:** CAVLC and CABAC entropy coding; I/SI, P, and B slices (spatial direct mode, bi-prediction with implicit and explicit weighting, B-pyramid); intra 4x4 / 8x8 / 16x16 / chroma prediction; the 8x8 transform (High profile); quarter-pel luma and bilinear chroma motion compensation; multi-reference MV prediction; reference picture list modification; MMCO short-term marking; explicit weighted prediction; picture-order display reordering; the deblocking filter (including 8x8-transform and B-slice bS rules). Everything x264 emits by default — `ffmpeg -c:v libx264` with no flags — decodes bit-exact, verified against ffmpeg on 120-frame 720p real content (`TestDecodeBGDefaultMP4VsReference`) plus the committed staged fixtures.
-- **Not supported (returns an error):** temporal direct mode (x264 `direct=temporal`/`auto`; the default `spatial` works), multiple slice groups, long-term references / MMCO ops 2-6, I_PCM inside CABAC slices, interlaced (field/MBAFF) coding. Custom (non-flat) scaling matrices are parsed but not applied — x264's default flat CQM decodes correctly.
+- **Supported:** CAVLC and CABAC entropy coding; I/SI, P, and B slices (spatial and temporal direct modes, bi-prediction with implicit and explicit weighting, B-pyramid, sub-8x8 B partitions); intra 4x4 / 8x8 / 16x16 / chroma prediction; I_PCM macroblocks (both entropy coders); the 8x8 transform (High profile); custom scaling matrices (default and explicit lists, SPS and PPS level); quarter-pel luma and bilinear chroma motion compensation; multi-reference MV prediction; reference picture list modification (short- and long-term); full MMCO adaptive marking (ops 1-6) with long-term references; explicit weighted prediction; picture-order display reordering; the deblocking filter (including 8x8-transform, B-slice, and I_PCM bS/QP rules). Everything x264 emits by default decodes bit-exact, verified against ffmpeg on 120-frame 720p real content (`TestDecodeBGDefaultMP4VsReference`) plus the committed staged fixtures; the harder-to-generate features (CABAC I_PCM, temporal direct, MMCO/long-term) are verified bit-exact against JVT conformance streams (CAPM3_Sony_D, CVPCMNL1/2_SVA_C, MR2_MW_A, MR2_TANDBERG_E — local-only fixtures, download commands in the test docs).
+- **Not supported (returns an error):** multiple slice groups (FMO), interlaced (field/MBAFF) coding, POC type 1, 4:2:2/4:4:4 chroma, and lossless transform bypass (`qpprime_y_zero_transform_bypass`).
 - **B-frame note:** with B-frames the decoder emits frames in display order with a small delay (from the stream's VUI `max_num_reorder_frames`). `Player`/`AsyncPlayer` handle this transparently, including draining the buffered tail frames at end of stream (`govid.FrameDrainer`).
 
 AV1 decoder coverage: intra frames only — there is no inter prediction, no film grain, no loop restoration.
@@ -303,7 +303,7 @@ Test fixtures under each package's `testdata/` (short clips plus ffmpeg-generate
 ## Roadmap
 
 - Get AV1 intra reconstruction correct before adding inter prediction
-- H.264 leftovers if ever needed: temporal direct mode, long-term references, interlaced coding
+- H.264 leftovers if ever needed: interlaced (field/MBAFF) coding, FMO, POC type 1
 
 ## License
 

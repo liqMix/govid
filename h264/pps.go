@@ -21,6 +21,7 @@ type PPS struct {
 	RedundantPicCntPresent         bool
 	Transform8x8Mode               bool
 	PicScalingMatrixPresent        bool
+	ScalingLists                   [12]scalingListEntry
 	SecondChromaQPIndexOffset      int32
 }
 
@@ -123,9 +124,11 @@ func ParsePPS(rbsp []byte) (*PPS, error) {
 			return nil, err
 		}
 		if p.PicScalingMatrixPresent {
+			// 6 + 2*transform_8x8_mode_flag lists for 4:2:0/4:2:2 (the PPS
+			// cannot see the SPS chroma_format_idc here; 4:4:4 is unsupported).
 			nScalingList := 6
 			if p.Transform8x8Mode {
-				nScalingList = 10
+				nScalingList = 8
 			}
 			for i := 0; i < nScalingList; i++ {
 				present, err := br.ReadBool()
@@ -137,7 +140,7 @@ func ParsePPS(rbsp []byte) (*PPS, error) {
 					if i >= 6 {
 						size = 64
 					}
-					if err := skipScalingList(br, size); err != nil {
+					if err := parseScalingList(br, &p.ScalingLists[i], size); err != nil {
 						return nil, err
 					}
 				}

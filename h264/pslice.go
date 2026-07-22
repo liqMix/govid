@@ -91,7 +91,7 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 			idx := mby*d.mbw + mbx
 			d.mbInfo[idx].isIntra = true
 			d.mbInfo[idx].mbType = -2 // intra-in-P
-			d.mbInfo[idx].qp = d.qp
+			d.mbInfo[idx].qp = d.pcmAwareQP(idx)
 			for k := range d.mbInfo[idx].mv {
 				d.mbInfo[idx].mv[k] = [2]int16{0, 0}
 			}
@@ -155,6 +155,7 @@ func (d *Decoder) decodeMBSkip(mbx, mby int, sh *sliceHeader) {
 	d.mbInfo[idx].cbpCabac = 0
 	d.mbInfo[idx].chromaPredMode = 0
 	d.mbInfo[idx].i16OrPCM = false
+	d.mbInfo[idx].isPCM = false
 	d.mbInfo[idx].mvdAbs = [16][2]uint8{}
 	for k := 0; k < 16; k++ {
 		d.mbInfo[idx].mv[k] = mvp
@@ -428,7 +429,7 @@ func (d *Decoder) decodeInterResidualCAVLC(br *BitReader, mbx, mby int, use8x8Tr
 				}
 				if nz > 0 {
 					hasCoef = true
-					dequant8x8(blk[:], d.qp)
+					dequant8x8(blk[:], d.qp, d.wsLuma8(false))
 					idct8x8(blk[:])
 					partY := (p / 2) * 8
 					partX := (p % 2) * 8
@@ -454,7 +455,7 @@ func (d *Decoder) decodeInterResidualCAVLC(br *BitReader, mbx, mby int, use8x8Tr
 					if nz > 0 {
 						hasCoef = true
 						reorderCoeffs(d.coeff[blk*16 : blk*16+16])
-						dequant4x4(d.coeff[blk*16:blk*16+16], d.qp)
+						dequant4x4(d.coeff[blk*16:blk*16+16], d.qp, d.wsLuma4(false))
 						idct4x4(d.coeff[blk*16 : blk*16+16])
 						pos := blk4x4Pos[blk]
 						d.addResidual4x4(ybrYY+pos[0], ybrYX+pos[1], d.coeff[blk*16:blk*16+16])
@@ -491,9 +492,9 @@ func (d *Decoder) decodeInterChroma(br *BitReader, mbx, mby, cbpChroma int) erro
 	}
 
 	hadamard2x2(cbDC)
-	dequantChromaDC(cbDC, qpC)
+	dequantChromaDC(cbDC, qpC, d.scalingWS4[4][0])
 	hadamard2x2(crDC)
-	dequantChromaDC(crDC, qpC)
+	dequantChromaDC(crDC, qpC, d.scalingWS4[5][0])
 
 	// Cb AC.
 	for blk := 0; blk < 4; blk++ {
@@ -511,7 +512,7 @@ func (d *Decoder) decodeInterChroma(br *BitReader, mbx, mby, cbpChroma int) erro
 		}
 
 		if d.coeff[base] != 0 || d.nzCoeffCur[16+blk] > 0 {
-			dequant4x4(d.coeff[base:base+16], qpC)
+			dequant4x4(d.coeff[base:base+16], qpC, d.wsChroma4(false, false))
 			d.coeff[base] = cbDC[blk]
 			idct4x4(d.coeff[base : base+16])
 			j4 := blk / 2
@@ -536,7 +537,7 @@ func (d *Decoder) decodeInterChroma(br *BitReader, mbx, mby, cbpChroma int) erro
 		}
 
 		if d.coeff[base] != 0 || d.nzCoeffCur[20+blk] > 0 {
-			dequant4x4(d.coeff[base:base+16], qpC)
+			dequant4x4(d.coeff[base:base+16], qpC, d.wsChroma4(false, true))
 			d.coeff[base] = crDC[blk]
 			idct4x4(d.coeff[base : base+16])
 			j4 := blk / 2

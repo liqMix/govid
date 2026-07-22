@@ -13,21 +13,11 @@ var levelScale4x4 = [6][4][4]int{
 	{{18, 23, 18, 23}, {23, 29, 23, 29}, {18, 23, 18, 23}, {23, 29, 23, 29}},
 }
 
-// defaultWeightScale is the flat 4x4 scaling matrix value (=16) used when
-// no custom scaling lists are specified (Baseline/Main/High without explicit lists).
-const defaultWeightScale = 16
-
 // dequant4x4 performs inverse quantization on a 4x4 block of coefficients.
 // Per spec 8.5.12.2: d[i][j] = c[i][j] * LevelScale4x4(m,i,j) << (qP/6 - 4)
-// where LevelScale4x4 = normAdjust * weightScale. The flat default weightScale is 16.
-// For I_16x16 AC blocks the weight scale is omitted because the DC coefficient
-// (from the separate Hadamard+dequantLumaDC path) is already at the normAdjust-only
-// scale, and DC/AC must be at consistent scales within the IDCT input.
-func dequant4x4(coeffs []int16, qp int) {
-	dequant4x4Scaled(coeffs, qp, defaultWeightScale)
-}
-
-func dequant4x4Scaled(coeffs []int16, qp, weightScale int) {
+// where LevelScale4x4 = normAdjust * weightScale(i,j). ws is the active
+// raster-order scaling matrix for this block class (flat 16s by default).
+func dequant4x4(coeffs []int16, qp int, ws *[16]int) {
 	qpDiv6 := qp / 6
 	qpMod6 := qp % 6
 
@@ -37,7 +27,7 @@ func dequant4x4Scaled(coeffs []int16, qp, weightScale int) {
 			if coeffs[idx] == 0 {
 				continue
 			}
-			scale := levelScale4x4[qpMod6][j][i] * weightScale
+			scale := levelScale4x4[qpMod6][j][i] * ws[idx]
 			if qpDiv6 >= 4 {
 				coeffs[idx] = int16(int(coeffs[idx]) * scale << uint(qpDiv6-4))
 			} else {
@@ -45,18 +35,6 @@ func dequant4x4Scaled(coeffs []int16, qp, weightScale int) {
 			}
 		}
 	}
-}
-
-// dequantDC4x4 dequantizes a single DC coefficient for 4x4 transform.
-func dequantDC4x4(coeff int16, qp int) int16 {
-	qpDiv6 := qp / 6
-	qpMod6 := qp % 6
-	scale := levelScale4x4[qpMod6][0][0]
-
-	if qpDiv6 >= 2 {
-		return int16(int(coeff) * scale << uint(qpDiv6-2))
-	}
-	return int16((int(coeff)*scale + (1 << uint(1-qpDiv6))) >> uint(2-qpDiv6))
 }
 
 // normAdjust8x8 values from spec Table 8-14, indexed [qp%6][class] where the
@@ -101,9 +79,10 @@ var levelScale8x8 = func() [6][8][8]int {
 }()
 
 // dequant8x8 performs inverse quantization on an 8x8 block of coefficients.
-// Per spec 8.5.12.2: d[i][j] = c[i][j] * LevelScale8x8(m,i,j) << (qP/6 - 6).
-// The flat default weightScale8x8 is 16 (no custom scaling list).
-func dequant8x8(coeffs []int16, qp int) {
+// Per spec 8.5.12.2: d[i][j] = c[i][j] * LevelScale8x8(m,i,j) << (qP/6 - 6),
+// with LevelScale8x8 = normAdjust * weightScale(i,j) from the active
+// raster-order 8x8 scaling matrix ws.
+func dequant8x8(coeffs []int16, qp int, ws *[64]int) {
 	qpDiv6 := qp / 6
 	qpMod6 := qp % 6
 	scales := &levelScale8x8[qpMod6]
@@ -114,7 +93,7 @@ func dequant8x8(coeffs []int16, qp int) {
 			if coeffs[idx] == 0 {
 				continue
 			}
-			scale := scales[j][i] * defaultWeightScale
+			scale := scales[j][i] * ws[idx]
 			if qpDiv6 >= 6 {
 				coeffs[idx] = int16(int(coeffs[idx]) * scale << uint(qpDiv6-6))
 			} else {
@@ -125,38 +104,37 @@ func dequant8x8(coeffs []int16, qp int) {
 }
 
 // dequantLumaDC performs inverse quantization on luma 4x4 DC coefficients
-// after the Hadamard transform (for I_16x16 macroblocks).
-func dequantLumaDC(coeffs []int16, qp int) {
+// after the Hadamard transform (for I_16x16 macroblocks). Per spec 8.5.10 the
+// scale is LevelScale4x4(qP%6, 0, 0) = normAdjust * weightScale(0,0); w is
+// weightScale(0,0) of the active Intra Y matrix (16 when flat).
+func dequantLumaDC(coeffs []int16, qp, w int) {
 	qpDiv6 := qp / 6
 	qpMod6 := qp % 6
-	scale := levelScale4x4[qpMod6][0][0]
+	scale := levelScale4x4[qpMod6][0][0] * w
 
-	if qpDiv6 >= 2 {
+	if qpDiv6 >= 6 {
 		for i := range coeffs {
-			coeffs[i] = int16(int(coeffs[i]) * scale << uint(qpDiv6-2))
+			coeffs[i] = int16(int(coeffs[i]) * scale << uint(qpDiv6-6))
 		}
 	} else {
 		for i := range coeffs {
-			coeffs[i] = int16((int(coeffs[i])*scale + (1 << uint(1-qpDiv6))) >> uint(2-qpDiv6))
+			coeffs[i] = int16((int(coeffs[i])*scale + (1 << uint(5-qpDiv6))) >> uint(6-qpDiv6))
 		}
 	}
 }
 
 // dequantChromaDC performs inverse quantization on chroma 2x2 DC coefficients
-// after the Hadamard transform.
-func dequantChromaDC(coeffs []int16, qp int) {
+// after the Hadamard transform. Per spec 8.5.11:
+// dcC = ((f * LevelScale4x4(qP%6,0,0)) << (qP/6)) >> 5, with LevelScale =
+// normAdjust * weightScale(0,0); w is weightScale(0,0) of the active chroma
+// matrix for this component (16 when flat).
+func dequantChromaDC(coeffs []int16, qp, w int) {
 	qpDiv6 := qp / 6
 	qpMod6 := qp % 6
-	scale := levelScale4x4[qpMod6][0][0]
+	scale := levelScale4x4[qpMod6][0][0] * w
 
-	if qpDiv6 >= 1 {
-		for i := range coeffs {
-			coeffs[i] = int16(int(coeffs[i]) * scale << uint(qpDiv6-1))
-		}
-	} else {
-		for i := range coeffs {
-			coeffs[i] = int16((int(coeffs[i]) * scale) >> 1)
-		}
+	for i := range coeffs {
+		coeffs[i] = int16((int(coeffs[i]) * scale << uint(qpDiv6)) >> 5)
 	}
 }
 

@@ -225,6 +225,47 @@ use a list reports "available with refIdx -1", matching FFmpeg's cache
 model); and ffmpeg's `-debug mb_type`/`-debug qp` grids print in *display*
 order, which is what makes them lineable against POC-derived frame indices.
 
+### The conformance-stream round (temporal direct, CABAC I_PCM, MMCO/long-term)
+
+Some features cannot be generated with x264, so bit-exactness needs the JVT
+conformance suite (https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/):
+x264 never emits long-term references or sub-8x8 B partitions, and asking it
+for I_PCM via `qp=0` silently escalates the encode to lossless High 4:4:4
+(`profile_idc 244` + `qpprime_y_zero_transform_bypass`) — check
+`trace_headers` before trusting a generated fixture. The streams used:
+CAPM3_Sony_D (CABAC IPB + I_PCM + temporal direct), CVPCMNL1/2_SVA_C (CAVLC
+I_PCM), MR2_MW_A and MR2_TANDBERG_E (MMCO ops 1-6 incl. an op-5 reset,
+long-term refs, long-term list modification). ffmpeg's decode of every one
+was first verified byte-identical to the package's `*_rec.yuv`, so the usual
+ffmpeg-reference workflow still applies; the bundled JM trace files give
+per-syntax-element ground truth (that's how `direct_8x8_inference_flag = 0`
+was discovered — **the package readme claimed it was ON; trust the
+bitstream, not the documentation**).
+
+Bugs this round, all with the same signature — bitstream stays in sync,
+errors localized to specific MBs:
+
+1. **Reorder depth without VUI** — with no `bitstream_restriction`, waiting
+   for the first B slice before enabling display reordering is wrong: the
+   reference frame coded ahead of that B has already been emitted. Buffer to
+   `max_num_ref_frames` up front (0 refs → no reordering possible).
+2. **Spec 6.4.8 positional availability in B_8x8** (8.4.1.3 MVP): a later
+   quadrant must read as *undecoded* during MV prediction so the above-right
+   neighbor substitutes above-left. Invisible with x264 (8x8-only subs never
+   query a later quadrant); an 8x4 second row does. The all-decoded-up-front
+   cache trick needs a positional mask during sub-partition MVP.
+3. **`direct_8x8_inference_flag = 0`** — temporal direct derives motion per
+   4x4 (own colocated block each), not per quadrant corner; spatial direct
+   evaluates colZeroFlag per 4x4.
+4. **I_PCM in CABAC needs no bitstream pointer surgery in a bit-serial
+   engine** — after the terminate bin, the BitReader position *is* the
+   conceptual RBSP position: byte-align, read raw samples, re-init the
+   engine (contexts persist). FFmpeg's `ptr--` adjustments exist only
+   because its engine buffers ahead. Side state: cbp 0x1EF, TotalCoeff 16,
+   deblocking QP 0, dqp context reset.
+5. **MMCO op 5** resets frame_num and POC of the current picture to 0 —
+   the display-order key needs an epoch bump exactly like an IDR.
+
 ---
 
 ## Part 1b: VP8 Lessons Learned
