@@ -45,7 +45,7 @@ func TestInterframe64Frame1Trace(t *testing.T) {
 	t.Logf("frame 1: firstPartLen=%d (%d bits) headerBits=%d remaining=%d",
 		fh.FirstPartitionLen, fh.FirstPartitionLen*8, headerBits,
 		int(fh.FirstPartitionLen)*8-headerBits)
-	t.Logf("probIntra=%d probLast=%d skipProb=%d mvProb[0]=%v", 
+	t.Logf("probIntra=%d probLast=%d skipProb=%d mvProb[0]=%v",
 		dec.probIntra, dec.probLast, dec.skipProb, dec.mvProb[0])
 
 	for mbx := 0; mbx < dec.mbw; mbx++ {
@@ -76,10 +76,10 @@ func TestInterframe64Frame1Trace(t *testing.T) {
 				cnt := dec.lastCnt
 				t.Logf("  MB(0,3) cnt=%v probs=[%d,%d,%d,%d]",
 					cnt,
-					modeContexts[min(cnt[0],5)][0],
-					modeContexts[min(cnt[1],5)][1],
-					modeContexts[min(cnt[2],5)][2],
-					modeContexts[min(cnt[3],5)][3])
+					modeContexts[min(cnt[0], 5)][0],
+					modeContexts[min(cnt[1], 5)][1],
+					modeContexts[min(cnt[2], 5)][2],
+					modeContexts[min(cnt[3], 5)][3])
 				t.Logf("  above=%+v left=%+v",
 					dec.upInterMB[mbx], dec.leftInterMB)
 			}
@@ -91,8 +91,12 @@ func TestInterframe64Frame1Trace(t *testing.T) {
 					got := int(dec.img.Y[(mby*16+j)*dec.img.YStride+mbx*16+i])
 					want := int(ref[refOff+(mby*16+j)*w+mbx*16+i])
 					d := got - want
-					if d < 0 { d = -d }
-					if d > maxErr { maxErr = d }
+					if d < 0 {
+						d = -d
+					}
+					if d > maxErr {
+						maxErr = d
+					}
 				}
 			}
 
@@ -100,7 +104,9 @@ func TestInterframe64Frame1Trace(t *testing.T) {
 			if dec.curMode == interModeSPLITMV {
 				mvStr += " sub=["
 				for si := 0; si < 16; si++ {
-					if si > 0 { mvStr += "," }
+					if si > 0 {
+						mvStr += ","
+					}
 					mvStr += fmt.Sprintf("(%d,%d)", dec.curSubMV[si][0], dec.curSubMV[si][1])
 				}
 				mvStr += "]"

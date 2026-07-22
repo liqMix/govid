@@ -69,6 +69,18 @@ func (m *miniBoolDec) readUint(prob, n uint8) uint32 {
 }
 
 func TestVerifyPartitionState(t *testing.T) {
+	// This test was written to document a suspected first-partition bool
+	// decoder desync. That theory is now disproven: the baker clip decodes
+	// bit-exact through frame 6 (a desync would corrupt everything after
+	// its first wrong bin), and the "state mismatch" below is a
+	// representation difference between the main decoder's buffered
+	// lookahead and the mini decoder's, with all decoded decisions equal.
+	// The real remaining VP8 defects are localized by
+	// TestBakerFirstDivergence (loop-filter ±1 divergence at frame 7) and
+	// TestBakerFirstDivergenceNoFilter (reconstruction divergence at frame
+	// 8 MB (44,42), NEWMV vs LAST).
+	t.Skip("obsolete: first-partition desync theory disproven; see TestBakerFirstDivergence*")
+
 	// Read the 64x64 interframe video's frame 1 first partition and
 	// verify our main decoder and mini decoder produce identical states.
 	const webmPath = "testdata/interframe64.webm"
@@ -128,7 +140,7 @@ func TestVerifyPartitionState(t *testing.T) {
 	seg := main.readBit(128)
 	segM := mini.readBit(128)
 	t.Logf("segment useSegment: main=%v mini=%v", seg, segM)
-	
+
 	// Verify state after segment
 	t.Logf("After segment: main(r=%d,count=%d,rng=%d,value=%08x) mini(r=%d,count=%d,rng=%d,value=%08x)",
 		main.r, main.count, main.rng, main.value,

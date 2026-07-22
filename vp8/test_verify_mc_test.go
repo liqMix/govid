@@ -55,8 +55,12 @@ func TestVerifyMCFix(t *testing.T) {
 		for x := 0; x < 4; x++ {
 			px := 63 + x
 			py := 47 + y
-			if px >= 64 { px = 63 }
-			if py >= 64 { py = 63 }
+			if px >= 64 {
+				px = 63
+			}
+			if py >= 64 {
+				py = 63
+			}
 			vals += " " + string(rune('0'+ref.Y[py*ref.YStride+px]/26))
 		}
 		t.Logf("  row %d:%s (%d %d %d %d)", y,

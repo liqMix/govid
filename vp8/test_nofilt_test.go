@@ -35,7 +35,7 @@ func TestInterframe64NoFilter(t *testing.T) {
 		// Decode frame but override filter level to 0.
 		dec.parseOtherHeaders()
 		savedLevel := dec.filterHeader.level
-		dec.filterHeader.level = 0  // disable filter
+		dec.filterHeader.level = 0 // disable filter
 
 		for mbx := 0; mbx < dec.mbw; mbx++ {
 			dec.upMB[mbx] = mb{}
@@ -76,13 +76,25 @@ func TestInterframe64NoFilter(t *testing.T) {
 					wantNF := int(refNoFilt[refOff+j*w+k])
 					wantF := int(refFilt[refOff+j*w+k])
 					dNF := got - wantNF
-					if dNF < 0 { dNF = -dNF }
-					if dNF > 0 { wrongNF++ }
-					if dNF > maxNF { maxNF = dNF }
+					if dNF < 0 {
+						dNF = -dNF
+					}
+					if dNF > 0 {
+						wrongNF++
+					}
+					if dNF > maxNF {
+						maxNF = dNF
+					}
 					dF := got - wantF
-					if dF < 0 { dF = -dF }
-					if dF > 0 { wrongF++ }
-					if dF > maxF { maxF = dF }
+					if dF < 0 {
+						dF = -dF
+					}
+					if dF > 0 {
+						wrongF++
+					}
+					if dF > maxF {
+						maxF = dF
+					}
 				}
 			}
 			t.Logf("frame 1 (no filter) vs nofilt-ref: Y %d/%d wrong, max=%d", wrongNF, ySize, maxNF)

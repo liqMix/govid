@@ -31,7 +31,7 @@ func TestInterframe64HeaderTrace(t *testing.T) {
 
 	b := func() int { return dec.fp.r*8 - dec.fp.count }
 	b0 := b()
-	
+
 	dec.parseSegmentHeader()
 	t.Logf("segment: +%d (total %d) use=%v update=%v", b()-b0, b(), dec.segmentHeader.useSegment, dec.segmentHeader.updateMap)
 	b0 = b()
@@ -78,7 +78,7 @@ func TestInterframe64HeaderTrace(t *testing.T) {
 	b0 = b()
 
 	dec.parseInterFrameProbs()
-	t.Logf("inter_probs: +%d (total %d) probIntra=%d probLast=%d probGf=%d", 
+	t.Logf("inter_probs: +%d (total %d) probIntra=%d probLast=%d probGf=%d",
 		b()-b0, b(), dec.probIntra, dec.probLast, dec.probGf)
 
 	total := b()

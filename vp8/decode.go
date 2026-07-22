@@ -120,6 +120,9 @@ type Decoder struct {
 	tokenProb   [nPlane][nBand][nContext][nProb]uint8
 	useSkipProb bool
 	skipProb    uint8
+	// disableFilter skips the loop filter (for staged testing against
+	// ffmpeg -skip_loop_filter all references).
+	disableFilter bool
 	// Loop filter parameters.
 	perMBFilterParams []filterParam
 	// Precomputed filter LUTs (ported from libvpx).
@@ -152,8 +155,8 @@ type Decoder struct {
 	ybr   [1 + 16 + 1 + 8][32]uint8
 
 	// Inter-frame reference buffers (RFC 6386 §9.7, §9.8).
-	refFrame    [4]*image.YCbCr // [0]=unused, [1]=last, [2]=golden, [3]=altref
-	refSignBias [4]bool
+	refFrame      [4]*image.YCbCr // [0]=unused, [1]=last, [2]=golden, [3]=altref
+	refSignBias   [4]bool
 	refreshLast   bool
 	refreshGolden bool
 	refreshAltRef bool
@@ -167,10 +170,10 @@ type Decoder struct {
 	leftInterMB      interMB
 	upInterMB        []interMB
 	aboveLeftInterMB interMB // saved from previous row before overwrite
-	curRefFrame uint8
-	curMV       [2]int16
-	curMode     uint8
-	curSubMV    [16][2]int16
+	curRefFrame      uint8
+	curMV            [2]int16
+	curMode          uint8
+	curSubMV         [16][2]int16
 
 	// Inter-frame prediction probabilities.
 	mvProb     [2][19]uint8
@@ -479,7 +482,7 @@ func (d *Decoder) DecodeFrame() (*image.YCbCr, error) {
 	// Even if we are using per-segment levels, section 15 says that "loop
 	// filtering must be skipped entirely if loop_filter_level at either the
 	// frame header level or macroblock override level is 0".
-	if d.filterHeader.level != 0 {
+	if d.filterHeader.level != 0 && !d.disableFilter {
 		if d.filterHeader.simple {
 			d.simpleFilter()
 		} else {

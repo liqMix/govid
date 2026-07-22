@@ -50,13 +50,21 @@ func TestMotionTestMultiFrame(t *testing.T) {
 				got := int(img.Y[j*img.YStride+k])
 				want := int(ref[refOff+j*w+k])
 				d := got - want
-				if d < 0 { d = -d }
-				if d > 0 { wrongY++ }
-				if d > maxY { maxY = d }
+				if d < 0 {
+					d = -d
+				}
+				if d > 0 {
+					wrongY++
+				}
+				if d > maxY {
+					maxY = d
+				}
 			}
 		}
 		ft := "inter"
-		if fh.KeyFrame { ft = "key" }
+		if fh.KeyFrame {
+			ft = "key"
+		}
 		t.Logf("frame %d (%s): Y %d/%d wrong (%.1f%%) max=%d eof=%v pktLen=%d firstPartLen=%d",
 			i, ft, wrongY, ySize, 100*float64(wrongY)/float64(ySize), maxY,
 			dec.fp.unexpectedEOF, len(pkt.Data), fh.FirstPartitionLen)

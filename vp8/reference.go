@@ -48,4 +48,3 @@ func (d *Decoder) updateReferenceFrames() {
 func (d *Decoder) FlushReferences() {
 	d.refFrame = [4]*image.YCbCr{}
 }
-

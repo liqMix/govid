@@ -4,9 +4,9 @@ package vp8
 
 // interMB holds per-macroblock inter-frame state.
 type interMB struct {
-	refFrame uint8      // 0=intra, 1=last, 2=golden, 3=altref
-	mv       [2]int16   // row, col in quarter-pixel units
-	mode     uint8      // inter mode
+	refFrame uint8        // 0=intra, 1=last, 2=golden, 3=altref
+	mv       [2]int16     // row, col in quarter-pixel units
+	mode     uint8        // inter mode
 	splitMV  [16][2]int16 // per 4x4 sub-block MVs (SPLITMV only)
 }
 
@@ -243,7 +243,21 @@ func (d *Decoder) readInterMBModeAndMV(mbx, mby int) {
 	}
 	d.leftInterMB = imb
 	d.upInterMB[mbx] = imb
+
+	if DebugInterMB != nil {
+		DebugInterMB(mbx, mby, int(d.curRefFrame), int(d.curMode), d.curMV, d.curSubMV)
+	}
+	if DebugNearMVs != nil {
+		DebugNearMVs(mbx, mby, nearest, near, bestMV, cnt)
+	}
 }
+
+// DebugInterMB, if non-nil, receives each inter MB's reference frame, mode,
+// MV, and (for SPLITMV) sub-MVs after mode/MV parsing.
+var DebugInterMB func(mbx, mby, refFrame, mode int, mv [2]int16, subMV [16][2]int16)
+
+// DebugNearMVs, if non-nil, receives the near-MV derivation of each inter MB.
+var DebugNearMVs func(mbx, mby int, nearest, near, bestMV [2]int16, cnt [4]int)
 
 // findNearMVs implements the inline near-MV logic from libvpx read_mb_modes_mv.
 // Returns nearest MV, near MV, bestMV, and counts with merge/swap/SPLITMV
@@ -460,10 +474,10 @@ func (d *Decoder) getAboveSubMV(mby, mbx int, subIdx int) [2]int16 {
 
 // Probability index constants for MV component decoding (§17.1).
 const (
-	mvpIsShort = 0  // prob[0]: short vs long
-	mvpSign    = 1  // prob[1]: sign
-	mvpShort   = 2  // prob[2-8]: short MV tree (7 probs for values 0-7)
-	mvpBits    = 9  // prob[9-18]: long MV magnitude bits (10 probs)
+	mvpIsShort = 0 // prob[0]: short vs long
+	mvpSign    = 1 // prob[1]: sign
+	mvpShort   = 2 // prob[2-8]: short MV tree (7 probs for values 0-7)
+	mvpBits    = 9 // prob[9-18]: long MV magnitude bits (10 probs)
 )
 
 const mvLongWidth = 10
@@ -534,13 +548,13 @@ func (d *Decoder) readSmallMV(comp int) int16 {
 // smallMVTree is the VP8 small MV tree for values 0-7.
 // Negative values are leaf nodes (negated result value).
 var smallMVTree = [14]int{
-	2, 8,     // Node 0: left→Node 2, right→Node 8
-	4, 6,     // Node 2: left→Node 4, right→Node 6
-	0, -1,    // Node 4: left→0, right→1 (0 encoded as -0 = 0)
-	-2, -3,   // Node 6: left→2, right→3
-	10, 12,   // Node 8: left→Node 10, right→Node 12
-	-4, -5,   // Node 10: left→4, right→5
-	-6, -7,   // Node 12: left→6, right→7
+	2, 8, // Node 0: left→Node 2, right→Node 8
+	4, 6, // Node 2: left→Node 4, right→Node 6
+	0, -1, // Node 4: left→0, right→1 (0 encoded as -0 = 0)
+	-2, -3, // Node 6: left→2, right→3
+	10, 12, // Node 8: left→Node 10, right→Node 12
+	-4, -5, // Node 10: left→4, right→5
+	-6, -7, // Node 12: left→6, right→7
 }
 
 // clampMVComp clamps a MV component to stay within frame boundaries.
@@ -561,13 +575,13 @@ func clampMVComp(mv int16, mb, mbMax int) int16 {
 // parseIntraYModeInter parses the Y mode for an intra MB in an inter-frame.
 // Uses the balanced binary tree from libvpx vp8_ymode_tree:
 //
-//	        [prob0]
-//	       /       \
-//	     DC       [prob1]
-//	             /       \
-//	          [prob2]   [prob3]
-//	          /   \     /   \
-//	         V     H  TM     B
+//	   [prob0]
+//	  /       \
+//	DC       [prob1]
+//	        /       \
+//	     [prob2]   [prob3]
+//	     /   \     /   \
+//	    V     H  TM     B
 func (d *Decoder) parseIntraYModeInter(mbx int) {
 	if !d.fp.readBit(d.yModeProb[0]) {
 		d.usePredY16 = true
@@ -610,4 +624,3 @@ func (d *Decoder) parsePredModeC8Inter() {
 		d.predC8 = predTM
 	}
 }
-

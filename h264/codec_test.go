@@ -8,7 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"time"
+
 	govidmp4 "github.com/Eyevinn/mp4ff/mp4"
+
+	mp4demux "github.com/liqmix/govid/mp4"
 
 	"github.com/liqmix/govid"
 )
@@ -2598,4 +2602,38 @@ func TestDecodeBGDefaultMP4VsReference(t *testing.T) {
 		t.Skip("bg_default_frames_0_119.yuv not found")
 	}
 	decodeAndCompareYUV(t, mp4Path, yuvPath, 120, false)
+}
+
+// TestPlayerBStreamDeliversAllFrames plays the B-frame fixture through the
+// real Player + mp4 demuxer and checks every display frame arrives,
+// including the reorder-buffered tail at end of stream.
+func TestPlayerBStreamDeliversAllFrames(t *testing.T) {
+	f, err := os.Open("testdata/test_b.mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	demuxer, err := mp4demux.NewDemuxer(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer demuxer.Close()
+
+	player, err := govid.NewPlayer(demuxer, NewCodec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	player.Play()
+
+	// Step well past the end in small increments, tracking distinct frames.
+	seen := map[time.Duration]bool{}
+	for ts := time.Duration(0); ts < 3*time.Second; ts += 10 * time.Millisecond {
+		player.UpdateToTime(ts)
+		if fr := player.CurrentFrame(); fr != nil {
+			seen[fr.Timestamp] = true
+		}
+	}
+	if len(seen) != 30 {
+		t.Fatalf("player delivered %d distinct frames, want 30", len(seen))
+	}
 }

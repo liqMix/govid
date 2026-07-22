@@ -88,7 +88,9 @@ func TestManualDecodeFirst3MBRow(t *testing.T) {
 
 		// Mode tree node 0.
 		prob0 := modeContexts[cnt[0]][0]
-		if cnt[0] > 5 { prob0 = modeContexts[5][0] }
+		if cnt[0] > 5 {
+			prob0 = modeContexts[5][0]
+		}
 		t.Logf("Mode node 0: cnt[0]=%d prob=%d", cnt[0], prob0)
 		node0bit := dec.fp.readBit(prob0)
 		t.Logf("node0=%v (true=not-ZEROMV), fp: r=%d count=%d rng=%d value=%08x",
@@ -99,15 +101,19 @@ func TestManualDecodeFirst3MBRow(t *testing.T) {
 		} else {
 			// Node 1.
 			bestIdx := 0
-			if cnt[1] >= cnt[0] { bestIdx = 1 }
+			if cnt[1] >= cnt[0] {
+				bestIdx = 1
+			}
 			t.Logf("bestIdx=%d (cnt[1]=%d >= cnt[0]=%d → %v)", bestIdx, cnt[1], cnt[0], cnt[1] >= cnt[0])
-			
+
 			if cnt[2] > cnt[1] {
 				t.Logf("Swap: cnt[2]=%d > cnt[1]=%d", cnt[2], cnt[1])
 			}
 
 			prob1 := modeContexts[cnt[1]][1]
-			if cnt[1] > 5 { prob1 = modeContexts[5][1] }
+			if cnt[1] > 5 {
+				prob1 = modeContexts[5][1]
+			}
 			t.Logf("Mode node 1: cnt[1]=%d prob=%d", cnt[1], prob1)
 			node1bit := dec.fp.readBit(prob1)
 			t.Logf("node1=%v (true=not-NEAREST), fp: r=%d count=%d rng=%d value=%08x",
@@ -117,7 +123,9 @@ func TestManualDecodeFirst3MBRow(t *testing.T) {
 				t.Logf("→ NEARESTMV mv=%v", nearest)
 			} else {
 				prob2 := modeContexts[cnt[2]][2]
-				if cnt[2] > 5 { prob2 = modeContexts[5][2] }
+				if cnt[2] > 5 {
+					prob2 = modeContexts[5][2]
+				}
 				t.Logf("Mode node 2: cnt[2]=%d prob=%d", cnt[2], prob2)
 				node2bit := dec.fp.readBit(prob2)
 				t.Logf("node2=%v (true=not-NEAR), fp: r=%d count=%d rng=%d value=%08x",

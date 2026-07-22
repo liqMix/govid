@@ -334,3 +334,62 @@ func BenchmarkConvertRGBA1080p(b *testing.B) {
 		buf = f.ConvertRGBA(buf)
 	}
 }
+
+// reorderTestCodec mimics a B-frame decoder: it withholds a fixed number of
+// frames for display reordering, releasing them via Drain at end of stream.
+type reorderTestCodec struct {
+	testCodec
+	delay   int
+	pending []*Frame
+}
+
+func (c *reorderTestCodec) Decode(pkt Packet) (*Frame, error) {
+	frame, err := c.testCodec.Decode(pkt)
+	if err != nil {
+		return nil, err
+	}
+	c.pending = append(c.pending, frame)
+	if len(c.pending) <= c.delay {
+		return nil, nil
+	}
+	return c.Drain(), nil
+}
+
+func (c *reorderTestCodec) Drain() *Frame {
+	if len(c.pending) == 0 {
+		return nil
+	}
+	f := c.pending[0]
+	c.pending = c.pending[1:]
+	return f
+}
+
+func (c *reorderTestCodec) Flush() { c.pending = nil }
+
+// TestReorderingCodecDrainsAtEOF verifies that frames a reordering codec
+// holds back are still delivered at end of stream: the player must reach the
+// final frame, and a loop restart must play from frame 0 again.
+func TestReorderingCodecDrainsAtEOF(t *testing.T) {
+	const n = 10
+	const interval = 33 * time.Millisecond
+	d := newTestDemuxer(n, interval)
+	p, err := NewPlayer(d, &reorderTestCodec{delay: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Play()
+
+	last := time.Duration(n-1) * interval
+	p.UpdateToTime(last + interval)
+	if got := p.CurrentFrame().Timestamp; got != last {
+		t.Fatalf("expected final frame at %v after EOF, got %v", last, got)
+	}
+
+	// Looping must restart cleanly after the drained tail.
+	p.SetLoop(true)
+	p.Seek(0)
+	p.UpdateToTime(0)
+	if got := p.CurrentFrame().Timestamp; got != 0 {
+		t.Fatalf("expected frame 0 after loop restart, got %v", got)
+	}
+}

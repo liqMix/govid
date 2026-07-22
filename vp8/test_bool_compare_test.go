@@ -108,7 +108,9 @@ func TestTokenPartitionBoolCompare(t *testing.T) {
 	// Simulate parseResiduals4 using both codecs.
 	// Track decoded values for debugging.
 	type decodedCoeff struct {
-		n int; v int32; z int
+		n int
+		v int32
+		z int
 	}
 	var lastBlockCoeffs []decodedCoeff
 
@@ -139,28 +141,42 @@ func TestTokenPartitionBoolCompare(t *testing.T) {
 						v = 2
 					} else {
 						v = 3
-						if readBitBoth(p[5]) { v++ }
+						if readBitBoth(p[5]) {
+							v++
+						}
 					}
 				} else if !readBitBoth(p[6]) {
 					if !readBitBoth(p[7]) {
 						v = 5
-						if readBitBoth(159) { v++ }
+						if readBitBoth(159) {
+							v++
+						}
 					} else {
 						v = 7
-						if readBitBoth(165) { v += 2 }
-						if readBitBoth(145) { v++ }
+						if readBitBoth(165) {
+							v += 2
+						}
+						if readBitBoth(145) {
+							v++
+						}
 					}
 				} else {
 					b1 := uint32(0)
-					if readBitBoth(p[8]) { b1 = 1 }
+					if readBitBoth(p[8]) {
+						b1 = 1
+					}
 					b0 := uint32(0)
-					if readBitBoth(p[9+b1]) { b0 = 1 }
+					if readBitBoth(p[9+b1]) {
+						b0 = 1
+					}
 					cat := 2*b1 + b0
 					tab := &cat3456[cat]
 					v = 0
 					for i := 0; tab[i] != 0; i++ {
 						v *= 2
-						if readBitBoth(tab[i]) { v++ }
+						if readBitBoth(tab[i]) {
+							v++
+						}
 					}
 					v += 3 + (8 << cat)
 				}
@@ -169,7 +185,9 @@ func TestTokenPartitionBoolCompare(t *testing.T) {
 			// Sign
 			sign := readBitBoth(uniformProb)
 			sv := int32(v)
-			if sign { sv = -sv }
+			if sign {
+				sv = -sv
+			}
 			z := int(zigzag[n-1])
 			lastBlockCoeffs = append(lastBlockCoeffs, decodedCoeff{n: n, v: sv, z: z})
 			if n == 16 || !readBitBoth(p[0]) {
@@ -180,7 +198,10 @@ func TestTokenPartitionBoolCompare(t *testing.T) {
 	}
 
 	// Simulate the full parseResiduals for all MBs.
-	type mbState struct{ nzMask uint8; nzY16 uint8 }
+	type mbState struct {
+		nzMask uint8
+		nzY16  uint8
+	}
 	leftMB := mbState{}
 	upMB := make([]mbState, dec.mbw)
 	quant := &dec.quant[0]

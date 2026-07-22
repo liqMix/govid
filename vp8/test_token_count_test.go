@@ -57,6 +57,6 @@ func TestCountTokenProbUpdates(t *testing.T) {
 
 	b1 := dec.fp.r*8 - dec.fp.count
 	t.Logf("token prob: %d bits consumed, %d updates (expected: 1056 flags + %d*8 = %d bits)",
-		b1-b0, updates, updates, 1056*0 + updates*9)
+		b1-b0, updates, updates, 1056*0+updates*9)
 	t.Logf("avg bits per flag (no update): %.3f", float64(b1-b0-updates*8)/float64(1056-updates))
 }

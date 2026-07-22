@@ -41,7 +41,7 @@ frame 10 (inter): Y 47495/921600 (5.2%)    max=113
 frame 70 (inter): Y 767272/921600 (83.3%)  max=116
 ```
 
-The suspected cause is a bitstream desync in the first partition / token partition boundary; `vp8/test_verify_partition_test.go` currently **fails** and documents the mismatch.
+The old "first-partition bitstream desync" theory is disproven (frames 0-6 are bit-exact, which a desync would not allow). The real defects are localized by two gated diagnostic tests: a loop-filter divergence starting at frame 7 (9 macroblocks, ±1 — the pixel filter kernels match libvpx, so the fault is in the filter level/threshold derivation), and an independent reconstruction divergence at frame 8 MB (44,42) (a NEWMV macroblock whose near-MV derivation matches libvpx, error pattern consistent with a slightly-off prediction). See `TestBakerFirstDivergence` / `TestBakerFirstDivergenceNoFilter`.
 
 **AV1** (`TestDecodeBakerMultiframe`) — headers, OBUs, the symbol decoder, and block structure parse, but reconstruction is wrong: ~99.5% of luma pixels differ with a mean absolute error around 44–75. Multiple bugs appear to compensate for each other, so fixing them one at a time has repeatedly made the error worse. Do not use this package.
 
@@ -57,7 +57,7 @@ H.264 decoder coverage:
 
 - **Supported:** CAVLC and CABAC entropy coding; I/SI, P, and B slices (spatial direct mode, bi-prediction with implicit and explicit weighting, B-pyramid); intra 4x4 / 8x8 / 16x16 / chroma prediction; the 8x8 transform (High profile); quarter-pel luma and bilinear chroma motion compensation; multi-reference MV prediction; reference picture list modification; MMCO short-term marking; explicit weighted prediction; picture-order display reordering; the deblocking filter (including 8x8-transform and B-slice bS rules). Everything x264 emits by default — `ffmpeg -c:v libx264` with no flags — decodes bit-exact, verified against ffmpeg on 120-frame 720p real content (`TestDecodeBGDefaultMP4VsReference`) plus the committed staged fixtures.
 - **Not supported (returns an error):** temporal direct mode (x264 `direct=temporal`/`auto`; the default `spatial` works), multiple slice groups, long-term references / MMCO ops 2-6, I_PCM inside CABAC slices, interlaced (field/MBAFF) coding. Custom (non-flat) scaling matrices are parsed but not applied — x264's default flat CQM decodes correctly.
-- **B-frame note:** with B-frames the decoder emits frames in display order with a small delay (from the stream's VUI `max_num_reorder_frames`). `Player`/`AsyncPlayer` handle this transparently; at end-of-stream the last few frames are only reachable via `(*h264.Codec).Drain`.
+- **B-frame note:** with B-frames the decoder emits frames in display order with a small delay (from the stream's VUI `max_num_reorder_frames`). `Player`/`AsyncPlayer` handle this transparently, including draining the buffered tail frames at end of stream (`govid.FrameDrainer`).
 
 AV1 decoder coverage: intra frames only — there is no inter prediction, no film grain, no loop restoration.
 

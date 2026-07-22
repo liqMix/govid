@@ -265,10 +265,25 @@ func (a *asyncSource) close() error {
 	return nil
 }
 
+// FrameDrainer is implemented by codecs that hold decoded frames back for
+// display reordering (e.g., H.264 with B-frames). Drain returns the next
+// buffered frame in display order, or nil when none remain. The player
+// drains the codec at end of stream so the final frames are not lost.
+type FrameDrainer interface {
+	Drain() *Frame
+}
+
 func readNextFrame(d Demuxer, c Codec) (*Frame, error) {
 	for {
 		pkt, err := d.NextPacket()
 		if err != nil {
+			if err == io.EOF {
+				if dr, ok := c.(FrameDrainer); ok {
+					if frame := dr.Drain(); frame != nil {
+						return frame, nil
+					}
+				}
+			}
 			return nil, err
 		}
 		frame, err := c.Decode(pkt)

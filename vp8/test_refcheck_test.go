@@ -42,9 +42,15 @@ func TestReferenceFrameCorrect(t *testing.T) {
 			got := int(lastRef.Y[j*lastRef.YStride+k])
 			want := int(ref[j*w+k])
 			d := got - want
-			if d < 0 { d = -d }
-			if d > 0 { wrongY++ }
-			if d > maxY { maxY = d }
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				wrongY++
+			}
+			if d > maxY {
+				maxY = d
+			}
 		}
 	}
 	t.Logf("refFrame[1] vs ffmpeg frame 0: Y %d/%d wrong, max=%d", wrongY, ySize, maxY)
@@ -56,9 +62,15 @@ func TestReferenceFrameCorrect(t *testing.T) {
 			got := int(dec.img.Y[j*dec.img.YStride+k])
 			want := int(ref[j*w+k])
 			d := got - want
-			if d < 0 { d = -d }
-			if d > 0 { wrongImg++ }
-			if d > maxImg { maxImg = d }
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				wrongImg++
+			}
+			if d > maxImg {
+				maxImg = d
+			}
 		}
 	}
 	t.Logf("d.img vs ffmpeg frame 0: Y %d/%d wrong, max=%d", wrongImg, ySize, maxImg)
@@ -69,7 +81,9 @@ func TestReferenceFrameCorrect(t *testing.T) {
 		for k := 0; k < w; k++ {
 			a := lastRef.Y[j*lastRef.YStride+k]
 			b := dec.img.Y[j*dec.img.YStride+k]
-			if a != b { wrongCopy++ }
+			if a != b {
+				wrongCopy++
+			}
 		}
 	}
 	t.Logf("refFrame[1] vs d.img: %d different pixels", wrongCopy)
@@ -84,8 +98,8 @@ func TestReferenceFrameCorrect(t *testing.T) {
 	// Check MB(0,3) pixel values: reference frame (frame 0), decoded frame 1, expected frame 1.
 	cSize := (w / 2) * (h / 2)
 	frameSize := ySize + 2*cSize
-	refF0 := ref[0:ySize]         // frame 0 (keyframe) reference
-	refF1 := ref[frameSize:frameSize+ySize] // frame 1 expected
+	refF0 := ref[0:ySize]                     // frame 0 (keyframe) reference
+	refF1 := ref[frameSize : frameSize+ySize] // frame 1 expected
 
 	t.Log("MB(0,3) first row: refF0=reference_pixel, got=decoded, want=expected")
 	for x := 0; x < 16; x++ {
@@ -95,8 +109,8 @@ func TestReferenceFrameCorrect(t *testing.T) {
 		subIdx := x / 4
 		t.Logf("  pixel(%d,48) sub=%d: refF0=%d got=%d want=%d | mc_err=%d res_should=%d res_actual=%d",
 			x, subIdx, f0pix, got, want,
-			int(got)-int(f0pix),       // how much decoded differs from pure MC prediction (MV=0)
-			int(want)-int(f0pix),       // residual the encoder intended
+			int(got)-int(f0pix),                        // how much decoded differs from pure MC prediction (MV=0)
+			int(want)-int(f0pix),                       // residual the encoder intended
 			int(got)-int(f0pix)-(int(want)-int(f0pix))) // difference between actual and intended residual
 	}
 
@@ -142,17 +156,17 @@ func TestReferenceFrameCorrect(t *testing.T) {
 	if mcRef != nil {
 		// Sub-block 0 of MB(0,3): MV=(2,-2) eighth-pixel, position (48,0)
 		mvRow, mvCol := int16(2), int16(-2)
-		srcX := 0*16 + 0*4 + int(mvCol>>3)  // = -1
-		srcY := 3*16 + 0*4 + int(mvRow>>3)  // = 48
-		xFrac := int(mvCol & 7) // = 6
-		yFrac := int(mvRow & 7) // = 2
+		srcX := 0*16 + 0*4 + int(mvCol>>3) // = -1
+		srcY := 3*16 + 0*4 + int(mvRow>>3) // = 48
+		xFrac := int(mvCol & 7)            // = 6
+		yFrac := int(mvRow & 7)            // = 2
 		t.Logf("MC sub-block 0: srcX=%d srcY=%d xFrac=%d yFrac=%d", srcX, srcY, xFrac, yFrac)
 
-		var mcOut [4*4]byte
+		var mcOut [4 * 4]byte
 		sixtapFilter(mcRef.Y, mcRef.YStride, srcX, srcY, xFrac, yFrac, mcOut[:], 4, 4, 4, mcRef.YStride, len(mcRef.Y)/mcRef.YStride)
 		t.Log("MC prediction for sub-block 0 first row:")
 		refF0 := ref[0:ySize]
-		refF1 := ref[frameSize:frameSize+ySize]
+		refF1 := ref[frameSize : frameSize+ySize]
 		for dx := 0; dx < 4; dx++ {
 			mc := int(mcOut[dx])
 			want := int(refF1[48*w+dx])
@@ -234,9 +248,13 @@ func TestReferenceFrameCorrect(t *testing.T) {
 					dec2.leftMB.nzMask, dec2.leftMB.nzY16, dec2.upMB[0].nzMask, dec2.upMB[0].nzY16)
 				// Show the token bytes at the current read position (r bytes into the buffer).
 				startByte := tp.r - 4
-				if startByte < 0 { startByte = 0 }
+				if startByte < 0 {
+					startByte = 0
+				}
 				endByte := tp.r + 8
-				if endByte > len(tp.buf) { endByte = len(tp.buf) }
+				if endByte > len(tp.buf) {
+					endByte = len(tp.buf)
+				}
 				t.Logf("  tok bytes[%d:%d]: %x", startByte, endByte, tp.buf[startByte:endByte])
 				// Print ALL Y1 block DCs.
 				var dcs [16]int16

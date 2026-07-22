@@ -1174,3 +1174,129 @@ func TestDecodeBakerMultiFrame(t *testing.T) {
 
 	t.Logf("Overall worst: frame %d with max error %d", worstFrame, worstMaxErr)
 }
+
+// TestBakerFirstDivergence finds the first inexact frame in 0..10 and its
+// first divergent macroblock, against an ffmpeg reference (local-only dump).
+func TestBakerFirstDivergence(t *testing.T) {
+	const webmPath = "../examples/videos/baker_vp8.webm"
+	const refYUV = "testdata/_baker_f0_10.yuv"
+	if _, err := os.Stat(webmPath); err != nil {
+		t.Skip("baker_vp8.webm not found")
+	}
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Skip("reference not found")
+	}
+
+	d := openTestDemuxer(t, webmPath)
+	c := NewCodec()
+	const w, h = 1280, 720
+	frameSize := w*h + 2*(w/2)*(h/2)
+
+	for i := 0; i <= 10; i++ {
+		pkt, err := d.NextPacket()
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame, err := c.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		refY := ref[i*frameSize : i*frameSize+w*h]
+		ycbcr := frame.YCbCr
+		bad := 0
+		firstMB := -1
+		for mby := 0; mby < h/16; mby++ {
+			for mbx := 0; mbx < w/16; mbx++ {
+				mx := 0
+				for j := mby * 16; j < mby*16+16; j++ {
+					for x := mbx * 16; x < mbx*16+16; x++ {
+						diff := int(ycbcr.Y[j*ycbcr.YStride+x]) - int(refY[j*w+x])
+						if diff < 0 {
+							diff = -diff
+						}
+						if diff > mx {
+							mx = diff
+						}
+					}
+				}
+				if mx > 0 {
+					bad++
+					if firstMB < 0 {
+						firstMB = mby*(w/16) + mbx
+					}
+					if bad <= 12 {
+						t.Logf("frame %d: bad MB (%d,%d) maxErr=%d", i, mbx, mby, mx)
+					}
+				}
+			}
+		}
+		if bad > 0 {
+			t.Logf("frame %d: %d bad MBs", i, bad)
+			return
+		}
+		t.Logf("frame %d: exact", i)
+	}
+}
+
+// TestBakerFirstDivergenceNoFilter is the staged variant: loop filter off on
+// both sides, isolating reconstruction from filtering.
+func TestBakerFirstDivergenceNoFilter(t *testing.T) {
+	const webmPath = "../examples/videos/baker_vp8.webm"
+	const refYUV = "testdata/_baker_f0_10_nodb.yuv"
+	if _, err := os.Stat(webmPath); err != nil {
+		t.Skip("baker_vp8.webm not found")
+	}
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Skip("reference not found")
+	}
+
+	d := openTestDemuxer(t, webmPath)
+	c := NewCodec()
+	c.dec.disableFilter = true
+	const w, h = 1280, 720
+	frameSize := w*h + 2*(w/2)*(h/2)
+
+	for i := 0; i <= 10; i++ {
+		pkt, err := d.NextPacket()
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame, err := c.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		refY := ref[i*frameSize : i*frameSize+w*h]
+		ycbcr := frame.YCbCr
+		bad := 0
+		for mby := 0; mby < h/16; mby++ {
+			for mbx := 0; mbx < w/16; mbx++ {
+				mx := 0
+				for j := mby * 16; j < mby*16+16; j++ {
+					for x := mbx * 16; x < mbx*16+16; x++ {
+						diff := int(ycbcr.Y[j*ycbcr.YStride+x]) - int(refY[j*w+x])
+						if diff < 0 {
+							diff = -diff
+						}
+						if diff > mx {
+							mx = diff
+						}
+					}
+				}
+				if mx > 0 {
+					bad++
+					if bad <= 6 {
+						t.Logf("frame %d: bad MB (%d,%d) maxErr=%d", i, mbx, mby, mx)
+					}
+				}
+			}
+		}
+		if bad > 0 {
+			t.Logf("frame %d: %d bad MBs (no filter)", i, bad)
+			return
+		}
+		t.Logf("frame %d: exact (no filter)", i)
+	}
+	t.Log("frames 0-10 exact without loop filter")
+}

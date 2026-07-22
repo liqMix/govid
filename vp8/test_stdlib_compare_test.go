@@ -59,9 +59,15 @@ func TestCompareStdlibKeyframe(t *testing.T) {
 			a := int(ourImg.Y[y*ourImg.YStride+x])
 			b := int(stdImg.Y[y*stdImg.YStride+x])
 			d := a - b
-			if d < 0 { d = -d }
-			if d > 0 { wrongY++ }
-			if d > maxY { maxY = d }
+			if d < 0 {
+				d = -d
+			}
+			if d > 0 {
+				wrongY++
+			}
+			if d > maxY {
+				maxY = d
+			}
 		}
 	}
 	t.Logf("Our vs Stdlib keyframe: Y %d/4096 wrong, max=%d", wrongY, maxY)
