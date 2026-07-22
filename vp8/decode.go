@@ -135,8 +135,11 @@ type Decoder struct {
 
 	// The eight fields below relate to the current macroblock being decoded.
 	//
-	// Segment-based adjustments.
-	segment int
+	// Segment-based adjustments. segmentMap holds each macroblock's
+	// last-assigned segment id; it persists between frames when the map is
+	// not re-coded (RFC 6386 §9.3).
+	segment    int
+	segmentMap []uint8
 	// Per-macroblock state for the macroblock immediately left of and those
 	// macroblocks immediately above the current macroblock.
 	leftMB mb
@@ -261,6 +264,7 @@ func (d *Decoder) ensureImg() {
 	d.perMBFilterParams = make([]filterParam, d.mbw*d.mbh)
 	d.upMB = make([]mb, d.mbw)
 	d.upInterMB = make([]interMB, d.mbw)
+	d.segmentMap = make([]uint8, d.mbw*d.mbh)
 }
 
 // parseSegmentHeader parses the segment header, as specified in section 9.3.
@@ -457,7 +461,11 @@ func (d *Decoder) DecodeFrame() (*image.YCbCr, error) {
 			prevAbove = d.upInterMB[mbx] // save before overwrite
 			skip := d.reconstruct(mbx, mby)
 			fs := d.lookupFilterParam()
-			fs.inner = fs.inner || !skip
+			// Per libvpx: skip_lf = mb_skip_coeff && mode != B_PRED &&
+			// mode != SPLITMV — inner edges of B_PRED and SPLITMV
+			// macroblocks are filtered even with no coefficients. Both are
+			// exactly the !usePredY16 modes.
+			fs.inner = fs.inner || !skip || !d.usePredY16
 			d.perMBFilterParams[d.mbw*mby+mbx] = fs
 		}
 	}

@@ -70,16 +70,14 @@ func (m *miniBoolDec) readUint(prob, n uint8) uint32 {
 
 func TestVerifyPartitionState(t *testing.T) {
 	// This test was written to document a suspected first-partition bool
-	// decoder desync. That theory is now disproven: the baker clip decodes
-	// bit-exact through frame 6 (a desync would corrupt everything after
-	// its first wrong bin), and the "state mismatch" below is a
-	// representation difference between the main decoder's buffered
-	// lookahead and the mini decoder's, with all decoded decisions equal.
-	// The real remaining VP8 defects are localized by
-	// TestBakerFirstDivergence (loop-filter ±1 divergence at frame 7) and
-	// TestBakerFirstDivergenceNoFilter (reconstruction divergence at frame
-	// 8 MB (44,42), NEWMV vs LAST).
-	t.Skip("obsolete: first-partition desync theory disproven; see TestBakerFirstDivergence*")
+	// decoder desync. That theory was disproven (the "state mismatch" below
+	// is a lookahead-representation difference with all decoded decisions
+	// equal), and the actual defects have since been found and fixed: the
+	// MV clamp margin (16 px, not 128 px), the skip_lf inner-edge exception
+	// for B_PRED/SPLITMV, and the stale reference-frame index in keyframe
+	// loop-filter level lookups. The decoder is now bit-exact — see
+	// TestDecodeBakerMultiFrame and the gated full-clip tests.
+	t.Skip("obsolete: premise disproven; decoder is now bit-exact (see TestBakerAllFrames)")
 
 	// Read the 64x64 interframe video's frame 1 first partition and
 	// verify our main decoder and mini decoder produce identical states.

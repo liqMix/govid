@@ -559,10 +559,12 @@ var smallMVTree = [14]int{
 
 // clampMVComp clamps a MV component to stay within frame boundaries.
 // mb is the macroblock index, mbMax is the frame dimension in macroblocks.
+// Per libvpx vp8_clamp_mv2, MVs may overshoot the frame edge by at most
+// LEFT_TOP_MARGIN / RIGHT_BOTTOM_MARGIN = 16<<3 eighth-pel units, i.e. one
+// macroblock (16 pixels) — not 128 pixels.
 func clampMVComp(mv int16, mb, mbMax int) int16 {
-	// Allow 128 pixel overshoot past frame edge (in eighth-pixel units).
-	minVal := int16(-((mb * 16) + 128) * 8)
-	maxVal := int16(((mbMax-1-mb)*16 + 128) * 8)
+	minVal := int16(-(mb*16)*8 - (16 << 3))
+	maxVal := int16(((mbMax-1-mb)*16)*8 + (16 << 3))
 	if mv < minVal {
 		return minVal
 	}

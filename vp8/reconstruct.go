@@ -399,6 +399,13 @@ func (d *Decoder) reconstruct(mbx, mby int) (skip bool) {
 		} else {
 			d.segment = int(d.fp.readUint(d.segmentHeader.prob[2], 1)) + 2
 		}
+		d.segmentMap[mby*d.mbw+mbx] = uint8(d.segment)
+	} else if d.segmentHeader.useSegment {
+		// The segment map persists between frames when it is not re-coded
+		// (RFC 6386 §9.3): each macroblock keeps its last-assigned segment.
+		d.segment = int(d.segmentMap[mby*d.mbw+mbx])
+	} else {
+		d.segment = 0
 	}
 	if d.useSkipProb {
 		skip = d.fp.readBit(d.skipProb)
@@ -409,6 +416,10 @@ func (d *Decoder) reconstruct(mbx, mby int) (skip bool) {
 	}
 
 	if d.frameHeader.KeyFrame {
+		// Keyframe macroblocks are all intra: reset the per-MB reference so
+		// the loop filter level lookup uses the INTRA row rather than a
+		// stale reference from the previous inter frame.
+		d.curRefFrame = 0
 		return d.reconstructKeyframe(mbx, mby, skip)
 	}
 	return d.reconstructInterframe(mbx, mby, skip)
@@ -455,6 +466,9 @@ func (d *Decoder) reconstructInterframe(mbx, mby int, skip bool) bool {
 		// Inter MB: motion compensation + residuals.
 		d.prepareYBR(mbx, mby)
 		d.motionCompensateMB(mbx, mby)
+		if DebugInterRecon != nil {
+			DebugInterRecon(mbx, mby, 0, &d.ybr)
+		}
 		// SPLITMV uses per-4x4 prediction (no Y2/WHT block); all other inter
 		// modes use 16x16 prediction (Y2/WHT block for DC coefficients).
 		d.usePredY16 = d.curMode != interModeSPLITMV
@@ -466,6 +480,9 @@ func (d *Decoder) reconstructInterframe(mbx, mby int, skip bool) bool {
 			d.clearResidualState(mbx)
 		}
 		d.applyInterResiduals(mbx, mby)
+		if DebugInterRecon != nil {
+			DebugInterRecon(mbx, mby, 1, &d.ybr)
+		}
 	}
 
 	d.copyMBToImg(mbx, mby)
@@ -529,3 +546,7 @@ func (d *Decoder) applyInterResiduals(mbx, mby int) {
 		d.inverseDCT8DCOnly(ybrRY, ybrRX, rCoeffBase)
 	}
 }
+
+// DebugInterRecon, if non-nil, receives the ybr workspace of each inter MB
+// at stage 0 (after motion compensation) and stage 1 (after residuals).
+var DebugInterRecon func(mbx, mby, stage int, ybr *[1 + 16 + 1 + 8][32]uint8)

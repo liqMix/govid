@@ -227,6 +227,54 @@ order, which is what makes them lineable against POC-derived frame indices.
 
 ---
 
+## Part 1b: VP8 Lessons Learned
+
+Three small bugs kept VP8 drifting for multiple sessions, all hidden behind
+a wrong theory ("first-partition bitstream desync") that was finally
+disproven by evidence: frames 0-6 decoded bit-exact with and without the
+loop filter, which no desync would allow.
+
+**Bug 1:** `clampMVComp` allowed MVs to overshoot the frame edge by 128
+*pixels*; libvpx's margin is `16 << 3` = 128 *eighth-pel units* = 16 pixels
+(one macroblock).
+
+- **Ref:** libvpx `vp8_clamp_mv2`, `LEFT_TOP_MARGIN`
+- **Symptom:** One macroblock wrong per ~8 frames — only when a neighbor MV
+  was large enough that the (missing) clamp should have altered `best_mv`
+  before a NEWMV delta was added. No bitstream desync, because `best_mv` is
+  a silently derived value that consumes no bins.
+- **Discovery:** With the prediction/residual separated (a debug hook
+  captured ybr after MC and after residuals), the decoded residual was
+  cleanly DC-blocky (proving the token decode right) while `ref8 − pred`
+  was smooth (proving the prediction wrong). An exhaustive MV-space search
+  for `sixtap(ref7, mv) + ourResidual == ref8` found a 3x3 cluster of exact
+  matches around the true MV; working backwards through `mv = best_mv +
+  delta` gave the true `best_mv` = exactly the correctly-clamped value.
+
+**Bug 2:** Inner-edge loop filtering was skipped for all no-coefficient
+macroblocks; libvpx's rule is `skip_lf = mb_skip_coeff && mode != B_PRED &&
+mode != SPLITMV` — B_PRED and SPLITMV MBs always filter their inner edges.
+(Both are exactly the `!usePredY16` modes in this decoder.)
+
+- **Ref:** libvpx `vp8_loop_filter_frame` (`skip_lf`)
+- **Symptom:** ±1 errors at scattered SPLITMV/intra-4x4 macroblocks, first
+  appearing at baker frame 7, while the no-filter decode stayed exact.
+
+**Bug 3:** The loop-filter level lookup uses the per-MB reference frame,
+but keyframe macroblocks never set it — a mid-stream keyframe filtered
+every MB with the previous inter frame's stale reference row (inter deltas)
+instead of the INTRA row. The stream-opening keyframe worked only because
+the field zero-initializes.
+
+- **Symptom:** Widespread small errors (±4, ~60% of MBs) on mid-stream
+  keyframes with LF deltas enabled; the opening keyframe was exact.
+
+Also fixed while verifying: segment-map persistence across frames when the
+map is not re-coded (RFC 6386 §9.3 — previously only a scalar), the
+golden/altref buffer-copy order (altref copy first, per libvpx
+`swap_frame_buffers`), and invisible-frame handling (`show_frame=0`
+auto-alt-ref frames decode but return no display frame).
+
 ## Part 2: Generalized Codec Verification Playbook
 
 ### 1. Reference Frame Generation

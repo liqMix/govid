@@ -14,7 +14,7 @@ Pure-Go, codec-agnostic video decoding and playback library — no cgo, no ffmpe
 | `mpeg1/` | Thin wrapper over [`gen2brain/mpeg`](https://github.com/gen2brain/mpeg) | **Working** — third-party decoder, matches ffmpeg to ±3 |
 | `mp4/`, `webm/` | Container demuxers (mp4ff / ebml-go) | **Working** for the tracks listed below |
 | `player.go`, `ebitengine/` | Playback orchestration + Ebitengine bridge | **Working** |
-| `vp8/` | Fork of `golang.org/x/image/vp8` + hand-written inter-frame support | **Partial** — keyframes and early inter frames exact, then drifts |
+| `vp8/` | Fork of `golang.org/x/image/vp8` + hand-written inter-frame support (incl. loop filter, alt-ref/invisible frames) | **Working** — bit-exact vs ffmpeg on the tracked test clips |
 | `av1/` | From-scratch AV1 decoder (intra only) | **Early / not usable** — decodes structure, output is wrong |
 
 ### What "working" means here
@@ -32,16 +32,14 @@ A longer 120-frame 720p run (`TestDecodeBGMP4VsReference`) is also bit-exact, bu
 
 **MPEG-1** (`TestDecodeBakerMultiFrame`) — ~2% of luma pixels differ by at most 3, i.e. IDCT rounding differences in the upstream decoder, not structural errors.
 
-**VP8** (`TestDecodeBakerMultiFrame`) — exact through frame 5, then diverges:
+**VP8** (`TestDecodeBakerMultiFrame`, 1280x720, key + 70 inter frames) — bit-exact on every checked frame:
 
 ```
-frame  0 (key):   Y 0/921600 wrong (0.0%)  max=0
-frame  5 (inter): Y 0/921600 wrong (0.0%)  max=0
-frame 10 (inter): Y 47495/921600 (5.2%)    max=113
-frame 70 (inter): Y 767272/921600 (83.3%)  max=116
+frame  0 (key):   Y 0/921600 wrong (0.0%) max=0 | Cb 0/230400 max=0 | Cr 0/230400 max=0
+frame 70 (inter): Y 0/921600 wrong (0.0%) max=0 | Cb 0/230400 max=0 | Cr 0/230400 max=0
 ```
 
-The old "first-partition bitstream desync" theory is disproven (frames 0-6 are bit-exact, which a desync would not allow). The real defects are localized by two gated diagnostic tests: a loop-filter divergence starting at frame 7 (9 macroblocks, ±1 — the pixel filter kernels match libvpx, so the fault is in the filter level/threshold derivation), and an independent reconstruction divergence at frame 8 MB (44,42) (a NEWMV macroblock whose near-MV derivation matches libvpx, error pattern consistent with a slightly-off prediction). See `TestBakerFirstDivergence` / `TestBakerFirstDivergenceNoFilter`.
+Gated local-fixture tests additionally verify the full 71-frame clip and two 120-frame 720p real-content clips (single-pass with a mid-stream keyframe and LF deltas, and a two-pass encode with invisible auto-alt-ref frames), all bit-exact.
 
 **AV1** (`TestDecodeBakerMultiframe`) — headers, OBUs, the symbol decoder, and block structure parse, but reconstruction is wrong: ~99.5% of luma pixels differ with a mean absolute error around 44–75. Multiple bugs appear to compensate for each other, so fixing them one at a time has repeatedly made the error worse. Do not use this package.
 
@@ -225,7 +223,11 @@ player.UpdateToTime(1 * time.Second)
 
 ### VP8 in WebM
 
-Works for keyframe-only content; long inter-frame sequences currently drift (see Status).
+Bit-exact against ffmpeg on the tracked clips, including inter frames, the loop filter, and invisible auto-alt-ref frames. Encode with libvpx defaults:
+
+```bash
+ffmpeg -i input.mov -c:v libvpx -crf 20 -b:v 4M -pix_fmt yuv420p out.webm
+```
 
 ```go
 f, _ := os.Open("video.webm")
@@ -300,7 +302,6 @@ Test fixtures under each package's `testdata/` (short clips plus ffmpeg-generate
 
 ## Roadmap
 
-- Fix the VP8 first-partition desync so inter frames stop drifting
 - Get AV1 intra reconstruction correct before adding inter prediction
 - H.264 leftovers if ever needed: temporal direct mode, long-term references, interlaced coding
 

@@ -28,6 +28,11 @@ func (c *Codec) Decode(pkt govid.Packet) (*govid.Frame, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !fh.ShowFrame {
+		// Invisible frame (e.g. an auto-alt-ref): it updates the reference
+		// buffers but is not displayed.
+		return nil, nil
+	}
 	// Deep copy — decoder reuses the buffer.
 	ycbcr := deepCopyYCbCr(img)
 	return &govid.Frame{

@@ -14,22 +14,23 @@ func (d *Decoder) updateReferenceFrames() {
 		return
 	}
 
-	// Inter-frame reference update order is critical.
-	// 1. Apply copy directives for non-refreshed buffers.
-	if !d.refreshGolden {
-		switch d.copyGolden {
-		case 1: // copy last
-			d.refFrame[2] = deepCopyYCbCr(d.refFrame[1])
-		case 2: // copy altref
-			d.refFrame[2] = deepCopyYCbCr(d.refFrame[3])
-		}
-	}
+	// Inter-frame reference update order is critical, and matches libvpx
+	// swap_frame_buffers: the altref copy happens first, and a subsequent
+	// golden-from-altref copy sees the already-updated altref.
 	if !d.refreshAltRef {
 		switch d.copyAltRef {
 		case 1: // copy last
 			d.refFrame[3] = deepCopyYCbCr(d.refFrame[1])
 		case 2: // copy golden
 			d.refFrame[3] = deepCopyYCbCr(d.refFrame[2])
+		}
+	}
+	if !d.refreshGolden {
+		switch d.copyGolden {
+		case 1: // copy last
+			d.refFrame[2] = deepCopyYCbCr(d.refFrame[1])
+		case 2: // copy altref
+			d.refFrame[2] = deepCopyYCbCr(d.refFrame[3])
 		}
 	}
 	// 2. Refresh from current decoded frame.

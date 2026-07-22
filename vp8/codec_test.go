@@ -1161,9 +1161,10 @@ func TestDecodeBakerMultiFrame(t *testing.T) {
 				worstFrame = decoded
 			}
 
-			if decoded == 0 && (yStats.maxError > 2 || cbStats.maxError > 2 || crStats.maxError > 2) {
-				t.Errorf("keyframe (frame 0) exceeds threshold (Y max=%d, Cb max=%d, Cr max=%d)",
-					yStats.maxError, cbStats.maxError, crStats.maxError)
+			if yStats.wrongPixels > 0 || cbStats.wrongPixels > 0 || crStats.wrongPixels > 0 {
+				t.Errorf("frame %d: not bit-exact (Y %d wrong max=%d, Cb %d max=%d, Cr %d max=%d)",
+					decoded, yStats.wrongPixels, yStats.maxError,
+					cbStats.wrongPixels, cbStats.maxError, crStats.wrongPixels, crStats.maxError)
 			}
 
 			refIdx++
@@ -1299,4 +1300,188 @@ func TestBakerFirstDivergenceNoFilter(t *testing.T) {
 		t.Logf("frame %d: exact (no filter)", i)
 	}
 	t.Log("frames 0-10 exact without loop filter")
+}
+
+// TestBakerAllFramesNoFilter decodes the entire clip with the loop filter
+// off and reports the first inexact frame, if any.
+func TestBakerAllFramesNoFilter(t *testing.T) {
+	const webmPath = "../examples/videos/baker_vp8.webm"
+	const refYUV = "testdata/_baker_all_nodb.yuv"
+	if _, err := os.Stat(webmPath); err != nil {
+		t.Skip("baker_vp8.webm not found")
+	}
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Skip("reference not found")
+	}
+	d := openTestDemuxer(t, webmPath)
+	c := NewCodec()
+	c.dec.disableFilter = true
+	const w, h = 1280, 720
+	frameSize := w*h + 2*(w/2)*(h/2)
+	nFrames := len(ref) / frameSize
+
+	for i := 0; i < nFrames; i++ {
+		pkt, err := d.NextPacket()
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		frame, err := c.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		refY := ref[i*frameSize : i*frameSize+w*h]
+		ycbcr := frame.YCbCr
+		bad := 0
+		for j := 0; j < h && bad == 0; j++ {
+			for x := 0; x < w; x++ {
+				if ycbcr.Y[j*ycbcr.YStride+x] != refY[j*w+x] {
+					bad++
+					break
+				}
+			}
+		}
+		if bad > 0 {
+			t.Fatalf("frame %d: first inexact frame (no filter)", i)
+		}
+	}
+	t.Logf("all %d frames bit-exact without loop filter", nFrames)
+}
+
+// TestBakerAllFrames decodes the entire clip (loop filter on) and requires
+// bit-exactness against the ffmpeg reference on every frame.
+func TestBakerAllFrames(t *testing.T) {
+	const webmPath = "../examples/videos/baker_vp8.webm"
+	const refYUV = "testdata/_baker_all.yuv"
+	if _, err := os.Stat(webmPath); err != nil {
+		t.Skip("baker_vp8.webm not found")
+	}
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Skip("reference not found")
+	}
+	d := openTestDemuxer(t, webmPath)
+	c := NewCodec()
+	const w, h = 1280, 720
+	frameSize := w*h + 2*(w/2)*(h/2)
+	nFrames := len(ref) / frameSize
+
+	for i := 0; i < nFrames; i++ {
+		pkt, err := d.NextPacket()
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		frame, err := c.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		ycbcr := frame.YCbCr
+		refOff := i * frameSize
+		for j := 0; j < h; j++ {
+			for x := 0; x < w; x++ {
+				if ycbcr.Y[j*ycbcr.YStride+x] != ref[refOff+j*w+x] {
+					t.Fatalf("frame %d: Y mismatch at (%d,%d)", i, x, j)
+				}
+			}
+		}
+		cw, ch := w/2, h/2
+		for j := 0; j < ch; j++ {
+			for x := 0; x < cw; x++ {
+				if ycbcr.Cb[j*ycbcr.CStride+x] != ref[refOff+w*h+j*cw+x] {
+					t.Fatalf("frame %d: Cb mismatch at (%d,%d)", i, x, j)
+				}
+				if ycbcr.Cr[j*ycbcr.CStride+x] != ref[refOff+w*h+cw*ch+j*cw+x] {
+					t.Fatalf("frame %d: Cr mismatch at (%d,%d)", i, x, j)
+				}
+			}
+		}
+	}
+	t.Logf("all %d frames bit-exact (loop filter on)", nFrames)
+}
+
+// TestDecodeBGVP8VsReference decodes a real-content 720p VP8 clip (libvpx
+// defaults) and requires bit-exactness over 120 frames. Local-only files
+// (gitignored); regenerate from the repo root:
+//
+//	ffmpeg -i examples/videos/bg.mpg -vf scale=1280:720 -r 30 -c:v libvpx \
+//	  -crf 20 -b:v 4M -frames:v 120 -pix_fmt yuv420p -an examples/videos/bg_vp8.webm
+//	ffmpeg -i examples/videos/bg_vp8.webm -f rawvideo vp8/testdata/_bg_vp8_frames.yuv
+func TestDecodeBGVP8VsReference(t *testing.T) {
+	const webmPath = "../examples/videos/bg_vp8.webm"
+	const refYUV = "testdata/_bg_vp8_frames.yuv"
+	if _, err := os.Stat(webmPath); err != nil {
+		t.Skip("bg_vp8.webm not found")
+	}
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Skip("reference not found")
+	}
+	d := openTestDemuxer(t, webmPath)
+	c := NewCodec()
+	const w, h = 1280, 720
+	frameSize := w*h + 2*(w/2)*(h/2)
+	nFrames := len(ref) / frameSize
+
+	for i := 0; i < nFrames; i++ {
+		pkt, err := d.NextPacket()
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		frame, err := c.Decode(pkt)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		ycbcr := frame.YCbCr
+		refOff := i * frameSize
+		for j := 0; j < h; j++ {
+			for x := 0; x < w; x++ {
+				if ycbcr.Y[j*ycbcr.YStride+x] != ref[refOff+j*w+x] {
+					t.Fatalf("frame %d: Y mismatch at (%d,%d)", i, x, j)
+				}
+			}
+		}
+	}
+	t.Logf("all %d frames bit-exact", nFrames)
+}
+
+// TestDecodeBGVP8AltRef decodes a stream encoded with auto-alt-ref
+// (invisible altref frames) and requires bit-exactness on visible frames.
+func TestDecodeBGVP8AltRef(t *testing.T) {
+	const webmPath = "../examples/videos/bg_vp8_altref.webm"
+	const refYUV = "testdata/_bg_vp8_altref.yuv"
+	if _, err := os.Stat(webmPath); err != nil {
+		t.Skip("bg_vp8_altref.webm not found")
+	}
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Skip("reference not found")
+	}
+	d := openTestDemuxer(t, webmPath)
+	c := NewCodec()
+	const w, h = 1280, 720
+	frameSize := w*h + 2*(w/2)*(h/2)
+	nFrames := len(ref) / frameSize
+
+	for i := 0; i < nFrames; i++ {
+		var frame *govid.Frame
+		for frame == nil {
+			pkt, err := d.NextPacket()
+			if err != nil {
+				t.Fatalf("visible frame %d: %v", i, err)
+			}
+			frame, err = c.Decode(pkt)
+			if err != nil {
+				t.Fatalf("frame %d: %v", i, err)
+			}
+		}
+		refY := ref[i*frameSize : i*frameSize+w*h]
+		for j := 0; j < h; j++ {
+			for x := 0; x < w; x++ {
+				if frame.YCbCr.Y[j*frame.YCbCr.YStride+x] != refY[j*w+x] {
+					t.Fatalf("frame %d: Y mismatch at (%d,%d)", i, x, j)
+				}
+			}
+		}
+	}
+	t.Logf("all %d visible frames bit-exact", nFrames)
 }
