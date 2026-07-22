@@ -2,13 +2,13 @@
 //
 // Usage: go run . [file-or-dir]
 //
-// Starts with a built-in file browser (no video is loaded by default).
-// Opening a file builds a playlist from its directory so left/right cycle
-// through neighboring videos. Pass a file to open it immediately, or a
-// directory to start the browser there.
+// No video is loaded by default — use the toolbar's Open button (or press O)
+// to pick a file with the OS file dialog. Opening a file builds a playlist
+// from its directory so left/right cycle through neighboring videos. Pass a
+// file to open it immediately, or a directory to start the picker there.
 //
-// Keys: O file browser, Space play/pause, [ ] seek, arrows prev/next,
-// A aspect mode (Fit / Stretch / 1:1), L loop, F1 help.
+// Keys: O open, Space play/pause, [ ] seek, arrows prev/next,
+// A aspect mode (Fit / Stretch / 1:1), L loop, F fullscreen, F1 help.
 package main
 
 import (
@@ -35,6 +35,7 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	etext "github.com/hajimehoshi/ebiten/v2/text/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
+	"github.com/ncruces/zenity"
 	"golang.org/x/image/font/gofont/goregular"
 )
 
@@ -43,6 +44,8 @@ const (
 	wheelSeekDelta = 2 * time.Second
 	hudShowTicks   = 180 // ~3s at 60 TPS
 	hudHeight      = 100
+	toolbarHeight  = 32
+	toolbarPad     = 10
 	progressHeight = 16
 	hudPad         = 8
 	primaryFontSz  = 20.0
@@ -53,7 +56,6 @@ const (
 	btnHeight      = 28
 	btnGap         = 6
 	btnCount       = 5 // |<  <<  >/||  >>  >|
-	browserRowH    = 24
 	initialWinW    = 960
 	initialWinH    = 540
 )
@@ -198,64 +200,19 @@ func (m viewMode) String() string {
 	}
 }
 
-// browserEntry is one row of the file browser.
-type browserEntry struct {
-	name  string
-	path  string
-	isDir bool
-}
+// Toolbar button identifiers.
+const (
+	tbOpen = iota
+	tbAspect
+	tbLoop
+	tbFullscreen
+	tbHelp
+)
 
-type browser struct {
-	visible bool
-	dir     string
-	entries []browserEntry
-	sel     int
-	scroll  int
-	errMsg  string
-
-	// Double-click detection.
-	lastClickTick int
-	lastClickRow  int
-}
-
-func (b *browser) open(dir string) {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		abs = dir
-	}
-	ents, err := os.ReadDir(abs)
-	if err != nil {
-		b.errMsg = err.Error()
-		b.visible = true
-		return
-	}
-	b.dir = abs
-	b.errMsg = ""
-	b.entries = b.entries[:0]
-	if parent := filepath.Dir(abs); parent != abs {
-		b.entries = append(b.entries, browserEntry{name: "..", path: parent, isDir: true})
-	}
-	var dirs, files []browserEntry
-	for _, e := range ents {
-		name := e.Name()
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-		if e.IsDir() {
-			dirs = append(dirs, browserEntry{name: name + string(filepath.Separator), path: filepath.Join(abs, name), isDir: true})
-		} else if supportedExts[strings.ToLower(filepath.Ext(name))] {
-			files = append(files, browserEntry{name: name, path: filepath.Join(abs, name)})
-		}
-	}
-	less := func(s []browserEntry) func(i, j int) bool {
-		return func(i, j int) bool { return strings.ToLower(s[i].name) < strings.ToLower(s[j].name) }
-	}
-	sort.Slice(dirs, less(dirs))
-	sort.Slice(files, less(files))
-	b.entries = append(append(b.entries, dirs...), files...)
-	b.sel = 0
-	b.scroll = 0
-	b.visible = true
+type tbButton struct {
+	id     int
+	label  string
+	x0, x1 int
 }
 
 type Game struct {
@@ -265,7 +222,16 @@ type Game struct {
 	closers []io.Closer
 	looping bool
 	view    viewMode
-	browser browser
+
+	// OS file picker state: pickerOpen guards against double-launch; the
+	// dialog runs on its own goroutine and delivers through pickerCh.
+	pickerOpen bool
+	pickerCh   chan string
+	pickerDir  string
+
+	// statusMsg shows transient errors (e.g. a file that failed to open).
+	statusMsg   string
+	statusTimer int
 
 	hudVisible bool
 	hudTimer   int
@@ -291,12 +257,42 @@ type Game struct {
 	secondFace  *etext.GoTextFace
 }
 
+func (g *Game) setStatus(msg string) {
+	g.statusMsg = msg
+	g.statusTimer = hudShowTicks * 2
+	g.showHUD()
+}
+
+// openPicker launches the OS file dialog on a background goroutine so the
+// game loop keeps running while it is up.
+func (g *Game) openPicker() {
+	if g.pickerOpen {
+		return
+	}
+	g.pickerOpen = true
+	dir := g.pickerDir
+	go func() {
+		opts := []zenity.Option{
+			zenity.Title("Open video"),
+			zenity.FileFilter{Name: "Videos", Patterns: []string{"*.mp4", "*.webm", "*.mpg", "*.mpeg"}, CaseFold: true},
+		}
+		if dir != "" {
+			opts = append(opts, zenity.Filename(dir+string(filepath.Separator)))
+		}
+		path, err := zenity.SelectFile(opts...)
+		if err != nil {
+			path = "" // canceled or dialog unavailable
+		}
+		g.pickerCh <- path
+	}()
+}
+
 // openFile loads path, replaces the current video, and rebuilds the playlist
 // from the file's directory.
 func (g *Game) openFile(path string) {
 	video, closers, err := loadVideo(path)
 	if err != nil {
-		g.browser.errMsg = err.Error()
+		g.setStatus(err.Error())
 		return
 	}
 	for _, c := range g.closers {
@@ -306,6 +302,7 @@ func (g *Game) openFile(path string) {
 	g.closers = closers
 	g.looping = false
 	dir := filepath.Dir(path)
+	g.pickerDir = dir
 	g.paths = discoverVideos(dir)
 	g.index = 0
 	for i, p := range g.paths {
@@ -314,7 +311,7 @@ func (g *Game) openFile(path string) {
 			break
 		}
 	}
-	g.browser.visible = false
+	g.statusMsg = ""
 	g.showHUD()
 	ebiten.SetWindowTitle(fmt.Sprintf("govid — %s", filepath.Base(path)))
 }
@@ -362,6 +359,76 @@ func togglePlayPause(player *govid.Player) {
 
 func (g *Game) hudYOffset() int {
 	return int(float64(hudHeight) * (1.0 - g.hudSlide))
+}
+
+// toolbarYOffset slides the toolbar up and out of view with the HUD; with no
+// video loaded it stays pinned.
+func (g *Game) toolbarYOffset() int {
+	if g.video == nil {
+		return 0
+	}
+	return -int(float64(toolbarHeight) * (1.0 - g.hudSlide))
+}
+
+// toolbarButtons lays out the toolbar buttons with widths measured from the
+// current labels.
+func (g *Game) toolbarButtons() []tbButton {
+	loopLabel := "Loop: Off"
+	if g.looping {
+		loopLabel = "Loop: On"
+	}
+	fsLabel := "Fullscreen"
+	if ebiten.IsFullscreen() {
+		fsLabel = "Windowed"
+	}
+	defs := []tbButton{
+		{id: tbOpen, label: "Open…"},
+		{id: tbAspect, label: fmt.Sprintf("Aspect: %s", g.view)},
+		{id: tbLoop, label: loopLabel},
+		{id: tbFullscreen, label: fsLabel},
+		{id: tbHelp, label: "Help"},
+	}
+	x := toolbarPad
+	for i := range defs {
+		w, _ := etext.Measure(defs[i].label, g.secondFace, 0)
+		defs[i].x0 = x
+		defs[i].x1 = x + int(w) + 2*toolbarPad
+		x = defs[i].x1 + btnGap
+	}
+	return defs
+}
+
+// hitToolbar returns the toolbar button id under (mx,my), or -1.
+func (g *Game) hitToolbar(mx, my int) int {
+	top := g.toolbarYOffset()
+	if my < top || my >= top+toolbarHeight {
+		return -1
+	}
+	for _, b := range g.toolbarButtons() {
+		if mx >= b.x0 && mx < b.x1 {
+			return b.id
+		}
+	}
+	return -1
+}
+
+func (g *Game) toolbarAction(id int) {
+	switch id {
+	case tbOpen:
+		g.openPicker()
+	case tbAspect:
+		g.view = (g.view + 1) % viewModeCount
+	case tbLoop:
+		if g.video != nil {
+			g.looping = !g.looping
+			g.video.Player().SetLoop(g.looping)
+		}
+	case tbFullscreen:
+		ebiten.SetFullscreen(!ebiten.IsFullscreen())
+	case tbHelp:
+		g.helpVisible = !g.helpVisible
+	}
+	g.showHUD()
 }
 
 // progressBarRect returns the progress bar bounds in logical coordinates.
@@ -418,139 +485,29 @@ func (g *Game) seekToClickPosition(mx, sw int, player *govid.Player) {
 }
 
 func (g *Game) updateCursorShape(mx, my, sw, sh int) {
-	if g.hitTestProgressBar(mx, my, sw, sh) || g.hitTestButton(mx, my, sw, sh) >= 0 {
+	hot := g.hitToolbar(mx, my) >= 0
+	if g.video != nil {
+		hot = hot || g.hitTestProgressBar(mx, my, sw, sh) || g.hitTestButton(mx, my, sw, sh) >= 0
+	}
+	if hot {
 		ebiten.SetCursorShape(ebiten.CursorShapePointer)
 	} else {
 		ebiten.SetCursorShape(ebiten.CursorShapeDefault)
 	}
 }
 
-// browserPanelRect returns the browser panel bounds.
-func (g *Game) browserPanelRect() (x0, y0, x1, y1 int) {
-	sw, sh := g.screenW, g.screenH
-	mx := sw / 12
-	my := sh / 12
-	return mx, my, sw - mx, sh - my
-}
-
-// browserListRect returns the row-list area inside the panel.
-func (g *Game) browserListRect() (x0, y0, x1, y1 int) {
-	px0, py0, px1, py1 := g.browserPanelRect()
-	return px0 + 8, py0 + 40, px1 - 8, py1 - 32
-}
-
-func (g *Game) browserVisibleRows() int {
-	_, y0, _, y1 := g.browserListRect()
-	n := (y1 - y0) / browserRowH
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
-func (g *Game) browserEnsureVisible() {
-	rows := g.browserVisibleRows()
-	if g.browser.sel < g.browser.scroll {
-		g.browser.scroll = g.browser.sel
-	}
-	if g.browser.sel >= g.browser.scroll+rows {
-		g.browser.scroll = g.browser.sel - rows + 1
-	}
-	if g.browser.scroll < 0 {
-		g.browser.scroll = 0
-	}
-}
-
-func (g *Game) browserActivate(idx int) {
-	if idx < 0 || idx >= len(g.browser.entries) {
-		return
-	}
-	e := g.browser.entries[idx]
-	if e.isDir {
-		g.browser.open(e.path)
-	} else {
-		g.openFile(e.path)
-	}
-}
-
-func (g *Game) updateBrowser() {
-	b := &g.browser
-
-	// Close (only when something is already playing behind it).
-	if g.video != nil &&
-		(inpututil.IsKeyJustPressed(ebiten.KeyEscape) || inpututil.IsKeyJustPressed(ebiten.KeyO)) {
-		b.visible = false
-		return
-	}
-
-	if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && b.sel > 0 {
-		b.sel--
-		g.browserEnsureVisible()
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) && b.sel < len(b.entries)-1 {
-		b.sel++
-		g.browserEnsureVisible()
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyPageUp) {
-		b.sel -= g.browserVisibleRows()
-		if b.sel < 0 {
-			b.sel = 0
-		}
-		g.browserEnsureVisible()
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyPageDown) {
-		b.sel += g.browserVisibleRows()
-		if b.sel > len(b.entries)-1 {
-			b.sel = len(b.entries) - 1
-		}
-		g.browserEnsureVisible()
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
-		g.browserActivate(b.sel)
-		return
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
-		if parent := filepath.Dir(b.dir); parent != b.dir {
-			b.open(parent)
-		}
-		return
-	}
-
-	// Mouse: wheel scrolls, click selects, double-click opens.
-	if _, yoff := ebiten.Wheel(); yoff != 0 {
-		b.scroll -= int(yoff)
-		maxScroll := len(b.entries) - g.browserVisibleRows()
-		if maxScroll < 0 {
-			maxScroll = 0
-		}
-		if b.scroll > maxScroll {
-			b.scroll = maxScroll
-		}
-		if b.scroll < 0 {
-			b.scroll = 0
-		}
-	}
-	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
-		mx, my := ebiten.CursorPosition()
-		x0, y0, x1, _ := g.browserListRect()
-		if mx >= x0 && mx < x1 && my >= y0 {
-			row := b.scroll + (my-y0)/browserRowH
-			if row >= 0 && row < len(b.entries) && (my-y0)/browserRowH < g.browserVisibleRows() {
-				if b.lastClickRow == row && g.tickCount-b.lastClickTick <= dblClickTicks {
-					g.browserActivate(row)
-					b.lastClickTick = 0
-				} else {
-					b.sel = row
-					b.lastClickRow = row
-					b.lastClickTick = g.tickCount
-				}
-			}
-		}
-	}
-}
-
 func (g *Game) Update() error {
 	g.tickCount++
+
+	// Deliver a finished file-picker result.
+	select {
+	case path := <-g.pickerCh:
+		g.pickerOpen = false
+		if path != "" {
+			g.openFile(path)
+		}
+	default:
+	}
 
 	// F1 toggles help overlay.
 	if inpututil.IsKeyJustPressed(ebiten.KeyF1) {
@@ -566,34 +523,15 @@ func (g *Game) Update() error {
 		return nil
 	}
 
-	// With nothing loaded the browser is the whole UI.
-	if g.video == nil {
-		g.browser.visible = true
-	}
-	if g.browser.visible {
-		g.updateBrowser()
-		if g.video != nil {
-			g.video.Update()
-		}
-		return nil
-	}
-
-	// O opens the file browser at the playlist directory.
+	// O opens the OS file picker.
 	if inpututil.IsKeyJustPressed(ebiten.KeyO) {
-		dir := "."
-		if len(g.paths) > 0 {
-			dir = filepath.Dir(g.paths[g.index])
-		}
-		g.browser.open(dir)
-		return nil
+		g.openPicker()
 	}
 
-	// Any key press shows the HUD.
+	// Any key press or mouse movement shows the HUD.
 	if len(inpututil.AppendJustPressedKeys(nil)) > 0 {
 		g.showHUD()
 	}
-
-	// Mouse movement shows HUD.
 	mx, my := ebiten.CursorPosition()
 	if mx != g.lastMouseX || my != g.lastMouseY {
 		g.showHUD()
@@ -608,6 +546,12 @@ func (g *Game) Update() error {
 		g.hudTimer--
 		if g.hudTimer == 0 {
 			g.hudVisible = false
+		}
+	}
+	if g.statusTimer > 0 {
+		g.statusTimer--
+		if g.statusTimer == 0 {
+			g.statusMsg = ""
 		}
 	}
 
@@ -628,10 +572,32 @@ func (g *Game) Update() error {
 		}
 	}
 
+	// Toolbar clicks are handled before anything else and consume the click.
+	clicked := inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft)
+	if clicked {
+		if id := g.hitToolbar(mx, my); id >= 0 {
+			g.toolbarAction(id)
+			g.lastClickTick = 0
+			clicked = false
+		}
+	}
+
+	// Aspect mode key works with or without a video.
+	if inpututil.IsKeyJustPressed(ebiten.KeyA) {
+		g.view = (g.view + 1) % viewModeCount
+	}
+	// F toggles fullscreen.
+	if inpututil.IsKeyJustPressed(ebiten.KeyF) {
+		ebiten.SetFullscreen(!ebiten.IsFullscreen())
+	}
+
+	if g.video == nil {
+		return nil
+	}
 	player := g.video.Player()
 
-	// Left-click handling.
-	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+	// Left-click handling (below the toolbar).
+	if clicked {
 		if g.lastClickTick > 0 && (g.tickCount-g.lastClickTick) <= dblClickTicks {
 			// Double-click: toggle fullscreen.
 			ebiten.SetFullscreen(!ebiten.IsFullscreen())
@@ -735,12 +701,6 @@ func (g *Game) Update() error {
 		}
 	}
 
-	// Aspect mode.
-	if inpututil.IsKeyJustPressed(ebiten.KeyA) {
-		g.view = (g.view + 1) % viewModeCount
-		g.showHUD()
-	}
-
 	// Toggle loop.
 	if inpututil.IsKeyJustPressed(ebiten.KeyL) {
 		g.looping = !g.looping
@@ -782,15 +742,58 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	screen.Fill(color.RGBA{16, 16, 16, 255})
 	if g.video != nil {
 		g.drawVideo(screen)
-		if g.hudSlide > 0 && !g.browser.visible {
+		if g.hudSlide > 0 {
 			g.drawHUD(screen)
 		}
+	} else {
+		g.drawEmptyState(screen)
 	}
-	if g.browser.visible {
-		g.drawBrowser(screen)
+	if g.video == nil || g.hudSlide > 0 {
+		g.drawToolbar(screen)
 	}
 	if g.helpVisible {
 		g.drawHelp(screen)
+	}
+}
+
+func (g *Game) drawEmptyState(screen *ebiten.Image) {
+	sw, sh := screen.Bounds().Dx(), screen.Bounds().Dy()
+	msg := "Open a video to get started  (O)"
+	tw, th := etext.Measure(msg, g.primaryFace, 0)
+	op := &etext.DrawOptions{}
+	op.GeoM.Translate((float64(sw)-tw)/2, (float64(sh)-th)/2)
+	op.ColorScale.ScaleWithColor(color.RGBA{140, 140, 140, 255})
+	etext.Draw(screen, msg, g.primaryFace, op)
+
+	if g.statusMsg != "" {
+		w, _ := etext.Measure(g.statusMsg, g.secondFace, 0)
+		op := &etext.DrawOptions{}
+		op.GeoM.Translate((float64(sw)-w)/2, (float64(sh)-th)/2+36)
+		op.ColorScale.ScaleWithColor(color.RGBA{255, 120, 120, 255})
+		etext.Draw(screen, g.statusMsg, g.secondFace, op)
+	}
+}
+
+func (g *Game) drawToolbar(screen *ebiten.Image) {
+	sw := screen.Bounds().Dx()
+	top := g.toolbarYOffset()
+	if top <= -toolbarHeight {
+		return
+	}
+
+	mx, my := ebiten.CursorPosition()
+
+	vector.FillRect(screen, 0, float32(top), float32(sw), toolbarHeight, color.RGBA{0, 0, 0, 200}, false)
+
+	for _, b := range g.toolbarButtons() {
+		hovered := my >= top && my < top+toolbarHeight && mx >= b.x0 && mx < b.x1
+		if hovered {
+			vector.FillRect(screen, float32(b.x0), float32(top+3), float32(b.x1-b.x0), toolbarHeight-6, color.RGBA{80, 80, 80, 255}, false)
+		}
+		op := &etext.DrawOptions{}
+		op.GeoM.Translate(float64(b.x0)+toolbarPad, float64(top)+8)
+		op.ColorScale.ScaleWithColor(color.RGBA{225, 225, 225, 255})
+		etext.Draw(screen, b.label, g.secondFace, op)
 	}
 }
 
@@ -808,9 +811,12 @@ func (g *Game) drawHUD(screen *ebiten.Image) {
 
 	player := g.video.Player()
 
-	filename := ""
+	leftText := ""
 	if g.index < len(g.paths) {
-		filename = filepath.Base(g.paths[g.index])
+		leftText = filepath.Base(g.paths[g.index])
+	}
+	if g.statusMsg != "" {
+		leftText = g.statusMsg
 	}
 
 	// Time info.
@@ -826,16 +832,17 @@ func (g *Game) drawHUD(screen *ebiten.Image) {
 	if g.looping {
 		loopTag = "[LOOP] "
 	}
+	rightText := fmt.Sprintf("%s%d/%d  %s/%s", loopTag, g.index+1, len(g.paths), posStr, durStr)
 
-	leftText := filename
-	rightText := fmt.Sprintf("%s[%s]  %d/%d  %s/%s",
-		loopTag, g.view, g.index+1, len(g.paths), posStr, durStr)
-
-	// Draw left text (primary face, white).
+	// Draw left text (primary face, white; red if it is an error).
 	{
+		c := color.RGBA{255, 255, 255, 255}
+		if g.statusMsg != "" {
+			c = color.RGBA{255, 120, 120, 255}
+		}
 		op := &etext.DrawOptions{}
 		op.GeoM.Translate(float64(hudPad), float64(hudTop)+8)
-		op.ColorScale.ScaleWithColor(color.White)
+		op.ColorScale.ScaleWithColor(c)
 		etext.Draw(screen, leftText, g.primaryFace, op)
 	}
 
@@ -898,70 +905,6 @@ func (g *Game) drawButtons(screen *ebiten.Image, sw, sh int) {
 	}
 }
 
-func (g *Game) drawBrowser(screen *ebiten.Image) {
-	sw, sh := screen.Bounds().Dx(), screen.Bounds().Dy()
-	px0, py0, px1, py1 := g.browserPanelRect()
-
-	// Dim the background, then the panel.
-	vector.FillRect(screen, 0, 0, float32(sw), float32(sh), color.RGBA{0, 0, 0, 140}, false)
-	vector.FillRect(screen, float32(px0), float32(py0), float32(px1-px0), float32(py1-py0), color.RGBA{28, 28, 28, 235}, false)
-
-	// Header: current directory.
-	{
-		op := &etext.DrawOptions{}
-		op.GeoM.Translate(float64(px0)+8, float64(py0)+8)
-		op.ColorScale.ScaleWithColor(color.White)
-		etext.Draw(screen, g.browser.dir, g.primaryFace, op)
-	}
-
-	// Rows.
-	lx0, ly0, lx1, _ := g.browserListRect()
-	rows := g.browserVisibleRows()
-	mx, my := ebiten.CursorPosition()
-	for i := 0; i < rows; i++ {
-		idx := g.browser.scroll + i
-		if idx >= len(g.browser.entries) {
-			break
-		}
-		e := g.browser.entries[idx]
-		ry := ly0 + i*browserRowH
-
-		hovered := mx >= lx0 && mx < lx1 && my >= ry && my < ry+browserRowH
-		if idx == g.browser.sel {
-			vector.FillRect(screen, float32(lx0), float32(ry), float32(lx1-lx0), browserRowH, color.RGBA{0, 90, 40, 255}, false)
-		} else if hovered {
-			vector.FillRect(screen, float32(lx0), float32(ry), float32(lx1-lx0), browserRowH, color.RGBA{55, 55, 55, 255}, false)
-		}
-
-		c := color.RGBA{220, 220, 220, 255}
-		if e.isDir {
-			c = color.RGBA{140, 190, 255, 255}
-		}
-		op := &etext.DrawOptions{}
-		op.GeoM.Translate(float64(lx0)+6, float64(ry)+4)
-		op.ColorScale.ScaleWithColor(c)
-		etext.Draw(screen, e.name, g.secondFace, op)
-	}
-	if len(g.browser.entries) == 0 {
-		op := &etext.DrawOptions{}
-		op.GeoM.Translate(float64(lx0)+6, float64(ly0)+4)
-		op.ColorScale.ScaleWithColor(color.RGBA{150, 150, 150, 255})
-		etext.Draw(screen, "(no videos or directories here)", g.secondFace, op)
-	}
-
-	// Footer: error or hint.
-	footer := "Enter open · Backspace up · O/Esc close · F1 help"
-	fc := color.RGBA{150, 150, 150, 255}
-	if g.browser.errMsg != "" {
-		footer = g.browser.errMsg
-		fc = color.RGBA{255, 120, 120, 255}
-	}
-	op := &etext.DrawOptions{}
-	op.GeoM.Translate(float64(px0)+8, float64(py1)-24)
-	op.ColorScale.ScaleWithColor(fc)
-	etext.Draw(screen, footer, g.secondFace, op)
-}
-
 func (g *Game) drawHelp(screen *ebiten.Image) {
 	sw, sh := screen.Bounds().Dx(), screen.Bounds().Dy()
 
@@ -969,7 +912,7 @@ func (g *Game) drawHelp(screen *ebiten.Image) {
 	vector.FillRect(screen, 0, 0, float32(sw), float32(sh), color.RGBA{0, 0, 0, 160}, false)
 
 	// Centered panel.
-	panelW, panelH := 420, 400
+	panelW, panelH := 420, 420
 	px := (sw - panelW) / 2
 	py := (sh - panelH) / 2
 	vector.FillRect(screen, float32(px), float32(py), float32(panelW), float32(panelH), color.RGBA{30, 30, 30, 220}, false)
@@ -987,12 +930,13 @@ func (g *Game) drawHelp(screen *ebiten.Image) {
 	// Keybind rows.
 	type row struct{ key, desc string }
 	rows := []row{
-		{"O", "Open file browser"},
+		{"O", "Open file (OS dialog)"},
 		{"Space", "Play / Pause"},
 		{"[ / ]", "Seek -5s / +5s"},
 		{"Left / Right", "Prev / Next in folder"},
 		{"A", "Aspect: Fit / Stretch / 1:1"},
 		{"L", "Toggle loop"},
+		{"F", "Toggle fullscreen"},
 		{"Scroll", "Seek -2s / +2s"},
 		{"Double-click", "Toggle fullscreen"},
 		{"F1 / Esc", "Close this help"},
@@ -1044,24 +988,22 @@ func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 
 func main() {
 	g := &Game{
+		pickerCh:    make(chan string, 1),
 		primaryFace: &etext.GoTextFace{Source: fontSource, Size: primaryFontSz},
 		secondFace:  &etext.GoTextFace{Source: fontSource, Size: secondFontSz},
 	}
 
-	// Optional argument: a file to open immediately, or a directory to start
-	// the browser in. With no argument the browser opens in the CWD.
-	browserDir := "."
+	// Optional argument: a file to open immediately, or a directory the file
+	// picker starts in.
 	if len(os.Args) > 1 {
 		arg := os.Args[1]
 		if st, err := os.Stat(arg); err == nil && !st.IsDir() {
 			g.openFile(arg)
-			browserDir = filepath.Dir(arg)
 		} else {
-			browserDir = arg
+			if abs, err := filepath.Abs(arg); err == nil {
+				g.pickerDir = abs
+			}
 		}
-	}
-	if g.video == nil {
-		g.browser.open(browserDir)
 	}
 
 	ebiten.SetWindowTitle("govid")
