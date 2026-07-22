@@ -2,46 +2,20 @@
 
 ### Disclaimer: This repo is written by Claude.
 
-Pure-Go, codec-agnostic video decoding and playback library — no cgo, no ffmpeg.
-
-> **Status: work in progress.** This is an in-progress project to write video decoders from the specs in Go. Some of it works well (the H.264 decoder is bit-exact against ffmpeg on the test clips); some of it is half-finished (VP8 inter frames drift); and some of it does not produce correct pictures yet at all (AV1). See the status table below before depending on any of it.
+Pure-Go, codec-agnostic video decoding and playback library — no cgo, no ffmpeg. Built for embedding video in Go applications (games in particular): decode H.264/MP4, VP8/WebM, or MPEG-1 into `image.YCbCr`/RGBA frames with playback, seeking, and looping handled for you.
 
 ## Status
 
+Every decoder is verified plane-by-plane against raw YUV dumped from ffmpeg for the same clips (`go test ./...`).
+
 | Package | What it is | State |
 |---|---|---|
-| `h264/` | From-scratch H.264 decoder (CAVLC + CABAC, I/P/B slices, High profile) — decodes default x264 output | **Working** — bit-exact vs ffmpeg on the tracked test clips |
-| `mpeg1/` | Thin wrapper over [`gen2brain/mpeg`](https://github.com/gen2brain/mpeg) | **Working** — third-party decoder, matches ffmpeg to ±3 |
-| `mp4/`, `webm/` | Container demuxers (mp4ff / ebml-go), incl. keyframe-accurate seek | **Working** for the tracks listed below |
+| `h264/` | From-scratch H.264 decoder (CAVLC + CABAC, I/P/B, High profile) | **Working** — bit-exact vs ffmpeg |
+| `vp8/` | Fork of `golang.org/x/image/vp8` + hand-written inter-frame support | **Working** — bit-exact vs ffmpeg |
+| `mpeg1/` | Thin wrapper over [`gen2brain/mpeg`](https://github.com/gen2brain/mpeg) | **Working** — matches ffmpeg to ±3 (IDCT rounding) |
+| `mp4/`, `webm/` | Container demuxers (mp4ff / ebml-go) with keyframe-accurate seek | **Working** |
 | `player.go`, `ebitengine/` | Playback orchestration + Ebitengine bridge | **Working** |
-| `vp8/` | Fork of `golang.org/x/image/vp8` + hand-written inter-frame support (incl. loop filter, alt-ref/invisible frames) | **Working** — bit-exact vs ffmpeg on the tracked test clips |
-| `av1/` | From-scratch AV1 decoder (intra only) | **Early / not usable** — decodes structure, output is wrong |
-
-### What "working" means here
-
-Every decoder is checked against raw YUV dumped from ffmpeg for the same clip, plane by plane, pixel by pixel. Current numbers, reproducible with `go test ./...`:
-
-**H.264** (`TestDecodeBakerMultiFrame`, 1280x720, IDR + 9 P-frames) — bit-exact:
-
-```
-frame 0 (IDR): Y 0/921600 wrong (0.0%) max=0 | Cb 0/230400 max=0 | Cr 0/230400 max=0
-frame 9 (P):   Y 0/921600 wrong (0.0%) max=0 | Cb 0/230400 max=0 | Cr 0/230400 max=0
-```
-
-A longer 120-frame 720p run (`TestDecodeBGMP4VsReference`) is also bit-exact, but it skips unless you supply the large source clip and reference YUV locally (both are gitignored).
-
-**MPEG-1** (`TestDecodeBakerMultiFrame`) — ~2% of luma pixels differ by at most 3, i.e. IDCT rounding differences in the upstream decoder, not structural errors.
-
-**VP8** (`TestDecodeBakerMultiFrame`, 1280x720, key + 70 inter frames) — bit-exact on every checked frame:
-
-```
-frame  0 (key):   Y 0/921600 wrong (0.0%) max=0 | Cb 0/230400 max=0 | Cr 0/230400 max=0
-frame 70 (inter): Y 0/921600 wrong (0.0%) max=0 | Cb 0/230400 max=0 | Cr 0/230400 max=0
-```
-
-Gated local-fixture tests additionally verify the full 71-frame clip and two 120-frame 720p real-content clips (single-pass with a mid-stream keyframe and LF deltas, and a two-pass encode with invisible auto-alt-ref frames), all bit-exact.
-
-**AV1** (`TestDecodeBakerMultiframe`) — headers, OBUs, the symbol decoder, and block structure parse, but reconstruction is wrong: ~99.5% of luma pixels differ with a mean absolute error around 44–75. Multiple bugs appear to compensate for each other, so fixing them one at a time has repeatedly made the error worse. Do not use this package.
+| `av1/` | From-scratch AV1 decoder | **Not usable** — parses structure, output is wrong |
 
 ## Codec / container support
 
@@ -51,56 +25,36 @@ Gated local-fixture tests additionally verify the full 71-frame clip and two 120
 | WebM (`webm/`) | `V_VP8`, `V_AV1` |
 | MPEG-PS/ES (`mpeg1/`) | MPEG-1 video (`Source` is both demuxer and codec) |
 
-H.264 decoder coverage:
+**H.264:** decodes everything x264 emits (any preset/tune, CAVLC or CABAC, B-frames/pyramid, 8x8 transform, custom scaling matrices, weighted prediction, I_PCM) plus temporal direct mode and long-term references / full MMCO, verified bit-exact against ffmpeg and JVT conformance streams. Not supported (returns an error): interlaced (field/MBAFF) coding, multiple slice groups (FMO), POC type 1, 4:2:2/4:4:4 chroma, lossless transform bypass.
 
-- **Supported:** CAVLC and CABAC entropy coding; I/SI, P, and B slices (spatial and temporal direct modes, bi-prediction with implicit and explicit weighting, B-pyramid, sub-8x8 B partitions); intra 4x4 / 8x8 / 16x16 / chroma prediction; I_PCM macroblocks (both entropy coders); the 8x8 transform (High profile); custom scaling matrices (default and explicit lists, SPS and PPS level); quarter-pel luma and bilinear chroma motion compensation; multi-reference MV prediction; reference picture list modification (short- and long-term); full MMCO adaptive marking (ops 1-6) with long-term references; explicit weighted prediction; picture-order display reordering; the deblocking filter (including 8x8-transform, B-slice, and I_PCM bS/QP rules). Everything x264 emits by default decodes bit-exact, verified against ffmpeg on 120-frame 720p real content (`TestDecodeBGDefaultMP4VsReference`) plus the committed staged fixtures; the harder-to-generate features (CABAC I_PCM, temporal direct, MMCO/long-term) are verified bit-exact against JVT conformance streams (CAPM3_Sony_D, CVPCMNL1/2_SVA_C, MR2_MW_A, MR2_TANDBERG_E — local-only fixtures, download commands in the test docs).
-- **Not supported (returns an error):** multiple slice groups (FMO), interlaced (field/MBAFF) coding, POC type 1, 4:2:2/4:4:4 chroma, and lossless transform bypass (`qpprime_y_zero_transform_bypass`).
-- **B-frame note:** with B-frames the decoder emits frames in display order with a small delay (from the stream's VUI `max_num_reorder_frames`). `Player`/`AsyncPlayer` handle this transparently, including draining the buffered tail frames at end of stream (`govid.FrameDrainer`).
+**VP8:** full decode including inter frames, loop filter, and invisible auto-alt-ref frames; encode with libvpx defaults.
 
-AV1 decoder coverage: intra frames only — there is no inter prediction, no film grain, no loop restoration.
+**AV1:** do not use; intra-only and incorrect.
+
+With B-frames, frames come out in display order after a small reorder delay; `Player`/`AsyncPlayer` handle this transparently, including draining tail frames at end of stream.
 
 ## Performance
 
-`h264/bench_decode_test.go` on 1280x720, 120 frames (this machine, one run — not a controlled benchmark):
+720p, 120 frames, single run on one machine (`h264/bench_decode_test.go`):
 
-```
-codec                               total   ms/frame        fps
-govid h264 Baseline (pure Go)      1600ms    13.33ms       75.0
-govid h264 High 8x8 CAVLC          1379ms    11.49ms       87.0
-govid h264 High CABAC              1378ms    11.48ms       87.1
-govid h264 x264 defaults (+B)      1792ms    15.19ms       65.8
-gen2brain/mpeg (MPEG-1)             104ms     0.87ms     1152.0
-```
+| codec | ms/frame | fps |
+|---|---|---|
+| govid h264 (x264 defaults, +B) | 15.2 | 66 |
+| govid h264 (High, no B) | 11.5 | 87 |
+| gen2brain/mpeg (MPEG-1) | 0.9 | 1152 |
 
-Enough for 720p30 real-time playback in a game loop; MPEG-1 is far cheaper if you control the encoding.
-
-Per second of 30 fps video that works out to ~414 ms of CPU for H.264 (~41% of one core) versus ~28 ms for MPEG-1 (~2.8%). With `NewPlayer` that cost lands on whichever goroutine calls `Update` — in a 60 TPS game loop, H.264's 13.8 ms decode eats most of the 16.7 ms tick budget on the ticks where a new frame is due. Use [`NewAsyncPlayer`](#decoding-off-the-game-thread) to move it off that goroutine.
-
-At matched quality (SSIM measured against the same 720p source), Baseline H.264 is roughly half the size of MPEG-1 — 0.945 SSIM costs ~886 KB as MPEG-1 versus ~410 KB as H.264. So: MPEG-1 buys frame budget, H.264 buys install size.
+Enough for 720p30 real-time playback. The tradeoff: MPEG-1 decodes ~15x cheaper, but at matched quality H.264 files are about half the size. H.264's per-frame cost eats most of a 60 TPS tick budget, so use `NewAsyncPlayer` to keep decoding off the game thread.
 
 ## Architecture
 
 ```
-Demuxer (container parsing)
-   │
-   ├── NextPacket() → Packet{Data, Timestamp, Keyframe}
-   │
-Codec (frame decoding)
-   │
-   ├── Decode(Packet) → *Frame
-   │
-Player (orchestration)
-   │
-   ├── Update() / UpdateToTime() / Seek() / SetLoop()
-   ├── CurrentFrame() → *Frame
-   ├── Close()  — stops the decode goroutine (async players)
-   │
-Frame
-   │
-   └── RGBA() → []byte (packed pixel data)
+Demuxer (container) ── NextPacket() → Packet
+Codec   (decoding)  ── Decode(Packet) → *Frame
+Player  (playback)  ── Update()/UpdateToTime()/Seek()/SetLoop()/CurrentFrame()
+Frame               ── YCbCr (*image.YCbCr) / RGBA() ([]byte)
 ```
 
-`Demuxer` reads compressed packets from a container. `Codec` decodes packets into frames. `Player` ties them together and manages playback state, timing, and looping. `Frame.YCbCr` is a standard `*image.YCbCr`; `Frame.RGBA()` gives raw pixel data ready for upload to a texture.
+Anything implementing the `Demuxer` and `Codec` interfaces plugs into `Player`:
 
 ```go
 type Demuxer interface {
@@ -117,8 +71,6 @@ type Codec interface {
 }
 ```
 
-Anything implementing these two interfaces plugs into `Player`.
-
 ## Installation
 
 ```bash
@@ -130,175 +82,73 @@ go get github.com/liqmix/govid
 ### H.264 in MP4 (recommended path)
 
 ```go
-package main
+f, _ := os.Open("video.mp4")
+defer f.Close()
 
-import (
-	"fmt"
-	"os"
-	"time"
+demuxer, _ := mp4.NewDemuxer(f)
+defer demuxer.Close()
 
-	govid "github.com/liqmix/govid"
-	"github.com/liqmix/govid/h264"
-	"github.com/liqmix/govid/mp4"
-)
+player, _ := govid.NewPlayer(demuxer, h264.NewCodec())
+player.Play()
+player.UpdateToTime(1 * time.Second)
 
-func main() {
-	f, err := os.Open("video.mp4")
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-
-	demuxer, err := mp4.NewDemuxer(f)
-	if err != nil {
-		panic(err)
-	}
-	defer demuxer.Close()
-
-	player, err := govid.NewPlayer(demuxer, h264.NewCodec())
-	if err != nil {
-		panic(err)
-	}
-
-	player.Play()
-	player.UpdateToTime(1 * time.Second)
-
-	frame := player.CurrentFrame()
-	fmt.Printf("Frame: %dx%d at %v\n", frame.Width, frame.Height, frame.Timestamp)
-	// frame.RGBA() returns packed RGBA pixel data
-}
+frame := player.CurrentFrame() // frame.YCbCr, frame.RGBA(), frame.Timestamp
 ```
 
-Encode input with plain x264 defaults — no special flags needed:
+Encode with plain x264 defaults (add `-bf 0` if you want zero-latency decoding):
 
 ```bash
 ffmpeg -i input.mov -c:v libx264 -pix_fmt yuv420p out.mp4
 ```
 
-On the bg test clip at matched crf, default x264 (CABAC + B-frames) is ~11% smaller than CABAC without B-frames and ~17% smaller than Baseline. If you want zero-latency decoding (no display reordering), add `-bf 0`.
-
-### Decoding off the game thread
-
-`NewPlayer` decodes inline: `Update` demuxes and decodes the next frame on the calling goroutine, so a 13.8 ms H.264 decode is 13.8 ms your game loop does not get. `NewAsyncPlayer` runs the demux+decode on a background goroutine and keeps a bounded queue of frames ready:
-
-```go
-// Keep 4 frames decoded ahead, converting to RGBA on the decode goroutine.
-player, err := govid.NewAsyncPlayer(demuxer, h264.NewCodec(), 4, govid.WithRGBA())
-if err != nil {
-	panic(err)
-}
-// Close before closing the demuxer — it returns only once the decode
-// goroutine has stopped touching it.
-defer player.Close()
-```
-
-The rest of the API is identical. The behavioral difference is what happens when the decoder falls behind: `Update` and `UpdateToTime` return `false` and leave the current frame on screen instead of blocking. A dropped tick shows a stale frame; it does not stall the loop.
-
-Details worth knowing:
-
-- **Depth** bounds both memory and latency. Each queued frame is a full YCbCr copy (~1.4 MB at 720p), and the queue applies backpressure — the decoder stops once it is full, so a paused player does not run away decoding.
-- **`Seek`, loop restart, and the initial two frames still block**, by design: you want the frame you seeked to, now. A seek waits at most one in-flight decode, because the decode goroutine holds the demuxer lock while decoding.
-- **Frames decoded before a seek are discarded**, not displayed — each frame carries a generation stamp that a seek invalidates.
-- **`Close` is required** and is safe to call twice. It stops the goroutine and waits for it to exit, which is what makes closing the demuxer or file afterwards safe. `Close` on a `NewPlayer` player is a no-op, so the two are interchangeable.
-
-`WithRGBA` moves the other per-frame cost off the consumer's goroutine. Without it, `Frame.RGBA()` runs a full YCbCr→RGBA conversion wherever you call it — on the game thread, that is ~6 ms at 1080p (`BenchmarkConvertRGBA1080p`) on top of the decode. With it, the decode goroutine converts, `Frame.HasRGBA()` reports true, and `Frame.RGBA()` is a field read; the Ebitengine bridge then does nothing but `WritePixels`. Conversion buffers are pooled and recycled as frames retire, so a long video does not allocate a frame-sized buffer per frame (~110 MB/s at 720p30). The tradeoff is a lifetime rule: **the slice returned by `Frame.RGBA()` is valid until the second frame change after the one that delivered it** — long enough for the `Update` → `Draw` pair that received it, but copy it if you intend to keep it. Calling `Frame.RGBA()` on a recycled frame stays safe; it recomputes.
-
-`examples/ebitengine/` uses this path for every format it loads.
-
-### MPEG-1
-
-`Source` implements both `Demuxer` and `Codec`, so it is passed as both arguments:
-
-```go
-f, _ := os.Open("video.mpg")
-defer f.Close()
-
-source, _ := mpeg1.NewSource(f)
-defer source.Close()
-
-player, _ := govid.NewPlayer(source, source)
-player.Play()
-player.UpdateToTime(1 * time.Second)
-```
-
 ### VP8 in WebM
 
-Bit-exact against ffmpeg on the tracked clips, including inter frames, the loop filter, and invisible auto-alt-ref frames. Encode with libvpx defaults:
+```go
+demuxer, _ := webm.NewDemuxer(f)
+player, _ := govid.NewPlayer(demuxer, vp8.NewCodec())
+```
 
 ```bash
 ffmpeg -i input.mov -c:v libvpx -crf 20 -b:v 4M -pix_fmt yuv420p out.webm
 ```
 
+### MPEG-1
+
+`Source` is both demuxer and codec:
+
 ```go
-f, _ := os.Open("video.webm")
-defer f.Close()
-
-demuxer, _ := webm.NewDemuxer(f)
-defer demuxer.Close()
-
-player, _ := govid.NewPlayer(demuxer, vp8.NewCodec())
+source, _ := mpeg1.NewSource(f)
+player, _ := govid.NewPlayer(source, source)
 ```
+
+### Decoding off the game thread
+
+`NewPlayer` decodes inline on whatever goroutine calls `Update`. `NewAsyncPlayer` decodes on a background goroutine and keeps a bounded queue of frames ready:
+
+```go
+player, _ := govid.NewAsyncPlayer(demuxer, h264.NewCodec(), 4, govid.WithRGBA())
+defer player.Close() // required; close before closing the demuxer
+```
+
+Same API, different behavior under load: if the decoder falls behind, `Update`/`UpdateToTime` return `false` and leave the current frame on screen instead of blocking. Notes:
+
+- The queue depth bounds memory (~1.4 MB per queued 720p frame) and applies backpressure — a paused player stops decoding.
+- `Seek` and loop restarts still block briefly, by design: you want the frame you seeked to. Frames decoded before a seek are discarded, never shown.
+- `WithRGBA()` performs the YCbCr→RGBA conversion (~6 ms at 1080p) on the decode goroutine too, making `Frame.RGBA()` a field read. Conversion buffers are pooled; the returned slice is valid until the second frame change after it was delivered — copy it if you keep it longer.
 
 ### Ebitengine
 
-```go
-package main
-
-import (
-	"os"
-
-	"github.com/hajimehoshi/ebiten/v2"
-	govid "github.com/liqmix/govid"
-	govidebiten "github.com/liqmix/govid/ebitengine"
-	"github.com/liqmix/govid/mpeg1"
-)
-
-type Game struct {
-	video *govidebiten.VideoImage
-}
-
-func (g *Game) Update() error {
-	g.video.Update()
-	return nil
-}
-
-func (g *Game) Draw(screen *ebiten.Image) {
-	screen.DrawImage(g.video.Image(), nil)
-}
-
-func (g *Game) Layout(_, _ int) (int, int) {
-	f := g.video.Player().CurrentFrame()
-	return f.Width, f.Height
-}
-
-func main() {
-	f, _ := os.Open(os.Args[1])
-	defer f.Close()
-
-	source, _ := mpeg1.NewSource(f)
-	defer source.Close()
-
-	player, _ := govid.NewPlayer(source, source)
-	player.Play()
-
-	game := &Game{video: govidebiten.New(player)}
-	ebiten.SetWindowTitle("govid")
-	ebiten.RunGame(game)
-}
-```
-
-Runnable examples live in [`examples/`](examples) — one per codec plus the Ebitengine bridge.
+`ebitengine/` wraps a player in a `VideoImage`: call its `Update()` in your game's `Update`, draw `Image()` in `Draw`. See [`examples/`](examples) for runnable programs, one per codec.
 
 ## Development
 
 ```bash
-go test ./...            # full suite (h264 takes ~50s)
-go test ./h264/ -v -run TestDecodeBakerMultiFrame
+go test ./...   # full suite (h264 takes ~50s)
 ```
 
-Test fixtures under each package's `testdata/` (short clips plus ffmpeg-generated raw YUV references) are committed on purpose; large local-only clips are gitignored.
+Short test fixtures with ffmpeg-generated YUV references are committed under each package's `testdata/`; large clips and conformance streams are local-only (gitignored) with regeneration commands in the test docs.
 
-[CODEC_GUIDE.md](CODEC_GUIDE.md) documents the verification methodology used here — ffmpeg reference generation, the staged testing strategy (keyframe → no-deblock → deblock → first P-frame → multi-frame drift → perfect-reference injection), diagnostic patterns, and an error-pattern-to-root-cause table. It also records every H.264 bug found and its spec reference.
+[CODEC_GUIDE.md](CODEC_GUIDE.md) documents the verification methodology — ffmpeg reference generation, staged testing, diagnostic patterns — and records every H.264/VP8 bug found with its spec reference.
 
 ## Roadmap
 
