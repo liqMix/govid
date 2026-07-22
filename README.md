@@ -12,7 +12,7 @@ Pure-Go, codec-agnostic video decoding and playback library — no cgo, no ffmpe
 |---|---|---|
 | `h264/` | From-scratch H.264 decoder (CAVLC + CABAC, I/P/B slices, High profile) — decodes default x264 output | **Working** — bit-exact vs ffmpeg on the tracked test clips |
 | `mpeg1/` | Thin wrapper over [`gen2brain/mpeg`](https://github.com/gen2brain/mpeg) | **Working** — third-party decoder, matches ffmpeg to ±3 |
-| `mp4/`, `webm/` | Container demuxers (mp4ff / ebml-go) | **Working** for the tracks listed below |
+| `mp4/`, `webm/` | Container demuxers (mp4ff / ebml-go), incl. keyframe-accurate seek | **Working** for the tracks listed below |
 | `player.go`, `ebitengine/` | Playback orchestration + Ebitengine bridge | **Working** |
 | `vp8/` | Fork of `golang.org/x/image/vp8` + hand-written inter-frame support (incl. loop filter, alt-ref/invisible frames) | **Working** — bit-exact vs ffmpeg on the tracked test clips |
 | `av1/` | From-scratch AV1 decoder (intra only) | **Early / not usable** — decodes structure, output is wrong |

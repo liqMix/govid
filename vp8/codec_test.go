@@ -1485,3 +1485,91 @@ func TestDecodeBGVP8AltRef(t *testing.T) {
 	}
 	t.Logf("all %d visible frames bit-exact", nFrames)
 }
+
+// TestPlayerVP8Loop plays VP8-in-WebM through the Player with looping on,
+// exercising the webm demuxer's Seek(0) path.
+func TestPlayerVP8Loop(t *testing.T) {
+	f, err := os.Open("testdata/interframe.webm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	d, err := webm.NewDemuxer(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	p, err := govid.NewPlayer(d, NewCodec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetLoop(true)
+	p.Play()
+
+	dur := d.Duration()
+	// Play past the end twice over; looping must wrap without error.
+	seen := map[time.Duration]bool{}
+	for ts := time.Duration(0); ts < 2*dur+time.Second; ts += 30 * time.Millisecond {
+		p.UpdateToTime(ts)
+		if fr := p.CurrentFrame(); fr != nil {
+			seen[fr.Timestamp] = true
+		}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected multiple distinct frames across loop, got %d", len(seen))
+	}
+	if p.CurrentFrame() == nil {
+		t.Fatal("nil frame after looped playback")
+	}
+}
+
+// TestBGVP8SeekMidStream seeks the real-content clip to a point after its
+// mid-stream keyframe and verifies decode-from-keyframe is bit-exact.
+func TestBGVP8SeekMidStream(t *testing.T) {
+	const webmPath = "../examples/videos/bg_vp8.webm"
+	const refYUV = "testdata/_bg_vp8_frames.yuv"
+	if _, err := os.Stat(webmPath); err != nil {
+		t.Skip("bg_vp8.webm not found")
+	}
+	ref, err := os.ReadFile(refYUV)
+	if err != nil {
+		t.Skip("reference not found")
+	}
+	d := openTestDemuxer(t, webmPath)
+	c := NewCodec()
+
+	// Seek past the frame-23 keyframe (23/30 s ≈ 766 ms).
+	ts, err := d.Seek(1 * time.Second)
+	if err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	t.Logf("seek returned %v", ts)
+
+	const w, h = 1280, 720
+	frameSize := w*h + 2*(w/2)*(h/2)
+	fps := 30.0
+	for n := 0; n < 20; n++ {
+		pkt, err := d.NextPacket()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 && !pkt.Keyframe {
+			t.Fatal("first packet after seek is not a keyframe")
+		}
+		frame, err := c.Decode(pkt)
+		if err != nil {
+			t.Fatalf("packet %d: %v", n, err)
+		}
+		idx := int(pkt.Timestamp.Seconds()*fps + 0.5)
+		refY := ref[idx*frameSize : idx*frameSize+w*h]
+		for j := 0; j < h; j++ {
+			for x := 0; x < w; x++ {
+				if frame.YCbCr.Y[j*frame.YCbCr.YStride+x] != refY[j*w+x] {
+					t.Fatalf("frame %d after seek: mismatch at (%d,%d)", idx, x, j)
+				}
+			}
+		}
+	}
+	t.Log("20 frames after mid-stream seek bit-exact")
+}

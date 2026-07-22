@@ -1,6 +1,7 @@
 package webm
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"time"
@@ -48,19 +49,27 @@ type webmRoot struct {
 // Demuxer reads video packets from a WebM container.
 // Supports VP8 (V_VP8) and AV1 (V_AV1) codecs.
 type Demuxer struct {
-	reader       mkvcore.BlockReadCloser
-	readers      []mkvcore.BlockReadCloserWithTrackEntry
-	info         govid.VideoInfo
-	duration     time.Duration
-	codecID      string
-	codecPrivate []byte
-	firstPacket  bool // true until first keyframe has been sent
-	closed       bool
+	// newView returns an independent reader over the whole stream. Each
+	// mkvcore reader stack parses in a background goroutine, so rebuilding
+	// on Seek must not share a file position with an abandoned stack.
+	newView        func() io.Reader
+	reader         mkvcore.BlockReadCloser
+	readers        []mkvcore.BlockReadCloserWithTrackEntry
+	info           govid.VideoInfo
+	duration       time.Duration
+	timestampScale uint64 // nanoseconds per timestamp tick
+	codecID        string
+	codecPrivate   []byte
+	firstPacket    bool // true until first keyframe has been sent
+	closed         bool
 }
 
 // NewDemuxer creates a WebM demuxer from a seekable reader.
 func NewDemuxer(r io.ReadSeeker) (*Demuxer, error) {
 	// First pass: parse metadata.
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
 	var root webmRoot
 	err := ebml.Unmarshal(r, &root)
 	if err != nil && err != ebml.ErrReadStopped {
@@ -101,21 +110,55 @@ func NewDemuxer(r io.ReadSeeker) (*Demuxer, error) {
 
 	dur := time.Duration(seg.Info.Duration * float64(timestampScale))
 
-	// Second pass: create block reader.
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
+	// Build the per-open independent view factory: a SectionReader when the
+	// source supports ReaderAt (files do), else a one-time in-memory copy.
+	size, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
 		return nil, err
 	}
+	var newView func() io.Reader
+	if ra, ok := r.(io.ReaderAt); ok {
+		newView = func() io.Reader { return io.NewSectionReader(ra, 0, size) }
+	} else {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		newView = func() io.Reader { return bytes.NewReader(data) }
+	}
 
-	readers, err := mkvcore.NewSimpleBlockReader(r,
-		mkvcore.WithOnFatalHandler(func(err error) {}),
-	)
+	// Second pass: create block reader.
+	videoReader, readers, err := openBlockReaders(newView())
 	if err != nil {
 		return nil, err
 	}
 
-	// Find the video track reader and drain non-video tracks.
-	// mkvcore's parser goroutine blocks if any track's channel is full,
-	// so unused tracks must be continuously drained.
+	return &Demuxer{
+		newView:        newView,
+		reader:         videoReader,
+		readers:        readers,
+		info:           vi,
+		duration:       dur,
+		timestampScale: timestampScale,
+		codecID:        videoTrack.CodecID,
+		codecPrivate:   videoTrack.CodecPrivate,
+		firstPacket:    true,
+	}, nil
+}
+
+// openBlockReaders builds the mkvcore block reader stack over r, returning
+// the video track reader. Non-video tracks are continuously drained:
+// mkvcore's parser goroutine blocks if any track's channel fills.
+func openBlockReaders(r io.Reader) (mkvcore.BlockReadCloserWithTrackEntry, []mkvcore.BlockReadCloserWithTrackEntry, error) {
+	readers, err := mkvcore.NewSimpleBlockReader(r,
+		mkvcore.WithOnFatalHandler(func(err error) {}),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
 	var videoReader mkvcore.BlockReadCloserWithTrackEntry
 	for _, rd := range readers {
 		if rd.TrackEntry().TrackType == 1 && videoReader == nil {
@@ -132,18 +175,9 @@ func NewDemuxer(r io.ReadSeeker) (*Demuxer, error) {
 		}
 	}
 	if videoReader == nil {
-		return nil, govid.ErrNoVideoTrack
+		return nil, nil, govid.ErrNoVideoTrack
 	}
-
-	return &Demuxer{
-		reader:       videoReader,
-		readers:      readers,
-		info:         vi,
-		duration:     dur,
-		codecID:      videoTrack.CodecID,
-		codecPrivate: videoTrack.CodecPrivate,
-		firstPacket:  true,
-	}, nil
+	return videoReader, readers, nil
 }
 
 // NextPacket returns the next video packet.
@@ -175,9 +209,15 @@ func (d *Demuxer) NextPacket() (govid.Packet, error) {
 
 	return govid.Packet{
 		Data:      data,
-		Timestamp: time.Duration(timestamp) * time.Millisecond,
+		Timestamp: d.tsToDuration(timestamp),
 		Keyframe:  keyframe,
 	}, nil
+}
+
+// tsToDuration converts a block timestamp (in TimecodeScale ticks, 1 ms by
+// default) to a duration.
+func (d *Demuxer) tsToDuration(ts int64) time.Duration {
+	return time.Duration(ts) * time.Duration(d.timestampScale)
 }
 
 // CodecID returns the detected codec identifier ("V_VP8" or "V_AV1").
@@ -185,9 +225,72 @@ func (d *Demuxer) CodecID() string {
 	return d.codecID
 }
 
-// Seek is not supported in v1.
-func (d *Demuxer) Seek(time.Duration) (time.Duration, error) {
-	return 0, govid.ErrSeekNotSupported
+// Seek repositions to the last keyframe at or before t, returning that
+// keyframe's timestamp. WebM Cues are not consulted; the stream is rescanned
+// from the start, which is fine for the short clips this library targets.
+func (d *Demuxer) Seek(t time.Duration) (time.Duration, error) {
+	if d.closed {
+		return 0, fmt.Errorf("webm: demuxer closed")
+	}
+	reopen := func() error {
+		for _, r := range d.readers {
+			r.Close()
+		}
+		d.readers = nil
+		d.reader = nil
+		videoReader, readers, err := openBlockReaders(d.newView())
+		if err != nil {
+			return err
+		}
+		d.reader = videoReader
+		d.readers = readers
+		d.firstPacket = true
+		return nil
+	}
+
+	if err := reopen(); err != nil {
+		return 0, err
+	}
+	if t <= 0 {
+		return 0, nil
+	}
+
+	// Scan forward to find the last keyframe at or before t and how many
+	// packets precede it.
+	skip := -1
+	var keyTS time.Duration
+	for n := 0; ; n++ {
+		_, keyframe, ts, err := d.reader.Read()
+		if err != nil {
+			break // EOF: use the last keyframe found
+		}
+		pts := d.tsToDuration(ts)
+		if pts > t {
+			break
+		}
+		if keyframe {
+			skip = n
+			keyTS = pts
+		}
+	}
+	if skip < 0 {
+		// No keyframe at or before t; restart from the beginning.
+		if err := reopen(); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+
+	// Reopen and consume packets up to (not including) the keyframe.
+	if err := reopen(); err != nil {
+		return 0, err
+	}
+	for n := 0; n < skip; n++ {
+		if _, _, _, err := d.reader.Read(); err != nil {
+			return 0, err
+		}
+	}
+	return keyTS, nil
 }
 
 // Duration returns the video duration.

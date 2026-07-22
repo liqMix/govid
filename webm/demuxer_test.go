@@ -8,8 +8,6 @@ import (
 	"testing"
 
 	"github.com/at-wat/ebml-go"
-
-	govid "github.com/liqmix/govid"
 )
 
 func openTestWebM(t *testing.T) *Demuxer {
@@ -84,11 +82,54 @@ func TestNextPacket(t *testing.T) {
 	}
 }
 
-func TestSeekNotSupported(t *testing.T) {
+func TestSeekToStart(t *testing.T) {
 	d := openTestWebM(t)
-	_, err := d.Seek(0)
-	if err != govid.ErrSeekNotSupported {
-		t.Errorf("expected ErrSeekNotSupported, got %v", err)
+	// Consume a few packets, seek back to 0, and verify delivery restarts
+	// from the first packet.
+	first, err := d.NextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := d.NextPacket(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ts, err := d.Seek(0)
+	if err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	if ts != 0 {
+		t.Errorf("expected seek to 0, got %v", ts)
+	}
+	again, err := d.NextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Keyframe || again.Timestamp != first.Timestamp || len(again.Data) != len(first.Data) {
+		t.Errorf("packet after Seek(0) differs from first packet")
+	}
+}
+
+func TestSeekMidStream(t *testing.T) {
+	d := openTestWebM(t)
+	target := d.Duration() / 2
+	ts, err := d.Seek(target)
+	if err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	if ts > target {
+		t.Errorf("seek returned %v beyond target %v", ts, target)
+	}
+	pkt, err := d.NextPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pkt.Keyframe {
+		t.Error("packet after mid-stream seek is not a keyframe")
+	}
+	if pkt.Timestamp != ts {
+		t.Errorf("first packet after seek at %v, want %v", pkt.Timestamp, ts)
 	}
 }
 
