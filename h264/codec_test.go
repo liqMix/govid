@@ -2893,3 +2893,22 @@ func TestDecodeConformanceMR2MW(t *testing.T) {
 func TestDecodeConformanceMR2Tandberg(t *testing.T) {
 	conformanceAnnexBTest(t, "mr2tandberg", 176, 144, 300)
 }
+
+// TestDecodeMultiSliceCAVLC / TestDecodeMultiSliceCABAC cover pictures coded
+// as several slices (x264 slices=3): first_mb_in_slice > 0, per-slice CAVLC
+// termination via more_rbsp_data / CABAC end_of_slice, and slice-boundary
+// neighbor unavailability for prediction and contexts. High profile with the
+// 8x8 transform and 2 B-frames. Regenerate from h264/testdata:
+//
+//	ffmpeg -i test.mp4 -f rawvideo src160.yuv
+//	ffmpeg -f rawvideo -pix_fmt yuv420p -s 160x120 -r 30 -i src160.yuv \
+//	  -c:v libx264 -profile:v high -x264-params "cabac=0:8x8dct=1:bframes=2:slices=3" \
+//	  -frames:v 20 -pix_fmt yuv420p test_slices_cavlc.mp4     (cabac=1 for the CABAC one)
+//	ffmpeg -i test_slices_cavlc.mp4 -f rawvideo test_slices_cavlc.yuv
+func TestDecodeMultiSliceCAVLC(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_slices_cavlc.mp4", "testdata/test_slices_cavlc.yuv", 20, false)
+}
+
+func TestDecodeMultiSliceCABAC(t *testing.T) {
+	decodeAndCompareYUV(t, "testdata/test_slices_cabac.mp4", "testdata/test_slices_cabac.yuv", 20, false)
+}

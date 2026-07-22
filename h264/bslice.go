@@ -2,7 +2,6 @@ package h264
 
 import (
 	"fmt"
-	"image"
 )
 
 // B-slice decoding (spec 7.4.5 Table 7-14, 8.4.1.2). Both entropy coders
@@ -646,42 +645,44 @@ func (d *Decoder) decodeMBDirect(sh *sliceHeader, mbx, mby int, skip bool) error
 
 // --- CAVLC B slice ----------------------------------------------------------
 
-func (d *Decoder) decodeBSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
+func (d *Decoder) decodeBSliceImpl(br *BitReader, sh *sliceHeader) (int, error) {
 	if len(d.refFrames) == 0 {
-		return nil, fmt.Errorf("B-slice: no reference frames available")
+		return 0, fmt.Errorf("B-slice: no reference frames available")
 	}
 	if err := d.buildRefLists(sh); err != nil {
-		return nil, fmt.Errorf("B-slice: %w", err)
+		return 0, fmt.Errorf("B-slice: %w", err)
 	}
 
 	totalMBs := d.mbw * d.mbh
-	mbIdx := 0
+	mbIdx := int(sh.firstMB)
 	for mbIdx < totalMBs {
 		skipRun, err := br.ReadUE()
 		if err != nil {
-			return nil, fmt.Errorf("mb_skip_run: %w", err)
+			return 0, fmt.Errorf("mb_skip_run: %w", err)
 		}
 		for i := 0; i < int(skipRun) && mbIdx < totalMBs; i++ {
 			mbx := mbIdx % d.mbw
 			mby := mbIdx / d.mbw
+			d.mbSlice[mbIdx] = d.curSlice
 			if err := d.decodeMBDirect(sh, mbx, mby, true); err != nil {
-				return nil, fmt.Errorf("MB(%d,%d) B_Skip: %w", mbx, mby, err)
+				return 0, fmt.Errorf("MB(%d,%d) B_Skip: %w", mbx, mby, err)
 			}
 			mbIdx++
 		}
-		if mbIdx >= totalMBs {
+		if mbIdx >= totalMBs || !br.MoreRBSPData() {
 			break
 		}
 
 		mbx := mbIdx % d.mbw
 		mby := mbIdx / d.mbw
+		d.mbSlice[mbIdx] = d.curSlice
 		mbType, err := br.ReadUE()
 		if err != nil {
-			return nil, fmt.Errorf("MB(%d,%d) mb_type: %w", mbx, mby, err)
+			return 0, fmt.Errorf("MB(%d,%d) mb_type: %w", mbx, mby, err)
 		}
 		if int(mbType) >= 23 {
 			if err := d.decodeMBIntraWithType(br, mbx, mby, int(mbType)-23); err != nil {
-				return nil, fmt.Errorf("MB(%d,%d) intra: %w", mbx, mby, err)
+				return 0, fmt.Errorf("MB(%d,%d) intra: %w", mbx, mby, err)
 			}
 			idx := mby*d.mbw + mbx
 			info := &d.mbInfo[idx]
@@ -701,11 +702,14 @@ func (d *Decoder) decodeBSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 			}
 			info.hasCoef = true
 		} else if err := d.decodeMBInterB(br, mbx, mby, sh, int(mbType)); err != nil {
-			return nil, fmt.Errorf("MB(%d,%d) B(mbType=%d): %w", mbx, mby, mbType, err)
+			return 0, fmt.Errorf("MB(%d,%d) B(mbType=%d): %w", mbx, mby, mbType, err)
 		}
 		mbIdx++
+		if !br.MoreRBSPData() {
+			break
+		}
 	}
-	return d.cropImg(), nil
+	return mbIdx - int(sh.firstMB), nil
 }
 
 // decodeMBInterB decodes a non-intra, non-skip B macroblock with CAVLC.
@@ -1001,5 +1005,3 @@ func (d *Decoder) publishBPartMVs(info *mbInterInfo, g *bPart, list int) {
 		}
 	}
 }
-
-var _ = image.Point{}

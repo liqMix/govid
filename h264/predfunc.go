@@ -58,8 +58,8 @@ func predIntra4x4DC(d *Decoder, y, x int) {
 	// Left is available if this block is not at the left frame edge.
 	blockRow := (y - ybrYY) / 4
 	blockCol := (x - ybrYX) / 4
-	hasAbove := blockRow > 0 || d.curMB[1] > 0
-	hasLeft := blockCol > 0 || d.curMB[0] > 0
+	hasAbove := blockRow > 0 || d.mbAvailable(d.curMB[0], d.curMB[1]-1)
+	hasLeft := blockCol > 0 || d.mbAvailable(d.curMB[0]-1, d.curMB[1])
 
 	var avg uint8
 	switch {
@@ -229,8 +229,8 @@ func predIntra16x16Horizontal(d *Decoder, y, x int) {
 }
 
 func predIntra16x16DC(d *Decoder, y, x int) {
-	hasAbove := d.curMB[1] > 0
-	hasLeft := d.curMB[0] > 0
+	hasAbove := d.mbAvailable(d.curMB[0], d.curMB[1]-1)
+	hasLeft := d.mbAvailable(d.curMB[0]-1, d.curMB[1])
 
 	var avg uint8
 	switch {
@@ -303,8 +303,8 @@ func predIntraChromaDC(d *Decoder, y, x int) {
 	// Chroma DC prediction per spec Section 8.3.4.1.
 	// Each 4x4 sub-block uses only MB-level border samples (not inner borders).
 	// The above border is ybr[y-1][x..x+7], left border is ybr[y..y+7][x-1].
-	hasAbove := d.curMB[1] > 0
-	hasLeft := d.curMB[0] > 0
+	hasAbove := d.mbAvailable(d.curMB[0], d.curMB[1]-1)
+	hasLeft := d.mbAvailable(d.curMB[0]-1, d.curMB[1])
 
 	// Precompute border sums for each half.
 	var aboveSum [2]int // [0]=cols 0-3, [1]=cols 4-7

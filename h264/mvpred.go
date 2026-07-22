@@ -160,7 +160,7 @@ func (d *Decoder) getNeighborMVAtList(list, mbx, mby, px, py int) (mv [2]int16, 
 		npy -= 16
 	}
 
-	if nmbx < 0 || nmbx >= d.mbw || nmby < 0 || nmby >= d.mbh {
+	if !d.mbAvailable(nmbx, nmby) {
 		return [2]int16{0, 0}, -1, false
 	}
 

@@ -2,7 +2,6 @@ package h264
 
 import (
 	"fmt"
-	"image"
 )
 
 // CABAC macroblock-layer decoding (spec 7.3.5, 9.3.3.1). Syntax element
@@ -77,16 +76,16 @@ func cbpCabacDefault(curIntra bool) uint16 {
 }
 
 func (d *Decoder) neighborCbpCabac(nx, ny int, curIntra bool) uint16 {
-	if nx < 0 || ny < 0 {
+	if !d.mbAvailable(nx, ny) {
 		return cbpCabacDefault(curIntra)
 	}
 	return d.mbInfo[ny*d.mbw+nx].cbpCabac
 }
 
-// mbAvail reports whether the MB at (nx, ny) is available as a neighbor
-// (within the picture; single slice per frame is assumed).
+// mbAvail reports whether the MB at (nx, ny) is available as a neighbor:
+// inside the picture and decoded by the current slice.
 func (d *Decoder) mbAvail(nx, ny int) bool {
-	return nx >= 0 && ny >= 0 && nx < d.mbw && ny < d.mbh
+	return d.mbAvailable(nx, ny)
 }
 
 // cabacCBFCtx derives the coded_block_flag ctxIdx (spec 9.3.3.1.1.9) for
@@ -548,15 +547,17 @@ func (d *Decoder) newSliceCABAC(br *BitReader, sh *sliceHeader) *cabacDecoder {
 	return cd
 }
 
-func (d *Decoder) decodeISliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
+func (d *Decoder) decodeISliceCABAC(br *BitReader, sh *sliceHeader) (int, error) {
 	cd := d.newSliceCABAC(br, sh)
 	totalMBs := d.mbw * d.mbh
-	for mbIdx := 0; mbIdx < totalMBs; mbIdx++ {
+	mbIdx := int(sh.firstMB)
+	for ; mbIdx < totalMBs; mbIdx++ {
 		mbx := mbIdx % d.mbw
 		mby := mbIdx / d.mbw
+		d.mbSlice[mbIdx] = d.curSlice
 		mbType := d.decodeCabacIntraMBType(cd, mbx, mby, 3, true)
 		if err := d.decodeMBIntraCABACWithType(cd, mbx, mby, mbType); err != nil {
-			return nil, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
+			return 0, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
 		}
 		if DebugCabacITrace != nil {
 			DebugCabacITrace(mbx, mby, mbType, int(d.mbInfo[mby*d.mbw+mbx].cbpCabac), d.qp)
@@ -576,17 +577,14 @@ func (d *Decoder) decodeISliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbC
 			info.predMask[k] = 0
 		}
 		if err := cd.checkErr(); err != nil {
-			return nil, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
+			return 0, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
 		}
 		if cd.decodeTerminate() == 1 {
-			if mbIdx != totalMBs-1 {
-				return nil, fmt.Errorf("early end_of_slice at MB %d/%d", mbIdx, totalMBs)
-			}
+			mbIdx++
 			break
 		}
 	}
-	d.deblockFrame(sh)
-	return d.cropImg(), nil
+	return mbIdx - int(sh.firstMB), nil
 }
 
 // DebugCabacPTrace, if non-nil, receives (mbx, mby, skip, pType, cbp) for
@@ -602,18 +600,20 @@ var DebugCabacITrace func(mbx, mby, mbType, cbp, qp int)
 // category, block index, and the scan-ordered coefficients.
 var DebugCabacResidual func(mbx, mby, cat, blkIdx int, coeffs []int16)
 
-func (d *Decoder) decodePSliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
+func (d *Decoder) decodePSliceCABAC(br *BitReader, sh *sliceHeader) (int, error) {
 	if len(d.refFrames) == 0 {
-		return nil, fmt.Errorf("P-slice: no reference frames available")
+		return 0, fmt.Errorf("P-slice: no reference frames available")
 	}
 	if err := d.buildRefLists(sh); err != nil {
-		return nil, fmt.Errorf("P-slice: %w", err)
+		return 0, fmt.Errorf("P-slice: %w", err)
 	}
 	cd := d.newSliceCABAC(br, sh)
 	totalMBs := d.mbw * d.mbh
-	for mbIdx := 0; mbIdx < totalMBs; mbIdx++ {
+	mbIdx := int(sh.firstMB)
+	for ; mbIdx < totalMBs; mbIdx++ {
 		mbx := mbIdx % d.mbw
 		mby := mbIdx / d.mbw
+		d.mbSlice[mbIdx] = d.curSlice
 		if d.decodeCabacMBSkip(cd, mbx, mby) {
 			d.decodeMBSkip(mbx, mby, sh)
 			d.lastQPDeltaNonZero = false
@@ -646,23 +646,21 @@ func (d *Decoder) decodePSliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbC
 				err = d.decodeMBInterCABAC(cd, mbx, mby, sh, pType)
 			}
 			if err != nil {
-				return nil, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
+				return 0, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
 			}
 			if DebugCabacPTrace != nil {
 				DebugCabacPTrace(mbx, mby, pType, int(d.mbInfo[mby*d.mbw+mbx].cbpCabac))
 			}
 		}
 		if err := cd.checkErr(); err != nil {
-			return nil, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
+			return 0, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
 		}
 		if cd.decodeTerminate() == 1 {
-			if mbIdx != totalMBs-1 {
-				return nil, fmt.Errorf("early end_of_slice at MB %d/%d", mbIdx, totalMBs)
-			}
+			mbIdx++
 			break
 		}
 	}
-	return d.cropImg(), nil
+	return mbIdx - int(sh.firstMB), nil
 }
 
 // --- Intra macroblock decoding ---------------------------------------------
@@ -1382,21 +1380,23 @@ func (d *Decoder) decodeCabacMVDB(cd *cabacDecoder, list, mbx, mby, n int) (int,
 	return mvdX, mvdY, [2]uint8{uint8(capX), uint8(capY)}
 }
 
-func (d *Decoder) decodeBSliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
+func (d *Decoder) decodeBSliceCABAC(br *BitReader, sh *sliceHeader) (int, error) {
 	if len(d.refFrames) == 0 {
-		return nil, fmt.Errorf("B-slice: no reference frames available")
+		return 0, fmt.Errorf("B-slice: no reference frames available")
 	}
 	if err := d.buildRefLists(sh); err != nil {
-		return nil, fmt.Errorf("B-slice: %w", err)
+		return 0, fmt.Errorf("B-slice: %w", err)
 	}
 	cd := d.newSliceCABAC(br, sh)
 	totalMBs := d.mbw * d.mbh
-	for mbIdx := 0; mbIdx < totalMBs; mbIdx++ {
+	mbIdx := int(sh.firstMB)
+	for ; mbIdx < totalMBs; mbIdx++ {
 		mbx := mbIdx % d.mbw
 		mby := mbIdx / d.mbw
+		d.mbSlice[mbIdx] = d.curSlice
 		if d.decodeCabacMBSkipB(cd, mbx, mby) {
 			if err := d.decodeMBDirect(sh, mbx, mby, true); err != nil {
-				return nil, fmt.Errorf("MB(%d,%d) B_Skip: %w", mbx, mby, err)
+				return 0, fmt.Errorf("MB(%d,%d) B_Skip: %w", mbx, mby, err)
 			}
 			d.lastQPDeltaNonZero = false
 			if DebugCabacBTrace != nil {
@@ -1434,20 +1434,18 @@ func (d *Decoder) decodeBSliceCABAC(br *BitReader, sh *sliceHeader) (*image.YCbC
 				err = d.decodeMBInterBCABAC(cd, mbx, mby, sh, mbType)
 			}
 			if err != nil {
-				return nil, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
+				return 0, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
 			}
 		}
 		if err := cd.checkErr(); err != nil {
-			return nil, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
+			return 0, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
 		}
 		if cd.decodeTerminate() == 1 {
-			if mbIdx != totalMBs-1 {
-				return nil, fmt.Errorf("early end_of_slice at MB %d/%d", mbIdx, totalMBs)
-			}
+			mbIdx++
 			break
 		}
 	}
-	return d.cropImg(), nil
+	return mbIdx - int(sh.firstMB), nil
 }
 
 // decodeMBInterBCABAC decodes a non-intra, non-skip B macroblock with CABAC.

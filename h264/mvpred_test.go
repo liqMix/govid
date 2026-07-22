@@ -32,6 +32,7 @@ func TestPredictMVNoNeighbors(t *testing.T) {
 	d.mbh = 2
 	d.img = image.NewYCbCr(image.Rect(0, 0, 32, 32), image.YCbCrSubsampleRatio420)
 	d.mbInfo = make([]mbInterInfo, 4)
+	d.mbSlice = make([]int32, 4)
 
 	// Top-left MB, no left or above neighbors.
 	mv := d.predictMVWithSize(0, 0, 0, 0, 16, 16, 0)
@@ -46,6 +47,7 @@ func TestPredictMVSingleNeighbor(t *testing.T) {
 	d.mbh = 2
 	d.img = image.NewYCbCr(image.Rect(0, 0, 32, 32), image.YCbCrSubsampleRatio420)
 	d.mbInfo = make([]mbInterInfo, 4)
+	d.mbSlice = make([]int32, 4)
 
 	// Set left MB (0,0) with a known MV.
 	d.mbInfo[0].isIntra = false
@@ -71,6 +73,7 @@ func TestPredictMVMedian(t *testing.T) {
 	d.mbh = 2
 	d.img = image.NewYCbCr(image.Rect(0, 0, 48, 32), image.YCbCrSubsampleRatio420)
 	d.mbInfo = make([]mbInterInfo, 6)
+	d.mbSlice = make([]int32, 6)
 
 	// Set left MB (0,1).
 	d.mbInfo[3].isIntra = false
@@ -116,6 +119,7 @@ func TestPredictMVIntraNeighbor(t *testing.T) {
 	d.mbh = 2
 	d.img = image.NewYCbCr(image.Rect(0, 0, 32, 32), image.YCbCrSubsampleRatio420)
 	d.mbInfo = make([]mbInterInfo, 4)
+	d.mbSlice = make([]int32, 4)
 
 	// Left MB is intra — contributes MV (0,0) with ref=0.
 	d.mbInfo[0].isIntra = true

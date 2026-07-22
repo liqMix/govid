@@ -79,6 +79,14 @@ type Decoder struct {
 	scalingWS8 [2][64]int
 	scalingSPS *SPS
 	scalingPPS *PPS
+
+	// Multi-slice picture state: mbSlice[i] records which slice (sequence
+	// number curSlice) decoded MB i, so neighbor availability can exclude
+	// MBs of other slices (spec 6.4.9); picMBsDone counts the current
+	// picture's decoded MBs so output waits for the last slice.
+	mbSlice    []int32
+	curSlice   int32
+	picMBsDone int
 }
 
 // ybr workspace layout constants.
@@ -300,36 +308,43 @@ func (d *Decoder) decodeSlice(nalu NALUnit) (*image.YCbCr, error) {
 	d.initDPB()
 	d.qp = 26 + int(pps.PicInitQPMinus26) + int(sh.sliceQPDelta)
 
-	d.curIsIDR = nalu.Type == NALSliceIDR
-	if d.curIsIDR {
-		d.resetDPB()
+	// A slice with first_mb_in_slice == 0 starts a new picture; later slices
+	// of the same picture only add their macroblocks. Per-picture state
+	// (IDR handling, POC) is derived once, from the first slice.
+	if sh.firstMB == 0 {
+		d.curIsIDR = nalu.Type == NALSliceIDR
+		if d.curIsIDR {
+			d.resetDPB()
+		}
+		if err := d.computePOC(sh, nalu); err != nil {
+			return nil, err
+		}
+		d.picMBsDone = 0
 	}
-	if err := d.computePOC(sh, nalu); err != nil {
-		return nil, err
-	}
+	d.curSlice++
 
 	cabac := pps.EntropyCodingModeFlag
 
-	var img *image.YCbCr
+	var n int
 	switch sh.sliceType {
 	case sliceTypeI, sliceTypeSI:
 		if cabac {
-			img, err = d.decodeISliceCABAC(br, sh)
+			n, err = d.decodeISliceCABAC(br, sh)
 		} else {
-			img, err = d.decodeISlice(br, sh)
+			n, err = d.decodeISlice(br, sh)
 		}
 	case sliceTypeP:
 		if cabac {
-			img, err = d.decodePSliceCABAC(br, sh)
+			n, err = d.decodePSliceCABAC(br, sh)
 		} else {
-			img, err = d.decodePSliceImpl(br, sh)
+			n, err = d.decodePSliceImpl(br, sh)
 		}
 	case sliceTypeB:
 		d.sawB = true
 		if cabac {
-			img, err = d.decodeBSliceCABAC(br, sh)
+			n, err = d.decodeBSliceCABAC(br, sh)
 		} else {
-			img, err = d.decodeBSliceImpl(br, sh)
+			n, err = d.decodeBSliceImpl(br, sh)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported slice type %d", sh.sliceType)
@@ -337,15 +352,22 @@ func (d *Decoder) decodeSlice(nalu NALUnit) (*image.YCbCr, error) {
 	if err != nil {
 		return nil, err
 	}
-	if sh.sliceType != sliceTypeI && sh.sliceType != sliceTypeSI {
-		d.deblockFrame(sh)
+	d.picMBsDone += n
+	if d.picMBsDone < d.mbw*d.mbh {
+		// More slices of this picture follow in later NAL units.
+		return nil, nil
 	}
+
+	// Picture complete: deblock (crossing slice boundaries; the deblock
+	// parameters of the last slice apply — encoders keep them uniform
+	// across a picture's slices), store, and emit.
+	d.deblockFrame(sh)
 	if nalu.RefIDC != 0 {
 		if err := d.storeRefFrame(sh); err != nil {
 			return nil, err
 		}
 	}
-	return img, nil
+	return d.cropImg(), nil
 }
 
 // computePOC derives the picture order count of the current picture
@@ -410,6 +432,22 @@ func (d *Decoder) ensureImg() {
 	for i := range d.intraModes {
 		d.intraModes[i] = -1
 	}
+	d.mbSlice = make([]int32, totalMBs)
+	for i := range d.mbSlice {
+		d.mbSlice[i] = -1
+	}
+}
+
+// mbAvailable reports whether the MB at (nx, ny) is available as a neighbor
+// of the MB currently being decoded: inside the picture AND decoded by the
+// current slice (spec 6.4.9 — MBs of other slices are not available for
+// prediction or context derivation; only the deblocking filter crosses
+// slice boundaries).
+func (d *Decoder) mbAvailable(nx, ny int) bool {
+	if nx < 0 || ny < 0 || nx >= d.mbw || ny >= d.mbh {
+		return false
+	}
+	return d.mbSlice[ny*d.mbw+nx] == d.curSlice
 }
 
 // DebugMBBits, if non-nil, is called with (mbx, mby, startBit, endBit) for each MB.
@@ -420,32 +458,38 @@ var DebugMBBits func(mbx, mby, startBit, endBit int)
 // rawVal: skipRun UE value for "S", mbType UE value for "N".
 var DebugPSliceTrace func(mbx, mby int, branch string, startBit, endBit int, rawVal uint32)
 
-func (d *Decoder) decodeISlice(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
-	for mby := 0; mby < d.mbh; mby++ {
-		for mbx := 0; mbx < d.mbw; mbx++ {
-			startBit := br.BitsRead()
-			if err := d.decodeMBIntra(br, mbx, mby); err != nil {
-				return nil, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
-			}
-			if DebugMBBits != nil {
-				DebugMBBits(mbx, mby, startBit, br.BitsRead())
-			}
-			// Mark as intra in mbInfo for P-slice MV prediction context.
-			idx := mby*d.mbw + mbx
-			d.mbInfo[idx].isIntra = true
-			d.mbInfo[idx].qp = d.pcmAwareQP(idx)
-			for k := range d.mbInfo[idx].mv {
-				d.mbInfo[idx].mv[k] = [2]int16{0, 0}
-			}
-			for k := range d.mbInfo[idx].refIdx {
-				d.mbInfo[idx].refIdx[k] = -1
-				d.mbInfo[idx].refIdxL1[k] = -1
-				d.mbInfo[idx].predMask[k] = 0
-			}
+func (d *Decoder) decodeISlice(br *BitReader, sh *sliceHeader) (int, error) {
+	totalMBs := d.mbw * d.mbh
+	mbIdx := int(sh.firstMB)
+	for mbIdx < totalMBs {
+		mbx := mbIdx % d.mbw
+		mby := mbIdx / d.mbw
+		d.mbSlice[mbIdx] = d.curSlice
+		startBit := br.BitsRead()
+		if err := d.decodeMBIntra(br, mbx, mby); err != nil {
+			return 0, fmt.Errorf("MB(%d,%d): %w", mbx, mby, err)
+		}
+		if DebugMBBits != nil {
+			DebugMBBits(mbx, mby, startBit, br.BitsRead())
+		}
+		// Mark as intra in mbInfo for P-slice MV prediction context.
+		idx := mbIdx
+		d.mbInfo[idx].isIntra = true
+		d.mbInfo[idx].qp = d.pcmAwareQP(idx)
+		for k := range d.mbInfo[idx].mv {
+			d.mbInfo[idx].mv[k] = [2]int16{0, 0}
+		}
+		for k := range d.mbInfo[idx].refIdx {
+			d.mbInfo[idx].refIdx[k] = -1
+			d.mbInfo[idx].refIdxL1[k] = -1
+			d.mbInfo[idx].predMask[k] = 0
+		}
+		mbIdx++
+		if !br.MoreRBSPData() {
+			break // end of this slice's data
 		}
 	}
-	d.deblockFrame(sh)
-	return d.cropImg(), nil
+	return mbIdx - int(sh.firstMB), nil
 }
 
 // DebugMBLog, if non-nil, receives debug info for each decoded intra MB.
@@ -596,12 +640,14 @@ func (d *Decoder) predIntra4x4(y, x, mode, blk int) {
 func (d *Decoder) predIntra8x8Part(y, x, p, mode, mbx, mby int) {
 	partY := (p / 2) * 8
 	partX := (p % 2) * 8
-	hasTop := partY > 0 || mby > 0
-	hasLeft := partX > 0 || mbx > 0
+	topMB := d.mbAvailable(mbx, mby-1)
+	leftMB := d.mbAvailable(mbx-1, mby)
+	hasTop := partY > 0 || topMB
+	hasLeft := partX > 0 || leftMB
 	hasCorner := (partY > 0 && partX > 0) ||
-		(partY > 0 && mbx > 0) ||
-		(partX > 0 && mby > 0) ||
-		(mbx > 0 && mby > 0)
+		(partY > 0 && leftMB) ||
+		(partX > 0 && topMB) ||
+		(leftMB && topMB && d.mbAvailable(mbx-1, mby-1))
 
 	// above-right for each partition:
 	//  p=0: columns 8..15 of y=-1 come from above MB (if mby > 0).
@@ -611,9 +657,9 @@ func (d *Decoder) predIntra8x8Part(y, x, p, mode, mbx, mby int) {
 	aboveRightAvail := false
 	switch p {
 	case 0:
-		aboveRightAvail = mby > 0
+		aboveRightAvail = topMB
 	case 1:
-		aboveRightAvail = mby > 0 && mbx < d.mbw-1
+		aboveRightAvail = d.mbAvailable(mbx+1, mby-1)
 	case 2:
 		aboveRightAvail = true
 	}
@@ -1005,12 +1051,12 @@ func (d *Decoder) prepareYBR(mbx, mby int) {
 		d.ybr[ybrBY-1][i] = 128
 	}
 
-	if mby > 0 {
+	if d.mbAvailable(mbx, mby-1) {
 		imgY := mby*16 - 1
 		for i := 0; i < 16; i++ {
 			d.ybr[ybrYY-1][ybrYX+i] = d.img.Y[imgY*d.img.YStride+mbx*16+i]
 		}
-		if mbx < d.mbw-1 {
+		if d.mbAvailable(mbx+1, mby-1) {
 			for i := 0; i < 8; i++ {
 				d.ybr[ybrYY-1][ybrYX+16+i] = d.img.Y[imgY*d.img.YStride+(mbx+1)*16+i]
 			}
@@ -1026,7 +1072,7 @@ func (d *Decoder) prepareYBR(mbx, mby int) {
 		}
 	}
 
-	if mbx > 0 {
+	if d.mbAvailable(mbx-1, mby) {
 		for j := 0; j < 16; j++ {
 			d.ybr[ybrYY+j][ybrYX-1] = d.img.Y[(mby*16+j)*d.img.YStride+mbx*16-1]
 		}
@@ -1036,7 +1082,7 @@ func (d *Decoder) prepareYBR(mbx, mby int) {
 		}
 	}
 
-	if mbx > 0 && mby > 0 {
+	if d.mbAvailable(mbx-1, mby-1) {
 		d.ybr[ybrYY-1][ybrYX-1] = d.img.Y[(mby*16-1)*d.img.YStride+mbx*16-1]
 		d.ybr[ybrBY-1][ybrBX-1] = d.img.Cb[(mby*8-1)*d.img.CStride+mbx*8-1]
 		d.ybr[ybrBY-1][ybrRX-1] = d.img.Cr[(mby*8-1)*d.img.CStride+mbx*8-1]
@@ -1095,7 +1141,7 @@ func (d *Decoder) getNCLuma(mbx, mby, blkIdx int, isLeft bool) int {
 		if neighborIdx >= 0 {
 			return d.nzCoeffCur[neighborIdx]
 		}
-		if mbx == 0 {
+		if !d.mbAvailable(mbx-1, mby) {
 			return -1
 		}
 		neighborMBIdx = mby*d.mbw + (mbx - 1)
@@ -1105,7 +1151,7 @@ func (d *Decoder) getNCLuma(mbx, mby, blkIdx int, isLeft bool) int {
 		if neighborIdx >= 0 {
 			return d.nzCoeffCur[neighborIdx]
 		}
-		if mby == 0 {
+		if !d.mbAvailable(mbx, mby-1) {
 			return -1
 		}
 		neighborMBIdx = (mby-1)*d.mbw + mbx
@@ -1139,7 +1185,7 @@ func (d *Decoder) getNCChromaLeft(mbx, mby, blkIdx int) int {
 	if bx > 0 {
 		return d.nzCoeffCur[16+blkIdx-1]
 	}
-	if mbx == 0 {
+	if !d.mbAvailable(mbx-1, mby) {
 		return -1
 	}
 	// Left neighbor: right column of left MB's chroma.
@@ -1153,7 +1199,7 @@ func (d *Decoder) getNCChromaAbove(mbx, mby, blkIdx int) int {
 	if by > 0 {
 		return d.nzCoeffCur[16+blkIdx-2]
 	}
-	if mby == 0 {
+	if !d.mbAvailable(mbx, mby-1) {
 		return -1
 	}
 	// Above neighbor: bottom row of above MB's chroma.
@@ -1177,8 +1223,8 @@ func (d *Decoder) mostProbableMode(mbx, mby, blk int) int {
 	// intraMxMPredModeA and intraMxMPredModeB are jointly set to Intra_4x4_DC.
 	// "Unavailable" means the neighbor MB lies outside the picture / slice.
 	// Within-MB neighbors (blkLeftIdx/blkAboveIdx >= 0) are always available.
-	leftMBUnavail := blkLeftIdx[blk] < 0 && mbx == 0
-	aboveMBUnavail := blkAboveIdx[blk] < 0 && mby == 0
+	leftMBUnavail := blkLeftIdx[blk] < 0 && !d.mbAvailable(mbx-1, mby)
+	aboveMBUnavail := blkAboveIdx[blk] < 0 && !d.mbAvailable(mbx, mby-1)
 	if leftMBUnavail || aboveMBUnavail {
 		return intra4x4DC
 	}
@@ -1200,7 +1246,7 @@ func (d *Decoder) getIntraModeNeighbor(mbx, mby, blkIdx int, isLeft bool) int {
 			}
 			return mode
 		}
-		if mbx == 0 {
+		if !d.mbAvailable(mbx-1, mby) {
 			return intra4x4DC
 		}
 		neighborMBIdx := mby*d.mbw + (mbx - 1)
@@ -1222,7 +1268,7 @@ func (d *Decoder) getIntraModeNeighbor(mbx, mby, blkIdx int, isLeft bool) int {
 		}
 		return mode
 	}
-	if mby == 0 {
+	if !d.mbAvailable(mbx, mby-1) {
 		return intra4x4DC
 	}
 	neighborMBIdx := (mby-1)*d.mbw + mbx

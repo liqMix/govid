@@ -25,7 +25,7 @@ Every decoder is verified plane-by-plane against raw YUV dumped from ffmpeg for 
 | WebM (`webm/`) | `V_VP8`, `V_AV1` |
 | MPEG-PS/ES (`mpeg1/`) | MPEG-1 video (`Source` is both demuxer and codec) |
 
-**H.264:** decodes everything x264 emits (any preset/tune, CAVLC or CABAC, B-frames/pyramid, 8x8 transform, custom scaling matrices, weighted prediction, I_PCM) plus temporal direct mode and long-term references / full MMCO, verified bit-exact against ffmpeg and JVT conformance streams. Not supported (returns an error): interlaced (field/MBAFF) coding, multiple slice groups (FMO), POC type 1, 4:2:2/4:4:4 chroma, lossless transform bypass.
+**H.264:** decodes everything x264 emits (any preset/tune, CAVLC or CABAC, B-frames/pyramid, 8x8 transform, custom scaling matrices, weighted prediction, I_PCM) plus multi-slice pictures (hardware/capture encoders), temporal direct mode, and long-term references / full MMCO, verified bit-exact against ffmpeg and JVT conformance streams. Not supported (returns an error): interlaced (field/MBAFF) coding, multiple slice groups (FMO), POC type 1, 4:2:2/4:4:4 chroma, lossless transform bypass.
 
 **VP8:** full decode including inter frames, loop filter, and invisible auto-alt-ref frames; encode with libvpx defaults.
 

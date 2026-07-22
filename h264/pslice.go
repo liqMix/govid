@@ -2,7 +2,6 @@ package h264
 
 import (
 	"fmt"
-	"image"
 )
 
 // P-slice macroblock types (spec Table 7-10).
@@ -33,23 +32,23 @@ var cbpTableInter = [48]int{
 	17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 }
 
-func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr, error) {
+func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (int, error) {
 	if len(d.refFrames) == 0 {
-		return nil, fmt.Errorf("P-slice: no reference frames available")
+		return 0, fmt.Errorf("P-slice: no reference frames available")
 	}
 	if err := d.buildRefLists(sh); err != nil {
-		return nil, fmt.Errorf("P-slice: %w", err)
+		return 0, fmt.Errorf("P-slice: %w", err)
 	}
 
 	totalMBs := d.mbw * d.mbh
-	mbIdx := 0
+	mbIdx := int(sh.firstMB)
 
 	for mbIdx < totalMBs {
 		// Read mb_skip_run.
 		skipStart := br.BitsRead()
 		skipRun, err := br.ReadUE()
 		if err != nil {
-			return nil, fmt.Errorf("mb_skip_run: %w", err)
+			return 0, fmt.Errorf("mb_skip_run: %w", err)
 		}
 		skipEnd := br.BitsRead()
 
@@ -57,6 +56,7 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 		for i := 0; i < int(skipRun) && mbIdx < totalMBs; i++ {
 			mbx := mbIdx % d.mbw
 			mby := mbIdx / d.mbw
+			d.mbSlice[mbIdx] = d.curSlice
 			d.decodeMBSkip(mbx, mby, sh)
 			if DebugMBBits != nil {
 				DebugMBBits(mbx, mby, skipStart, skipEnd)
@@ -67,25 +67,26 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 			mbIdx++
 		}
 
-		if mbIdx >= totalMBs {
+		if mbIdx >= totalMBs || !br.MoreRBSPData() {
 			break
 		}
 
 		// Non-skip MB.
 		mbx := mbIdx % d.mbw
 		mby := mbIdx / d.mbw
+		d.mbSlice[mbIdx] = d.curSlice
 		mbStart := br.BitsRead()
 
 		mbType, err := br.ReadUE()
 		if err != nil {
-			return nil, fmt.Errorf("MB(%d,%d) mb_type: %w", mbx, mby, err)
+			return 0, fmt.Errorf("MB(%d,%d) mb_type: %w", mbx, mby, err)
 		}
 
 		if int(mbType) >= pMBTypeIntraStart {
 			// Intra MB in P-slice.
 			intraMBType := int(mbType) - pMBTypeIntraStart
 			if err := d.decodeMBIntraWithType(br, mbx, mby, intraMBType); err != nil {
-				return nil, fmt.Errorf("MB(%d,%d) intra(mbType=%d): %w", mbx, mby, mbType, err)
+				return 0, fmt.Errorf("MB(%d,%d) intra(mbType=%d): %w", mbx, mby, mbType, err)
 			}
 			// Mark as intra in mbInfo.
 			idx := mby*d.mbw + mbx
@@ -103,7 +104,7 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 			d.mbInfo[idx].hasCoef = true
 		} else {
 			if err := d.decodeMBInter(br, mbx, mby, sh, int(mbType)); err != nil {
-				return nil, fmt.Errorf("MB(%d,%d) inter(mbType=%d): %w", mbx, mby, mbType, err)
+				return 0, fmt.Errorf("MB(%d,%d) inter(mbType=%d): %w", mbx, mby, mbType, err)
 			}
 		}
 		if DebugMBBits != nil {
@@ -113,9 +114,12 @@ func (d *Decoder) decodePSliceImpl(br *BitReader, sh *sliceHeader) (*image.YCbCr
 			DebugPSliceTrace(mbx, mby, "N", mbStart, br.BitsRead(), mbType)
 		}
 		mbIdx++
+		if !br.MoreRBSPData() {
+			break
+		}
 	}
 
-	return d.cropImg(), nil
+	return mbIdx - int(sh.firstMB), nil
 }
 
 func (d *Decoder) decodeMBSkip(mbx, mby int, sh *sliceHeader) {

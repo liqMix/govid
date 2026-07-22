@@ -41,7 +41,8 @@ type sliceHeader struct {
 	weightsL1               *predWeights
 	cabacInitIdc            uint32
 	mmco                    []mmcoOp
-	idrLongTerm             bool // IDR long_term_reference_flag
+	idrLongTerm             bool   // IDR long_term_reference_flag
+	firstMB                 uint32 // first_mb_in_slice
 }
 
 // mmcoOp is one memory_management_control_operation (spec 7.4.3.3).
@@ -81,8 +82,7 @@ func parseSliceHeader(br *BitReader, sps *SPS, pps *PPS, nalType uint8, nalRefID
 	sh := &sliceHeader{}
 	var err error
 
-	// first_mb_in_slice
-	_, err = br.ReadUE()
+	sh.firstMB, err = br.ReadUE()
 	if err != nil {
 		return nil, fmt.Errorf("slice: first_mb_in_slice: %w", err)
 	}
