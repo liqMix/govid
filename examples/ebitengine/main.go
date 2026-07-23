@@ -25,6 +25,7 @@ import (
 	govid "github.com/liqmix/govid"
 	"github.com/liqmix/govid/av1"
 	govidebiten "github.com/liqmix/govid/ebitengine"
+	"github.com/liqmix/govid/ebiv"
 	"github.com/liqmix/govid/h264"
 	mp4pkg "github.com/liqmix/govid/mp4"
 	"github.com/liqmix/govid/mpeg1"
@@ -71,6 +72,7 @@ func init() {
 }
 
 var supportedExts = map[string]bool{
+	".ebiv": true,
 	".webm": true,
 	".mpg":  true,
 	".mpeg": true,
@@ -161,6 +163,23 @@ func loadVideo(path string) (*govidebiten.VideoImage, []io.Closer, error) {
 		default:
 			codec = h264.NewCodec()
 		}
+		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead, govid.WithRGBA())
+		if err != nil {
+			demuxer.Close()
+			f.Close()
+			return nil, nil, fmt.Errorf("player: %w", err)
+		}
+		closers = []io.Closer{player, demuxer, f}
+
+	case ".ebiv":
+		demuxer, err := ebiv.NewDemuxer(f)
+		if err != nil {
+			f.Close()
+			return nil, nil, fmt.Errorf("ebiv demuxer: %w", err)
+		}
+		// The async player runs decodeAhead frames ahead, so the codec's plane
+		// ring needs room for those plus the two the player itself holds.
+		codec := ebiv.NewCodec(ebiv.WithFrameRing(decodeAhead + 2))
 		player, err = govid.NewAsyncPlayer(demuxer, codec, decodeAhead, govid.WithRGBA())
 		if err != nil {
 			demuxer.Close()
@@ -274,7 +293,7 @@ func (g *Game) openPicker() {
 	go func() {
 		opts := []zenity.Option{
 			zenity.Title("Open video"),
-			zenity.FileFilter{Name: "Videos", Patterns: []string{"*.mp4", "*.webm", "*.mpg", "*.mpeg"}, CaseFold: true},
+			zenity.FileFilter{Name: "Videos", Patterns: []string{"*.mp4", "*.webm", "*.mpg", "*.mpeg", "*.ebiv"}, CaseFold: true},
 		}
 		if dir != "" {
 			opts = append(opts, zenity.Filename(dir+string(filepath.Separator)))
