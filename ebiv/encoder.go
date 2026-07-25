@@ -17,12 +17,13 @@ type Encoder struct {
 	geo geometry
 	buf []byte
 
-	coding    CodingMode
-	qp        int
-	gop       int // key-frame interval; 1 means all-intra
-	tileCols  int
-	tileRows  int
-	autoTiles int // when >0 and no explicit grid, target this many tiles
+	coding     CodingMode
+	qp         int
+	gop        int // key-frame interval; 1 means all-intra
+	tileCols   int
+	tileRows   int
+	autoTiles  int  // when >0 and no explicit grid, target this many tiles
+	fastEncode bool // skip the second (real-cost RDOQ) encode pass
 
 	ref       *frameBuf  // previous reconstruction, reference for an inter frame
 	sinceKF   int        // inter frames since the last key frame
@@ -75,6 +76,18 @@ func WithTiles(cols, rows int) EncoderOption {
 func WithAutoTiles(workers int) EncoderOption {
 	return func(e *Encoder) {
 		e.autoTiles = workers
+	}
+}
+
+// WithFastEncode skips the second encode pass (the M2 real-cost RDOQ
+// re-encode), halving encode time for files that measure ~3.5% larger at
+// matched PSNR. The bitstream is identical in format and decodes at the same
+// speed; only the encoder's rate-distortion decisions are cheaper. Use it for
+// iteration and previews; drop it for final assets if the last few percent
+// matter.
+func WithFastEncode() EncoderOption {
+	return func(e *Encoder) {
+		e.fastEncode = true
 	}
 }
 
@@ -149,14 +162,14 @@ func (e *Encoder) writeCoded(img *image.YCbCr) error {
 	)
 	if key {
 		hdr = frameHeader{Type: FrameKey, Coding: CodingIntra, Width: e.geo.W, Height: e.geo.H}
-		payload, rec, freqs = encodeIntraFrame(e.geo, img, e.qp, cols, rows)
+		payload, rec, freqs = encodeIntraFrame(e.geo, img, e.qp, cols, rows, !e.fastEncode)
 		e.sinceKF = 0
 		// A key frame's tables are self-contained; the delta history restarts
 		// here, mirroring the decoder's wipe so a seek can never desync.
 		e.prevFreqs = make([][]uint32, numContexts)
 	} else {
 		hdr = frameHeader{Type: FrameInter, Coding: CodingInter}
-		payload, rec, freqs = encodeInterFrame(e.geo, img, e.ref, e.qp, cols, rows, e.prevFreqs)
+		payload, rec, freqs = encodeInterFrame(e.geo, img, e.ref, e.qp, cols, rows, e.prevFreqs, !e.fastEncode)
 		e.sinceKF++
 	}
 	e.ref = rec

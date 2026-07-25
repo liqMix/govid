@@ -16,9 +16,9 @@ import "image"
 // in principle but converges quickly around a good predictor.
 const searchStart = 16
 
-func encodeInterFrame(g geometry, img *image.YCbCr, ref *frameBuf, qp, tileCols, tileRows int, prev [][]uint32) ([]byte, *frameBuf, [][]uint32) {
+func encodeInterFrame(g geometry, img *image.YCbCr, ref *frameBuf, qp, tileCols, tileRows int, prev [][]uint32, twoPass bool) ([]byte, *frameBuf, [][]uint32) {
 	e := newFrameEncoder(g, img, ref, qp, tileCols, tileRows)
-	e.encodeTwoPass(true)
+	e.encode(true, twoPass)
 	return e.finish(qp, prev)
 }
 

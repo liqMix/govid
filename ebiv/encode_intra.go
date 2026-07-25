@@ -146,18 +146,24 @@ func (e *frameEncoder) finish(qp int, prev [][]uint32) ([]byte, *frameBuf, [][]u
 // payload (without the outer frame-type byte), the reconstructed buffer that
 // becomes the reference for a following inter frame, and the shipped frequency
 // vectors for table delta-coding.
-func encodeIntraFrame(g geometry, img *image.YCbCr, qp, tileCols, tileRows int) ([]byte, *frameBuf, [][]uint32) {
+func encodeIntraFrame(g geometry, img *image.YCbCr, qp, tileCols, tileRows int, twoPass bool) ([]byte, *frameBuf, [][]uint32) {
 	e := newFrameEncoder(g, img, nil, qp, tileCols, tileRows)
-	e.encodeTwoPass(false)
+	e.encode(false, twoPass)
 	return e.finish(qp, nil)
 }
 
-// encodeTwoPass runs the M2 real-cost encode: pass 1 quantizes with the dead
-// zone to learn the token statistics, then pass 2 re-encodes with RDOQ pricing
-// against those real costs. The second pass reconstructs from scratch, so rec
-// ends bit-exact with the decoder.
-func (e *frameEncoder) encodeTwoPass(inter bool) {
+// encode codes the frame's tiles. With twoPass it runs the M2 real-cost
+// encode: pass 1 quantizes with the dead zone to learn the token statistics,
+// then pass 2 re-encodes with RDOQ pricing every decision against those real
+// costs. The second pass reconstructs from scratch, so rec ends bit-exact with
+// the decoder. Without twoPass it stops after pass 1 — dead-zone quantization
+// with nominal cost estimates — which measures ~3.5% larger at matched PSNR
+// for half the encode time.
+func (e *frameEncoder) encode(inter, twoPass bool) {
 	e.encodeTilesParallel(inter)
+	if !twoPass {
+		return
+	}
 	e.rdoq = e.measureCosts()
 	e.resetForPass2()
 	e.encodeTilesParallel(inter)

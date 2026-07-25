@@ -371,3 +371,38 @@ func itoaTest(v int) string {
 	}
 	return string(b[i:])
 }
+
+// TestFastEncodeRoundTrip pins the WithFastEncode contract: the single-pass
+// stream is a normal v2 bitstream — it decodes deterministically and
+// bit-exactly — and gives up only encoder rate-distortion quality, never
+// correctness. Per-frame quality must stay close to the two-pass encode of
+// the same content at the same qp.
+func TestFastEncodeRoundTrip(t *testing.T) {
+	cfg := Config{Width: 96, Height: 64, FPSNum: 30, FPSDen: 1}
+	const frames = 8
+	opts := []EncoderOption{WithIntra(16), WithGOP(4), WithTiles(2, 1)}
+	fast, refs := encodeCodedGen(t, cfg, frames, synthPan, append(opts[:len(opts):len(opts)], WithFastEncode())...)
+	best, _ := encodeCodedGen(t, cfg, frames, synthPan, opts...)
+
+	first := decodeToPlanes(t, fast)
+	second := decodeToPlanes(t, fast)
+	if len(first) != frames {
+		t.Fatalf("decoded %d frames, want %d", len(first), frames)
+	}
+	for i := range first {
+		if !bytes.Equal(first[i], second[i]) {
+			t.Fatalf("frame %d: fast-encode decode is not deterministic", i)
+		}
+	}
+
+	g := geometryFor(cfg.Width, cfg.Height)
+	fastImgs := decodeImages(t, fast)
+	bestImgs := decodeImages(t, best)
+	for i := range fastImgs {
+		fp := framePSNR(fastImgs[i], refs[i], g)
+		bp := framePSNR(bestImgs[i], refs[i], g)
+		if fp < bp-1.0 {
+			t.Errorf("frame %d: fast-encode PSNR %.2f dB more than 1 dB below two-pass %.2f dB", i, fp, bp)
+		}
+	}
+}

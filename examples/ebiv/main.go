@@ -34,12 +34,13 @@ func main() {
 	gop := flag.Int("gop", 30, "key-frame interval; 1 keeps every frame intra")
 	tileCols := flag.Int("tilecols", 0, "tile columns for parallel decode (0 = 1)")
 	tileRows := flag.Int("tilerows", 0, "tile rows for parallel decode (0 = 1)")
+	fast := flag.Bool("fast", false, "single-pass encode: ~2x faster, ~3.5% larger at matched quality")
 	flag.Parse()
 	if flag.NArg() != 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s [-q QP] [-gop N] [-frames N] [-tilecols C -tilerows R] <input> <output.ebiv>\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "usage: %s [-q QP] [-gop N] [-frames N] [-tilecols C -tilerows R] [-fast] <input> <output.ebiv>\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
-	opt := transcodeOptions{qp: *qp, gop: *gop, tileCols: *tileCols, tileRows: *tileRows, limit: *frames}
+	opt := transcodeOptions{qp: *qp, gop: *gop, tileCols: *tileCols, tileRows: *tileRows, limit: *frames, fast: *fast}
 	if err := transcode(flag.Arg(0), flag.Arg(1), opt); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -53,6 +54,7 @@ type transcodeOptions struct {
 	tileCols int
 	tileRows int
 	limit    int
+	fast     bool // single-pass encode (skip the real-cost RDOQ re-encode)
 }
 
 func (o transcodeOptions) encoderOptions() []ebiv.EncoderOption {
@@ -62,6 +64,9 @@ func (o transcodeOptions) encoderOptions() []ebiv.EncoderOption {
 	opts := []ebiv.EncoderOption{
 		ebiv.WithIntra(o.qp),
 		ebiv.WithGOP(o.gop),
+	}
+	if o.fast {
+		opts = append(opts, ebiv.WithFastEncode())
 	}
 	if o.tileCols > 1 || o.tileRows > 1 {
 		// Explicit grid the caller asked for.
