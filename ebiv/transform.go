@@ -142,9 +142,25 @@ func inverseDCT(src, dst []int32, n int) {
 		return
 	}
 
+	round := int64(1) << (dctScaleBits - 1)
+
+	// DC-only block: the single low-frequency coefficient spreads to a flat
+	// value across the block. The DCT's k=0 row is a constant (cos(0)=alpha), so
+	// both separable passes reduce to one multiply each and the result is a
+	// constant fill — bit-identical to the full transform, but O(1) instead of
+	// two O(n) passes per output. Common after quantization, so worth the branch.
+	if maxR == 0 && maxC == 0 {
+		d0 := int64(dctMatrix[n][0])
+		col := (d0*int64(src[0]) + round) >> dctScaleBits
+		val := int32((d0*col + round) >> dctScaleBits)
+		for i := range dst[:n*n] {
+			dst[i] = val
+		}
+		return
+	}
+
 	c := dctMatrix[n]
 	var tmp [maxLevels]int32
-	round := int64(1) << (dctScaleBits - 1)
 
 	// Column pass: only input rows 0..maxR contribute, and only output columns
 	// 0..maxC can be non-zero (input columns past maxC are all zero).

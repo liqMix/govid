@@ -249,6 +249,141 @@ func mcChroma(ref planeView, srcX, srcY, fx, fy, pw, ph int, out []int32, dstX, 
 	}
 }
 
+// mcLumaByte writes a pw×ph luma prediction directly into the destination byte
+// plane at (dstX,dstY), fusing motion compensation, the byte clamp, and the
+// store into one pass. Skip macroblocks and uncoded inter components have no
+// residual to add, so the int32 prediction buffer that mcLuma+writeMC round-trip
+// through is pure overhead: a full-pel interior block collapses to a per-row
+// memmove, and a subpel block filters straight to bytes. Bit-identical to
+// mcLuma followed by writeMC — the dominant path on skip-heavy content.
+func mcLumaByte(ref planeView, srcX, srcY, fx, fy, pw, ph int, dst planeView, dstX, dstY int) {
+	if !interiorLuma(ref, srcX, srcY, fx, fy, pw, ph) {
+		for r := 0; r < ph; r++ {
+			db := (dstY+r)*dst.stride + dstX
+			out := dst.data[db : db+pw : db+pw]
+			for c := 0; c < pw; c++ {
+				out[c] = clampByte(lumaSubpel(ref, srcX+c, srcY+r, fx, fy))
+			}
+		}
+		return
+	}
+	data, stride := ref.data, ref.stride
+	switch {
+	case fx == 0 && fy == 0:
+		for r := 0; r < ph; r++ {
+			sb := (srcY+r)*stride + srcX
+			db := (dstY+r)*dst.stride + dstX
+			copy(dst.data[db:db+pw], data[sb:sb+pw])
+		}
+	case fy == 0:
+		t := lumaTaps[fx]
+		for r := 0; r < ph; r++ {
+			sb := (srcY+r)*stride + srcX
+			db := (dstY+r)*dst.stride + dstX
+			out := dst.data[db : db+pw : db+pw]
+			for c := 0; c < pw; c++ {
+				b := sb + c
+				v := t[0]*int32(data[b-1]) + t[1]*int32(data[b]) + t[2]*int32(data[b+1]) + t[3]*int32(data[b+2])
+				out[c] = clampByte((v + 32) >> 6)
+			}
+		}
+	case fx == 0:
+		t := lumaTaps[fy]
+		for r := 0; r < ph; r++ {
+			sb := (srcY+r)*stride + srcX
+			db := (dstY+r)*dst.stride + dstX
+			out := dst.data[db : db+pw : db+pw]
+			for c := 0; c < pw; c++ {
+				b := sb + c
+				v := t[0]*int32(data[b-stride]) + t[1]*int32(data[b]) + t[2]*int32(data[b+stride]) + t[3]*int32(data[b+2*stride])
+				out[c] = clampByte((v + 32) >> 6)
+			}
+		}
+	default:
+		tx, ty := lumaTaps[fx], lumaTaps[fy]
+		for r := 0; r < ph; r++ {
+			db := (dstY+r)*dst.stride + dstX
+			out := dst.data[db : db+pw : db+pw]
+			for c := 0; c < pw; c++ {
+				var h [4]int32
+				for k := 0; k < 4; k++ {
+					b := (srcY+r-1+k)*stride + srcX + c
+					h[k] = tx[0]*int32(data[b-1]) + tx[1]*int32(data[b]) + tx[2]*int32(data[b+1]) + tx[3]*int32(data[b+2])
+				}
+				v := ty[0]*h[0] + ty[1]*h[1] + ty[2]*h[2] + ty[3]*h[3]
+				out[c] = clampByte((v + (1 << 11)) >> 12)
+			}
+		}
+	}
+}
+
+// mcChromaByte is the chroma analogue of mcLumaByte: eighth-pel bilinear
+// prediction written straight to the destination byte plane, full-pel collapsing
+// to a memmove. Bit-identical to mcChroma followed by writeMC.
+func mcChromaByte(ref planeView, srcX, srcY, fx, fy, pw, ph int, dst planeView, dstX, dstY int) {
+	interior := srcX >= 0 && srcY >= 0 && srcX+pw+1 <= ref.w && srcY+ph+1 <= ref.h
+	if fx == 0 && fy == 0 {
+		interior = srcX >= 0 && srcY >= 0 && srcX+pw <= ref.w && srcY+ph <= ref.h
+	}
+	if !interior {
+		for r := 0; r < ph; r++ {
+			db := (dstY+r)*dst.stride + dstX
+			out := dst.data[db : db+pw : db+pw]
+			for c := 0; c < pw; c++ {
+				out[c] = clampByte(chromaSubpel(ref, srcX+c, srcY+r, fx, fy))
+			}
+		}
+		return
+	}
+	data, stride := ref.data, ref.stride
+	if fx == 0 && fy == 0 {
+		for r := 0; r < ph; r++ {
+			sb := (srcY+r)*stride + srcX
+			db := (dstY+r)*dst.stride + dstX
+			copy(dst.data[db:db+pw], data[sb:sb+pw])
+		}
+		return
+	}
+	fxi, fyi := int32(fx), int32(fy)
+	w00 := (8 - fxi) * (8 - fyi)
+	w01 := fxi * (8 - fyi)
+	w10 := (8 - fxi) * fyi
+	w11 := fxi * fyi
+	for r := 0; r < ph; r++ {
+		sb := (srcY+r)*stride + srcX
+		db := (dstY+r)*dst.stride + dstX
+		out := dst.data[db : db+pw : db+pw]
+		for c := 0; c < pw; c++ {
+			b := sb + c
+			v := w00*int32(data[b]) + w01*int32(data[b+1]) + w10*int32(data[b+stride]) + w11*int32(data[b+stride+1])
+			out[c] = clampByte((v + 32) >> 6)
+		}
+	}
+}
+
+// mcLumaByteMB / mcLumaByteRect / mcChromaByteMB / mcChromaByteRect mirror the
+// int32 dispatchers above but target the reconstruction byte plane directly.
+func mcLumaByteMB(ref planeView, mbx, mby int, mv motionVector, dst planeView) {
+	mcLumaByte(ref, mbx*mbSize+int(mv.x>>2), mby*mbSize+int(mv.y>>2),
+		int(mv.x&3), int(mv.y&3), mbSize, mbSize, dst, mbx*mbSize, mby*mbSize)
+}
+
+func mcLumaByteRect(ref planeView, mbx, mby, px, py, pw, ph int, mv motionVector, dst planeView) {
+	mcLumaByte(ref, mbx*mbSize+px+int(mv.x>>2), mby*mbSize+py+int(mv.y>>2),
+		int(mv.x&3), int(mv.y&3), pw, ph, dst, mbx*mbSize+px, mby*mbSize+py)
+}
+
+func mcChromaByteMB(ref planeView, x0, y0 int, mv motionVector, dst planeView) {
+	mcChromaByte(ref, x0+int(mv.x>>3), y0+int(mv.y>>3),
+		int(mv.x&7), int(mv.y&7), chromaMB, chromaMB, dst, x0, y0)
+}
+
+func mcChromaByteRect(ref planeView, cx, cy, px, py, pw, ph int, mv motionVector, dst planeView) {
+	cpx, cpy, cpw, cph := px/2, py/2, pw/2, ph/2
+	mcChromaByte(ref, cx+cpx+int(mv.x>>3), cy+cpy+int(mv.y>>3),
+		int(mv.x&7), int(mv.y&7), cpw, cph, dst, cx+cpx, cy+cpy)
+}
+
 // clampMV keeps a motion vector within the search/decode range.
 func clampMV(v int) int16 {
 	if v < -mvClampRange {

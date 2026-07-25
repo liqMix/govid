@@ -49,15 +49,10 @@ func (td *tileDecoder) decodeInterMB(mbx, mby int, b tileBounds) {
 // reconMCMB reconstructs a macroblock as pure motion compensation — the whole
 // job for a skipped macroblock, and the uncoded components of an inter one.
 func (td *tileDecoder) reconMCMB(mbx, mby int, mv motionVector) {
-	var mcY [mbSize * mbSize]int32
-	mcLumaMB(td.ref.y, mbx, mby, mv, mcY[:])
-	writeMC(td.rec.y, mbx*mbSize, mby*mbSize, mbSize, mcY[:], mbSize)
-	var mcC [chromaMB * chromaMB]int32
+	mcLumaByteMB(td.ref.y, mbx, mby, mv, td.rec.y)
 	cx, cy := mbx*chromaMB, mby*chromaMB
-	mcChromaBlock(td.ref.cb, cx, cy, mv, mcC[:])
-	writeMC(td.rec.cb, cx, cy, chromaMB, mcC[:], chromaMB)
-	mcChromaBlock(td.ref.cr, cx, cy, mv, mcC[:])
-	writeMC(td.rec.cr, cx, cy, chromaMB, mcC[:], chromaMB)
+	mcChromaByteMB(td.ref.cb, cx, cy, mv, td.rec.cb)
+	mcChromaByteMB(td.ref.cr, cx, cy, mv, td.rec.cr)
 }
 
 func (td *tileDecoder) reconInterMB(mbx, mby, part int, mvs []motionVector) {
@@ -68,14 +63,14 @@ func (td *tileDecoder) reconInterMB(mbx, mby, part int, mvs []motionVector) {
 	}
 	rects := partRects[part]
 
-	// Assemble the motion-compensated prediction from the partitions, then add
-	// the residual per transform block when coded, else write the prediction
-	// directly.
-	var mcY [mbSize * mbSize]int32
-	for i, rc := range rects {
-		mcLumaRect(td.ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], mcY[:])
-	}
+	// Luma: a coded macroblock needs the int32 prediction as the base for the
+	// residual add; an uncoded one goes straight to bytes per partition, skipping
+	// the int32 buffer and the separate clamped copy entirely.
 	if cbp&cbpLuma != 0 {
+		var mcY [mbSize * mbSize]int32
+		for i, rc := range rects {
+			mcLumaRect(td.ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], mcY[:])
+		}
 		txIdx := td.dec.decode(ctxTxSize)
 		if txIdx < 0 || txIdx >= len(lumaTxSizes) {
 			td.dec.fail(ErrCorrupt)
@@ -96,27 +91,32 @@ func (td *tileDecoder) reconInterMB(mbx, mby, part int, mvs []motionVector) {
 			}
 		}
 	} else {
-		writeMC(td.rec.y, mbx*mbSize, mby*mbSize, mbSize, mcY[:], mbSize)
+		for i, rc := range rects {
+			mcLumaByteRect(td.ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], td.rec.y)
+		}
 	}
 
-	// Chroma: assemble each plane's prediction from the partitions.
+	// Chroma: same split per plane — assemble int32 only for a coded plane.
 	cx, cy := mbx*chromaMB, mby*chromaMB
-	var mcCb, mcCr [chromaMB * chromaMB]int32
+	td.reconInterChroma(mbx, mby, cx, cy, rects, mvs, td.ref.cb, td.rec.cb, cbp&cbpCb != 0)
+	td.reconInterChroma(mbx, mby, cx, cy, rects, mvs, td.ref.cr, td.rec.cr, cbp&cbpCr != 0)
+}
+
+// reconInterChroma reconstructs one chroma plane of an inter macroblock: an
+// int32 prediction plus residual when coded, or a direct byte write per
+// partition when not.
+func (td *tileDecoder) reconInterChroma(mbx, mby, cx, cy int, rects [][4]int, mvs []motionVector, ref, rec planeView, coded bool) {
+	if coded {
+		var mc [chromaMB * chromaMB]int32
+		for i, rc := range rects {
+			mcChromaRect(ref, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], mc[:])
+		}
+		copy(td.sc.pred[:chromaMB*chromaMB], mc[:])
+		td.reconResidual(planeChroma, 0, rec, cx, cy, chromaMB)
+		return
+	}
 	for i, rc := range rects {
-		mcChromaRect(td.ref.cb, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], mcCb[:])
-		mcChromaRect(td.ref.cr, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], mcCr[:])
-	}
-	if cbp&cbpCb != 0 {
-		copy(td.sc.pred[:chromaMB*chromaMB], mcCb[:])
-		td.reconResidual(planeChroma, 0, td.rec.cb, cx, cy, chromaMB)
-	} else {
-		writeMC(td.rec.cb, cx, cy, chromaMB, mcCb[:], chromaMB)
-	}
-	if cbp&cbpCr != 0 {
-		copy(td.sc.pred[:chromaMB*chromaMB], mcCr[:])
-		td.reconResidual(planeChroma, 0, td.rec.cr, cx, cy, chromaMB)
-	} else {
-		writeMC(td.rec.cr, cx, cy, chromaMB, mcCr[:], chromaMB)
+		mcChromaByteRect(ref, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], rec)
 	}
 }
 
