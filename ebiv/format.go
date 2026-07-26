@@ -21,9 +21,11 @@ import (
 // Format version written by this package. The reader accepts only this exact
 // version — the bitstream is not frozen and there is no compatibility story
 // until it is. Version 2 was the M1 bitstream (skip/CBP, class-coded MVs and
-// escapes, tx-split coefficient contexts, table delta-coding); version 3 adds
-// the golden reference frame (per-macroblock reference select).
-const Version = 3
+// escapes, tx-split coefficient contexts, table delta-coding); version 3
+// added the golden reference frame (per-macroblock reference select) and
+// sign data hiding; version 4 adds the alt-ref golden override: key frames
+// may carry a hidden, temporally-filtered synthetic reference for the GOP.
+const Version = 4
 
 // On-disk sizes, in bytes.
 const (
@@ -333,6 +335,11 @@ type frameHeader struct {
 	Coding CodingMode
 	Width  int // key frames only
 	Height int // key frames only
+	// GoldenOverride marks a key frame that carries a second coded payload —
+	// a temporally-filtered synthetic reference, inter-coded from the key —
+	// which the decoder places in the golden buffer instead of the key's own
+	// reconstruction. It is never displayed and never enters the timeline.
+	GoldenOverride bool
 }
 
 const (
@@ -350,7 +357,11 @@ func (f frameHeader) size() int {
 
 // appendTo appends the encoded header to dst.
 func (f frameHeader) appendTo(dst []byte) []byte {
-	dst = append(dst, (uint8(f.Type)&0x03)|((uint8(f.Coding)&0x07)<<2))
+	b := (uint8(f.Type) & 0x03) | ((uint8(f.Coding) & 0x07) << 2)
+	if f.GoldenOverride {
+		b |= 1 << 5
+	}
+	dst = append(dst, b)
 	if f.Type != FrameKey {
 		return dst
 	}
@@ -369,8 +380,12 @@ func parseFrameHeader(b []byte) (frameHeader, []byte, error) {
 	}
 	f.Type = FrameType(b[0] & 0x03)
 	f.Coding = CodingMode((b[0] >> 2) & 0x07)
+	f.GoldenOverride = b[0]&(1<<5) != 0
 	if f.Type != FrameKey && f.Type != FrameInter {
 		return f, nil, fmt.Errorf("%w: frame type %d", ErrCorrupt, uint8(f.Type))
+	}
+	if f.GoldenOverride && f.Type != FrameKey {
+		return f, nil, fmt.Errorf("%w: golden override on a non-key frame", ErrCorrupt)
 	}
 	if f.Type != FrameKey {
 		return f, b[frameHeaderBase:], nil

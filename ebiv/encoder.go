@@ -1,6 +1,7 @@
 package ebiv
 
 import (
+	"encoding/binary"
 	"fmt"
 	"image"
 	"io"
@@ -26,10 +27,18 @@ type Encoder struct {
 	fastEncode bool // skip the second (real-cost RDOQ) encode pass
 
 	ref       *frameBuf  // previous reconstruction, reference for an inter frame
-	golden    *frameBuf  // the GOP key frame's reconstruction, the second reference
+	golden    *frameBuf  // the GOP's golden reference reconstruction
 	sinceKF   int        // inter frames since the last key frame
 	prevFreqs [][]uint32 // last shipped frequency vector per context (table deltas)
 	prevY     []byte     // previous source luma, packed — scene-cut detection
+
+	// pending buffers the current GOP's source frames; its head becomes the
+	// next key frame. Buffering is what lets the encoder see the future: the
+	// alt-ref golden override is filtered from the frames the GOP will
+	// actually contain, and a scene cut can restart the GOP at the cut.
+	pending   []*image.YCbCr
+	accepted  int // frames accepted by WriteFrame, including still-buffered ones
+	altRefWin int // temporal-filter window for the golden override; 0 disables
 }
 
 // EncoderOption configures a compressing encoder.
@@ -81,6 +90,27 @@ func WithAutoTiles(workers int) EncoderOption {
 	}
 }
 
+// WithAltRef sets the temporal-filter window for the alt-ref golden override:
+// each key frame carries a hidden synthetic reference built by averaging up
+// to window source frames wherever they agree with the key (a
+// motion-rejecting temporal denoiser). Inter frames may then predict from a
+// cleaner image than any single lossy frame — the libvpx alt-ref idea shaped
+// to this container.
+//
+// Off by default (window 0): on the BGA corpus it measured 1–2.5% LARGER at
+// matched PSNR, because that content's apparent noise — twinkling lights,
+// shimmer — is deliberate animation, not sensor noise; averaging it away
+// builds a reference nothing resembles, and the override payload still has to
+// be paid for. Enable it only for true film-grain sources, where temporal
+// averaging recovers the underlying image.
+func WithAltRef(window int) EncoderOption {
+	return func(e *Encoder) {
+		if window >= 0 {
+			e.altRefWin = window
+		}
+	}
+}
+
 // WithFastEncode skips the second encode pass (the M2 real-cost RDOQ
 // re-encode), halving encode time for files that measure ~3.5% larger at
 // matched PSNR. The bitstream is identical in format and decodes at the same
@@ -102,12 +132,12 @@ func NewEncoder(w io.Writer, cfg Config, opts ...EncoderOption) (*Encoder, error
 	}
 	geo := geometryFor(cfg.Width, cfg.Height)
 	e := &Encoder{
-		w:        cw,
-		geo:      geo,
-		buf:      make([]byte, 0, frameHeaderBase+frameHeaderKeyExtra+geo.packedSize()),
-		coding:   CodingRaw,
-		qp:       20,
-		gop:      1,
+		w:         cw,
+		geo:       geo,
+		buf:       make([]byte, 0, frameHeaderBase+frameHeaderKeyExtra+geo.packedSize()),
+		coding:    CodingRaw,
+		qp:        20,
+		gop:       1,
 		tileCols: cfg.TileCols,
 		tileRows: cfg.TileRows,
 	}
@@ -117,12 +147,14 @@ func NewEncoder(w io.Writer, cfg Config, opts ...EncoderOption) (*Encoder, error
 	return e, nil
 }
 
-// FrameCount returns the number of frames written so far.
-func (e *Encoder) FrameCount() int { return e.w.FrameCount() }
+// FrameCount returns the number of frames accepted so far, including frames
+// still buffered in the current GOP (they are written no later than Close).
+func (e *Encoder) FrameCount() int { return e.accepted }
 
 // WriteFrame encodes one frame. The image must be 4:2:0 with exactly the
 // dimensions the encoder was configured for; its pixels are copied, so the
-// caller may reuse the image immediately.
+// caller may reuse the image immediately. Coded frames may be buffered up to
+// one GOP before being written; Close flushes the remainder.
 func (e *Encoder) WriteFrame(img *image.YCbCr) error {
 	if img == nil {
 		return fmt.Errorf("%w: nil image", ErrDimensions)
@@ -136,7 +168,11 @@ func (e *Encoder) WriteFrame(img *image.YCbCr) error {
 	if e.coding == CodingRaw {
 		return e.writeRaw(img)
 	}
-	return e.writeCoded(img)
+	if err := e.writeCoded(img); err != nil {
+		return err
+	}
+	e.accepted++
+	return nil
 }
 
 func (e *Encoder) writeRaw(img *image.YCbCr) error {
@@ -190,48 +226,194 @@ func (e *Encoder) sceneCut(img *image.YCbCr) bool {
 	return !first && sad > int64(w*h)*sceneCutAvgSAD
 }
 
+// writeCoded buffers the frame into the current GOP. The GOP flushes when it
+// reaches the scheduled length, or early when a scene cut arrives (min-gap
+// guarded) so the cut frame starts the next GOP as its key. Buffering is what
+// gives the encoder its future: the alt-ref override filters the frames the
+// GOP will actually contain.
 func (e *Encoder) writeCoded(img *image.YCbCr) error {
-	// Keys land every gop frames: sinceKF counts the inter frames written since
-	// the last key, so gop-1 of them fit between keys. (A >= e.gop test here is
-	// the off-by-one that made gop=1 alternate I/P instead of all-intra.)
-	// A detected scene cut starts the GOP early, min-gap guarded.
-	cut := e.sceneCut(img)
-	key := e.ref == nil || e.sinceKF >= e.gop-1 || (cut && e.sinceKF+1 >= sceneCutMinGap)
-	cols, rows := e.tileGrid()
-	var (
-		hdr     frameHeader
-		payload []byte
-		rec     *frameBuf
-		freqs   [][]uint32
-	)
-	if key {
-		hdr = frameHeader{Type: FrameKey, Coding: CodingIntra, Width: e.geo.W, Height: e.geo.H}
-		payload, rec, freqs = encodeIntraFrame(e.geo, img, e.qp, cols, rows, !e.fastEncode)
-		e.sinceKF = 0
-		// The key frame's reconstruction is the GOP's golden reference. Frame
-		// encoders allocate a fresh rec per frame, so holding the pointer is
-		// enough — nothing overwrites it until the next key replaces it.
-		e.golden = rec
-		// A key frame's tables are self-contained; the delta history restarts
-		// here, mirroring the decoder's wipe so a seek can never desync.
-		e.prevFreqs = make([][]uint32, numContexts)
-	} else {
-		hdr = frameHeader{Type: FrameInter, Coding: CodingInter}
-		payload, rec, freqs = encodeInterFrame(e.geo, img, e.ref, e.golden, e.qp, cols, rows, e.prevFreqs, !e.fastEncode)
-		e.sinceKF++
+	if e.sceneCut(img) && len(e.pending) >= sceneCutMinGap {
+		if err := e.flushGOP(); err != nil {
+			return err
+		}
 	}
+	e.pending = append(e.pending, cloneImage(img))
+	if len(e.pending) >= e.gop {
+		return e.flushGOP()
+	}
+	return nil
+}
+
+// flushGOP encodes the buffered GOP: its head as a key frame (with the
+// alt-ref golden override when the filter produced one), the rest as inter
+// frames.
+func (e *Encoder) flushGOP() error {
+	if len(e.pending) == 0 {
+		return nil
+	}
+	frames := e.pending
+	e.pending = nil
+	cols, rows := e.tileGrid()
+
+	altref := e.buildAltRef(frames)
+	hdr := frameHeader{
+		Type: FrameKey, Coding: CodingIntra,
+		Width: e.geo.W, Height: e.geo.H,
+		GoldenOverride: altref != nil,
+	}
+	payload, rec, freqs := encodeIntraFrame(e.geo, frames[0], e.qp, cols, rows, !e.fastEncode)
+	// A key frame's tables are self-contained; the delta history restarts
+	// here, mirroring the decoder's wipe so a seek can never desync.
+	e.prevFreqs = make([][]uint32, numContexts)
+	e.mergeFreqs(freqs)
 	e.ref = rec
-	// prev keeps the last *shipped* vector per context: a context unused this
-	// frame retains its older reference, matching parseTablesInto.
+	e.golden = rec
+	e.sinceKF = 0
+
+	e.buf = hdr.appendTo(e.buf[:0])
+	if altref != nil {
+		// The override codes the filtered reference as an inter frame
+		// predicted from the key it rides on, chaining the table history the
+		// same way the decoder will replay it.
+		ovPayload, ovRec, ovFreqs := encodeInterFrame(e.geo, altref, rec, nil, e.qp, cols, rows, e.prevFreqs, !e.fastEncode)
+		e.mergeFreqs(ovFreqs)
+		e.golden = ovRec
+		var lenBuf [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(lenBuf[:], uint64(len(payload)))
+		e.buf = append(e.buf, lenBuf[:n]...)
+		e.buf = append(e.buf, payload...)
+		e.buf = append(e.buf, ovPayload...)
+	} else {
+		e.buf = append(e.buf, payload...)
+	}
+	if err := e.w.WriteFrame(e.buf, true); err != nil {
+		return err
+	}
+
+	for _, f := range frames[1:] {
+		hdr := frameHeader{Type: FrameInter, Coding: CodingInter}
+		payload, rec, freqs := encodeInterFrame(e.geo, f, e.ref, e.golden, e.qp, cols, rows, e.prevFreqs, !e.fastEncode)
+		e.mergeFreqs(freqs)
+		e.ref = rec
+		e.sinceKF++
+		e.buf = hdr.appendTo(e.buf[:0])
+		e.buf = append(e.buf, payload...)
+		if err := e.w.WriteFrame(e.buf, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeFreqs keeps the last *shipped* vector per context: a context unused in
+// a frame retains its older reference, matching parseTablesInto.
+func (e *Encoder) mergeFreqs(freqs [][]uint32) {
 	for c, f := range freqs {
 		if f != nil {
 			e.prevFreqs[c] = f
 		}
 	}
+}
 
-	e.buf = hdr.appendTo(e.buf[:0])
-	e.buf = append(e.buf, payload...)
-	return e.w.WriteFrame(e.buf, key)
+// altRefBlockSAD is the per-pixel agreement threshold for the temporal
+// filter: a 16×16 block of a window frame joins the average only when it
+// matches the key this closely, so motion is rejected and only hold/noise
+// variation is averaged away.
+const altRefBlockSAD = 6
+
+// buildAltRef builds the golden-override image: the GOP head, temporally
+// denoised by averaging every window frame's blocks that agree with it. It
+// returns nil when the window is too small or nothing agreed — then the key's
+// own reconstruction serves as golden, exactly as before.
+func (e *Encoder) buildAltRef(frames []*image.YCbCr) *image.YCbCr {
+	n := min(e.altRefWin, len(frames))
+	if n < 3 {
+		return nil
+	}
+	g := e.geo
+	w, h := g.W, g.H
+	cw, ch := g.CW, g.CH
+	target := frames[0]
+
+	sumY := make([]uint32, w*h)
+	cntY := make([]uint16, w*h)
+	sumCb := make([]uint32, cw*ch)
+	sumCr := make([]uint32, cw*ch)
+	cntC := make([]uint16, cw*ch)
+
+	accPlane := func(sum []uint32, cnt []uint16, src []byte, stride, x0, y0, x1, y1, pw int) {
+		for y := y0; y < y1; y++ {
+			row := src[y*stride:]
+			for x := x0; x < x1; x++ {
+				sum[y*pw+x] += uint32(row[x])
+				if cnt != nil {
+					cnt[y*pw+x]++
+				}
+			}
+		}
+	}
+	// The key contributes everywhere.
+	accPlane(sumY, cntY, target.Y, target.YStride, 0, 0, w, h, w)
+	accPlane(sumCb, cntC, target.Cb, target.CStride, 0, 0, cw, ch, cw)
+	accPlane(sumCr, nil, target.Cr, target.CStride, 0, 0, cw, ch, cw)
+
+	accepted := 0
+	for j := 1; j < n; j++ {
+		f := frames[j]
+		for by := 0; by < h; by += mbSize {
+			bh := min(mbSize, h-by)
+			for bx := 0; bx < w; bx += mbSize {
+				bw := min(mbSize, w-bx)
+				var sad int64
+				for y := by; y < by+bh; y++ {
+					trow := target.Y[y*target.YStride:]
+					frow := f.Y[y*f.YStride:]
+					for x := bx; x < bx+bw; x++ {
+						sad += int64(abs32(int32(trow[x]) - int32(frow[x])))
+					}
+				}
+				if sad > int64(bw*bh)*altRefBlockSAD {
+					continue
+				}
+				accepted++
+				accPlane(sumY, cntY, f.Y, f.YStride, bx, by, bx+bw, by+bh, w)
+				cx0, cy0 := bx/2, by/2
+				cx1, cy1 := min(cw, (bx+bw+1)/2), min(ch, (by+bh+1)/2)
+				accPlane(sumCb, cntC, f.Cb, f.CStride, cx0, cy0, cx1, cy1, cw)
+				accPlane(sumCr, nil, f.Cr, f.CStride, cx0, cy0, cx1, cy1, cw)
+			}
+		}
+	}
+	if accepted == 0 {
+		return nil
+	}
+
+	out := &image.YCbCr{
+		Y: make([]byte, w*h), Cb: make([]byte, cw*ch), Cr: make([]byte, cw*ch),
+		YStride: w, CStride: cw,
+		SubsampleRatio: image.YCbCrSubsampleRatio420,
+		Rect:           image.Rect(0, 0, w, h),
+	}
+	for i := range out.Y {
+		c := uint32(cntY[i])
+		out.Y[i] = byte((sumY[i] + c/2) / c)
+	}
+	for i := range out.Cb {
+		c := uint32(cntC[i])
+		out.Cb[i] = byte((sumCb[i] + c/2) / c)
+		out.Cr[i] = byte((sumCr[i] + c/2) / c)
+	}
+	return out
+}
+
+// cloneImage deep-copies a frame so the caller may reuse its buffers while
+// the frame waits in the GOP buffer.
+func cloneImage(img *image.YCbCr) *image.YCbCr {
+	dst := *img
+	dst.Y = append([]byte(nil), img.Y...)
+	dst.Cb = append([]byte(nil), img.Cb...)
+	dst.Cr = append([]byte(nil), img.Cr...)
+	return &dst
 }
 
 // tileGrid resolves the tile grid for a coded frame: an explicit WithTiles grid
@@ -261,8 +443,13 @@ func (e *Encoder) packPlanes(dst []byte, img *image.YCbCr) {
 	gatherPlane(dst[ySize+cSize:], img.Cr, img.CStride, g.CW, g.CH)
 }
 
-// Close writes the frame index and footer.
-func (e *Encoder) Close() error { return e.w.Close() }
+// Close flushes any buffered GOP, then writes the frame index and footer.
+func (e *Encoder) Close() error {
+	if err := e.flushGOP(); err != nil {
+		return err
+	}
+	return e.w.Close()
+}
 
 // grow returns b resliced to n bytes, reallocating only if its capacity is too
 // small. The encoder's buffer reaches its final size on the first frame and is

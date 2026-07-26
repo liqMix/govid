@@ -645,3 +645,68 @@ func TestSceneCutKeyframes(t *testing.T) {
 		}
 	}
 }
+
+// TestAltRefGoldenOverride pins the opt-in alt-ref machinery: with a window
+// set, a key frame over hold-under-noise content carries a golden override (a
+// temporally denoised hidden reference), and decode stays deterministic and
+// accurate — including after the override replaces the key's reconstruction
+// as the golden reference. The override is off by default because it measured
+// larger on the BGA corpus (its shimmer is animation, not noise); this test
+// asserts correctness of the mechanism, not a size win.
+func TestAltRefGoldenOverride(t *testing.T) {
+	cfg := Config{Width: 128, Height: 96, FPSNum: 30, FPSDen: 1}
+	const frames = 24
+	// Noise must be large enough to survive quantization at the test qp, or
+	// the codec codes it to zero and the override never engages meaningfully.
+	noisy := func(g geometry, i int) *image.YCbCr {
+		img := synthFrame(g, 3)
+		for y := 0; y < g.H; y++ {
+			row := img.Y[y*img.YStride : y*img.YStride+g.W]
+			for x := 0; x < g.W; x++ {
+				n := int32((x*31+y*17+i*97)%13) - 6
+				row[x] = clampByte(int32(row[x]) + n)
+			}
+		}
+		return img
+	}
+	withAlt, refs := encodeCodedGen(t, cfg, frames, noisy, WithIntra(16), WithGOP(frames), WithAltRef(8))
+	withoutAlt, _ := encodeCodedGen(t, cfg, frames, noisy, WithIntra(16), WithGOP(frames))
+
+	// The key record must carry the override flag.
+	d, err := NewDemuxer(bytes.NewReader(withAlt))
+	if err != nil {
+		t.Fatalf("NewDemuxer: %v", err)
+	}
+	pkt, err := d.NextPacket()
+	if err != nil {
+		t.Fatalf("NextPacket: %v", err)
+	}
+	fh, _, err := parseFrameHeader(pkt.Data)
+	if err != nil {
+		t.Fatalf("parseFrameHeader: %v", err)
+	}
+	d.Close()
+	if !fh.GoldenOverride {
+		t.Fatal("key frame carries no golden override on hold-under-noise content")
+	}
+
+	// Core contract: deterministic decode, sane quality on every frame.
+	first := decodeToPlanes(t, withAlt)
+	second := decodeToPlanes(t, withAlt)
+	if len(first) != frames {
+		t.Fatalf("decoded %d frames, want %d", len(first), frames)
+	}
+	g := geometryFor(cfg.Width, cfg.Height)
+	imgs := decodeImages(t, withAlt)
+	for i := range first {
+		if !bytes.Equal(first[i], second[i]) {
+			t.Fatalf("frame %d: decode is not deterministic", i)
+		}
+		if p := framePSNR(imgs[i], refs[i], g); p < 30 {
+			t.Errorf("frame %d: PSNR %.1f dB, want >= 30", i, p)
+		}
+	}
+
+	t.Logf("noisy hold: %d bytes with alt-ref, %d without (%+.1f%%)",
+		len(withAlt), len(withoutAlt), 100*(float64(len(withAlt))/float64(len(withoutAlt))-1))
+}

@@ -1,6 +1,7 @@
 package ebiv
 
 import (
+	"encoding/binary"
 	"fmt"
 	"image"
 
@@ -143,17 +144,37 @@ func (c *Codec) configure(w, h int) error {
 
 // decodeCoded decodes a compressed frame into the padded work buffer, copies
 // the visible region into the ring image, then promotes the work buffer to the
-// reference for a following inter frame. A key frame's reconstruction is also
-// copied into the golden buffer — the GOP's second reference — so a seek that
+// reference for a following inter frame. A key frame also fills the golden
+// buffer — the GOP's second reference — either with its own reconstruction or,
+// when the record carries a golden override, with the hidden alt-ref payload
+// decoded from the key. Both live inside the key's record, so a seek that
 // lands on a key rebuilds golden identically to a straight-through decode.
 func (c *Codec) decodeCoded(dst *image.YCbCr, fh frameHeader, body []byte) error {
 	inter := fh.Coding == CodingInter
 	key := fh.Type == FrameKey
+	var ovBody []byte
+	if fh.GoldenOverride {
+		keyLen, n := binary.Uvarint(body)
+		if n <= 0 || keyLen > uint64(len(body)-n) {
+			return fmt.Errorf("%w: golden override split", ErrCorrupt)
+		}
+		ovBody = body[n+int(keyLen):]
+		body = body[n : n+int(keyLen)]
+	}
 	if err := c.dec.decodeCoded(c.work, c.ref, c.golden, body, inter, key); err != nil {
 		return err
 	}
 	if key {
-		c.golden.copyFrom(c.work)
+		if ovBody != nil {
+			// The override predicts only from the key it rides on; its golden
+			// slot points at the key too, so even a hostile stream cannot
+			// dereference stale pre-seek state through it.
+			if err := c.dec.decodeCoded(c.golden, c.work, c.work, ovBody, true, false); err != nil {
+				return err
+			}
+		} else {
+			c.golden.copyFrom(c.work)
+		}
 	}
 	c.work.storeImage(c.geo, dst)
 	c.work, c.ref = c.ref, c.work
