@@ -26,6 +26,7 @@ type Encoder struct {
 	fastEncode bool // skip the second (real-cost RDOQ) encode pass
 
 	ref       *frameBuf  // previous reconstruction, reference for an inter frame
+	golden    *frameBuf  // the GOP key frame's reconstruction, the second reference
 	sinceKF   int        // inter frames since the last key frame
 	prevFreqs [][]uint32 // last shipped frequency vector per context (table deltas)
 }
@@ -164,12 +165,16 @@ func (e *Encoder) writeCoded(img *image.YCbCr) error {
 		hdr = frameHeader{Type: FrameKey, Coding: CodingIntra, Width: e.geo.W, Height: e.geo.H}
 		payload, rec, freqs = encodeIntraFrame(e.geo, img, e.qp, cols, rows, !e.fastEncode)
 		e.sinceKF = 0
+		// The key frame's reconstruction is the GOP's golden reference. Frame
+		// encoders allocate a fresh rec per frame, so holding the pointer is
+		// enough — nothing overwrites it until the next key replaces it.
+		e.golden = rec
 		// A key frame's tables are self-contained; the delta history restarts
 		// here, mirroring the decoder's wipe so a seek can never desync.
 		e.prevFreqs = make([][]uint32, numContexts)
 	} else {
 		hdr = frameHeader{Type: FrameInter, Coding: CodingInter}
-		payload, rec, freqs = encodeInterFrame(e.geo, img, e.ref, e.qp, cols, rows, e.prevFreqs, !e.fastEncode)
+		payload, rec, freqs = encodeInterFrame(e.geo, img, e.ref, e.golden, e.qp, cols, rows, e.prevFreqs, !e.fastEncode)
 		e.sinceKF++
 	}
 	e.ref = rec

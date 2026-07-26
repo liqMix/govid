@@ -406,3 +406,72 @@ func TestFastEncodeRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// packetSizes returns each frame record's payload size in a container.
+func packetSizes(t *testing.T, container []byte) []int {
+	t.Helper()
+	d, err := NewDemuxer(bytes.NewReader(container))
+	if err != nil {
+		t.Fatalf("NewDemuxer: %v", err)
+	}
+	defer d.Close()
+	var sizes []int
+	for {
+		pkt, err := d.NextPacket()
+		if err == io.EOF {
+			return sizes
+		}
+		if err != nil {
+			t.Fatalf("NextPacket: %v", err)
+		}
+		sizes = append(sizes, len(pkt.Data))
+	}
+}
+
+// TestGoldenRefFlashingSequence pins the v3 golden reference: content that
+// returns to the key frame's pose after an excursion — the background-
+// animation flash pattern — codes each return almost for free by predicting
+// from the golden frame, where last-ref prediction would pay a full re-code
+// (the previous frame no longer holds the pose).
+func TestGoldenRefFlashingSequence(t *testing.T) {
+	cfg := Config{Width: 128, Height: 96, FPSNum: 30, FPSDen: 1}
+	const frames = 9
+	flash := func(g geometry, i int) *image.YCbCr {
+		if i%2 == 0 {
+			return synthFrame(g, 1) // the held pose, also the key frame
+		}
+		return synthFrame(g, 2) // the excursion
+	}
+	container, refs := encodeCodedGen(t, cfg, frames, flash, WithIntra(16), WithGOP(frames))
+
+	// The format's core contract holds on the golden path: decode is
+	// deterministic, and quality is sane on every frame.
+	first := decodeToPlanes(t, container)
+	second := decodeToPlanes(t, container)
+	if len(first) != frames {
+		t.Fatalf("decoded %d frames, want %d", len(first), frames)
+	}
+	g := geometryFor(cfg.Width, cfg.Height)
+	imgs := decodeImages(t, container)
+	for i := range first {
+		if !bytes.Equal(first[i], second[i]) {
+			t.Fatalf("frame %d: decode is not deterministic", i)
+		}
+		if p := framePSNR(imgs[i], refs[i], g); p < 30 {
+			t.Errorf("frame %d: PSNR %.1f dB, want >= 30", i, p)
+		}
+	}
+
+	// Every return to the pose (even frames past the key) must be tiny next to
+	// an excursion frame, which re-codes real content. Without the golden
+	// reference the returns cost as much as the excursions.
+	sizes := packetSizes(t, container)
+	for i := 2; i < frames; i += 2 {
+		if sizes[i] > sizes[1]/10 {
+			t.Errorf("frame %d (return to pose): %d bytes, want < 10%% of excursion frame's %d",
+				i, sizes[i], sizes[1])
+		}
+	}
+	t.Logf("key %d B, excursion %d B, returns %d/%d/%d/%d B",
+		sizes[0], sizes[1], sizes[2], sizes[4], sizes[6], sizes[8])
+}

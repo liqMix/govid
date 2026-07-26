@@ -29,11 +29,13 @@ type Codec struct {
 
 	// work is the padded reconstruction buffer coded frames decode into before
 	// the visible region is copied to the ring. ref is the previous frame's
-	// reconstruction, the reference an inter frame predicts from. dec owns the
+	// reconstruction, the reference an inter frame predicts from; golden holds
+	// the GOP key frame's reconstruction, the second reference. dec owns the
 	// reusable entropy tables and tile workers.
-	work *frameBuf
-	ref  *frameBuf
-	dec  *decodeState
+	work   *frameBuf
+	ref    *frameBuf
+	golden *frameBuf
+	dec    *decodeState
 }
 
 // Option configures a Codec.
@@ -132,6 +134,7 @@ func (c *Codec) configure(w, h int) error {
 	}
 	c.work = newFrameBuf(c.geo)
 	c.ref = newFrameBuf(c.geo)
+	c.golden = newFrameBuf(c.geo)
 	c.dec = newDecodeState()
 	c.next = 0
 	c.ready = true
@@ -140,11 +143,17 @@ func (c *Codec) configure(w, h int) error {
 
 // decodeCoded decodes a compressed frame into the padded work buffer, copies
 // the visible region into the ring image, then promotes the work buffer to the
-// reference for a following inter frame.
+// reference for a following inter frame. A key frame's reconstruction is also
+// copied into the golden buffer — the GOP's second reference — so a seek that
+// lands on a key rebuilds golden identically to a straight-through decode.
 func (c *Codec) decodeCoded(dst *image.YCbCr, fh frameHeader, body []byte) error {
 	inter := fh.Coding == CodingInter
-	if err := c.dec.decodeCoded(c.work, c.ref, body, inter, fh.Type == FrameKey); err != nil {
+	key := fh.Type == FrameKey
+	if err := c.dec.decodeCoded(c.work, c.ref, c.golden, body, inter, key); err != nil {
 		return err
+	}
+	if key {
+		c.golden.copyFrom(c.work)
 	}
 	c.work.storeImage(c.geo, dst)
 	c.work, c.ref = c.ref, c.work

@@ -18,7 +18,18 @@ func (td *tileDecoder) decodeInterMB(mbx, mby int, b tileBounds) {
 		td.decodeChromaMB(mbx, mby, b)
 		td.mv[idx] = motionVector{}
 	case mbInter:
-		pred := predictMV(td.mv, td.mvStride, mbx, mby, b)
+		refSel := td.dec.decode(ctxRef)
+		if refSel < 0 || refSel >= numRefs {
+			td.dec.fail(ErrCorrupt)
+			return
+		}
+		// A golden macroblock predicts from a static anchor: its MVs code
+		// against zero and it looks like a zero vector to its neighbors, so
+		// last-ref prediction never mixes reference spaces.
+		ref, pred := td.ref, predictMV(td.mv, td.mvStride, mbx, mby, b)
+		if refSel == refGolden {
+			ref, pred = td.golden, motionVector{}
+		}
 		part := td.dec.decode(ctxPart)
 		if part < 0 || part >= numPartModes {
 			td.dec.fail(ErrCorrupt)
@@ -39,8 +50,12 @@ func (td *tileDecoder) decodeInterMB(mbx, mby int, b tileBounds) {
 		if td.dec.err != nil {
 			return
 		}
-		td.mv[idx] = mvs[0]
-		td.reconInterMB(mbx, mby, part, mvs[:len(rects)])
+		if refSel == refGolden {
+			td.mv[idx] = motionVector{}
+		} else {
+			td.mv[idx] = mvs[0]
+		}
+		td.reconInterMB(ref, mbx, mby, part, mvs[:len(rects)])
 	default:
 		td.dec.fail(ErrCorrupt)
 	}
@@ -55,7 +70,7 @@ func (td *tileDecoder) reconMCMB(mbx, mby int, mv motionVector) {
 	mcChromaByteMB(td.ref.cr, cx, cy, mv, td.rec.cr)
 }
 
-func (td *tileDecoder) reconInterMB(mbx, mby, part int, mvs []motionVector) {
+func (td *tileDecoder) reconInterMB(ref *frameBuf, mbx, mby, part int, mvs []motionVector) {
 	cbp := td.dec.decode(ctxCBP)
 	if cbp < 0 || cbp >= numCBP || td.dec.err != nil {
 		td.dec.fail(ErrCorrupt)
@@ -69,7 +84,7 @@ func (td *tileDecoder) reconInterMB(mbx, mby, part int, mvs []motionVector) {
 	if cbp&cbpLuma != 0 {
 		var mcY [mbSize * mbSize]int32
 		for i, rc := range rects {
-			mcLumaRect(td.ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], mcY[:])
+			mcLumaRect(ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], mcY[:])
 		}
 		txIdx := td.dec.decode(ctxTxSize)
 		if txIdx < 0 || txIdx >= len(lumaTxSizes) {
@@ -92,14 +107,14 @@ func (td *tileDecoder) reconInterMB(mbx, mby, part int, mvs []motionVector) {
 		}
 	} else {
 		for i, rc := range rects {
-			mcLumaByteRect(td.ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], td.rec.y)
+			mcLumaByteRect(ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], td.rec.y)
 		}
 	}
 
 	// Chroma: same split per plane — assemble int32 only for a coded plane.
 	cx, cy := mbx*chromaMB, mby*chromaMB
-	td.reconInterChroma(mbx, mby, cx, cy, rects, mvs, td.ref.cb, td.rec.cb, cbp&cbpCb != 0)
-	td.reconInterChroma(mbx, mby, cx, cy, rects, mvs, td.ref.cr, td.rec.cr, cbp&cbpCr != 0)
+	td.reconInterChroma(mbx, mby, cx, cy, rects, mvs, ref.cb, td.rec.cb, cbp&cbpCb != 0)
+	td.reconInterChroma(mbx, mby, cx, cy, rects, mvs, ref.cr, td.rec.cr, cbp&cbpCr != 0)
 }
 
 // reconInterChroma reconstructs one chroma plane of an inter macroblock: an

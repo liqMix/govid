@@ -35,6 +35,7 @@ type frameEncoder struct {
 	src     *frameBuf
 	rec     *frameBuf
 	ref     *frameBuf // previous reconstruction; nil for an intra frame
+	golden  *frameBuf // the GOP key frame's reconstruction; nil for an intra frame
 	q       quantizer
 	grid    tileGrid
 	streams []*tileStream
@@ -66,8 +67,9 @@ type tileEncoder struct {
 }
 
 // newFrameEncoder builds an encoder over a source image, shared by the intra
-// and inter paths. ref is the reference frame for inter coding, or nil.
-func newFrameEncoder(g geometry, img *image.YCbCr, ref *frameBuf, qp, tileCols, tileRows int) *frameEncoder {
+// and inter paths. ref and golden are the reference frames for inter coding,
+// or nil.
+func newFrameEncoder(g geometry, img *image.YCbCr, ref, golden *frameBuf, qp, tileCols, tileRows int) *frameEncoder {
 	src := newFrameBuf(g)
 	src.loadImage(g, img)
 	rec := newFrameBuf(g)
@@ -77,6 +79,7 @@ func newFrameEncoder(g geometry, img *image.YCbCr, ref *frameBuf, qp, tileCols, 
 		src:      src,
 		rec:      rec,
 		ref:      ref,
+		golden:   golden,
 		q:        newQuantizer(qp),
 		grid:     newTileGrid(src.mbCols, src.mbRows, tileCols, tileRows),
 		mv:       make([]motionVector, src.mbCols*src.mbRows),
@@ -147,7 +150,7 @@ func (e *frameEncoder) finish(qp int, prev [][]uint32) ([]byte, *frameBuf, [][]u
 // becomes the reference for a following inter frame, and the shipped frequency
 // vectors for table delta-coding.
 func encodeIntraFrame(g geometry, img *image.YCbCr, qp, tileCols, tileRows int, twoPass bool) ([]byte, *frameBuf, [][]uint32) {
-	e := newFrameEncoder(g, img, nil, qp, tileCols, tileRows)
+	e := newFrameEncoder(g, img, nil, nil, qp, tileCols, tileRows)
 	e.encode(false, twoPass)
 	return e.finish(qp, nil)
 }

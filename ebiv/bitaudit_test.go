@@ -52,6 +52,7 @@ func TestBitAudit(t *testing.T) {
 	var (
 		g           geometry
 		ref         *frameBuf
+		golden      *frameBuf
 		prevShipped [][]uint32
 		agg         = newAuditTally()
 		interAgg    = newAuditTally()
@@ -75,7 +76,7 @@ func TestBitAudit(t *testing.T) {
 		}
 
 		inter := i > 0
-		e := newFrameEncoder(g, frame.YCbCr, ref, qp, tileCols, tileRows)
+		e := newFrameEncoder(g, frame.YCbCr, ref, golden, qp, tileCols, tileRows)
 		e.encodeTilesParallel(inter)
 		var prev [][]uint32
 		if inter {
@@ -83,6 +84,9 @@ func TestBitAudit(t *testing.T) {
 		}
 		payload, rec, shipped := e.finish(qp, prev)
 		ref = rec
+		if !inter {
+			golden = rec // the key frame's reconstruction is the GOP's golden
+		}
 		payloadSum += len(payload)
 		if !inter {
 			prevShipped = make([][]uint32, numContexts)
@@ -241,6 +245,8 @@ func (a *auditTally) record(ctx, sym int, bits float64) {
 	switch {
 	case ctx == ctxMBMode:
 		a.groups["mbmode"] += bits
+	case ctx == ctxRef:
+		a.groups["ref"] += bits
 	case ctx == ctxPart:
 		a.groups["part"] += bits
 	case ctx == ctxTxSize:
@@ -382,6 +388,7 @@ func (w *auditWalker) walkInterMB(stats *auditMBStats) {
 		return
 	}
 	stats.interMBs++
+	w.next() // ctxRef
 	_, part := w.next() // ctxPart
 	for range partRects[part] {
 		w.classValue("mv") // dx

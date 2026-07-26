@@ -201,7 +201,7 @@ func measureClip(t *testing.T, clip, work string, frames int) (clipResult, error
 	}
 	var lastEbiv string
 	ebivPoints, err := bracket(anchorPSNR, 18, 4, 0, 63, func(qp int) (ratePoint, error) {
-		f := filepath.Join(dir, fmt.Sprintf("ebiv_qp%d_gop%d_%d%s.ebiv", qp, gop, frames, suffix))
+		f := filepath.Join(dir, fmt.Sprintf("ebiv_v%d_qp%d_gop%d_%d%s.ebiv", ebiv.Version, qp, gop, frames, suffix))
 		if err := encodeEbivFromYUV(f, master, w, h, fpsNum, fpsDen, qp, gop, frames, twoPass); err != nil {
 			return ratePoint{}, err
 		}

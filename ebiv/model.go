@@ -5,11 +5,15 @@ package ebiv
 // and the entropy-context layout. Both sides derive every table from these
 // constants, so a change here changes both ends at once.
 //
-// This is bitstream v2 (see .docs/ebiv-gap-analysis.md M1): compared with v1 it
-// adds a skip macroblock mode, a coded-block pattern, class+suffix coding for
-// motion vectors and escapes (replacing raw LEB128 bytes), a fixed uniform
-// "bypass" context for raw suffix bits, and coefficient-token contexts split by
-// transform size with a dedicated DC band.
+// This is bitstream v3 (see .docs/ebiv-v3-plan.md M8): v2 (M1) added a skip
+// macroblock mode, a coded-block pattern, class+suffix coding for motion
+// vectors and escapes (replacing raw LEB128 bytes), a fixed uniform "bypass"
+// context for raw suffix bits, and coefficient-token contexts split by
+// transform size with a dedicated DC band. v3 adds a second reference frame:
+// an mbInter macroblock carries a reference-select token choosing between the
+// previous reconstruction and the golden frame (the GOP's key frame), which
+// makes returning to a held pose — the background-animation flash pattern —
+// nearly free.
 
 // Block grid. Luma is coded in 16x16 macroblocks; in 4:2:0 each macroblock
 // carries one 8x8 block per chroma plane.
@@ -47,6 +51,17 @@ const (
 	mbInter        // explicit MV delta plus a coded residual
 	mbIntra        // coded like a key-frame macroblock
 	numMBModes
+)
+
+// Reference frames an mbInter macroblock may predict from. Skip always uses
+// refLast. A golden-ref macroblock predicts its MVs from zero (its motion is
+// relative to a static anchor, uncorrelated with neighboring last-ref motion)
+// and contributes a zero vector to the MV grid, exactly like an intra
+// macroblock, so last-ref prediction never mixes reference spaces.
+const (
+	refLast   = iota // the previous frame's reconstruction
+	refGolden        // the GOP's key-frame reconstruction
+	numRefs
 )
 
 // Coded-block pattern bits for an mbInter macroblock. A clear bit means the
@@ -111,6 +126,7 @@ const (
 	ctxLumaMode          // intra mode per luma block, alphabet numIntraModes
 	ctxChromaMode        // intra mode per macroblock chroma, alphabet numIntraModes
 	ctxMBMode            // inter macroblock mode, alphabet numMBModes
+	ctxRef               // inter reference select, alphabet numRefs
 	ctxPart              // inter motion partition shape, alphabet numPartModes
 	ctxCBP               // coded-block pattern, alphabet numCBP
 	ctxSign              // coefficient sign, alphabet 2
@@ -182,6 +198,7 @@ var alphabetSizes = func() [numContexts]int {
 	a[ctxLumaMode] = numIntraModes
 	a[ctxChromaMode] = numIntraModes
 	a[ctxMBMode] = numMBModes
+	a[ctxRef] = numRefs
 	a[ctxPart] = numPartModes
 	a[ctxCBP] = numCBP
 	a[ctxSign] = 2

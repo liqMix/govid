@@ -36,6 +36,15 @@ func newFrameBuf(g geometry) *frameBuf {
 	}
 }
 
+// copyFrom copies another buffer's planes into this one. The two must share a
+// geometry; the decoder uses it to hold the key frame's reconstruction as the
+// golden reference (a copy once per GOP, not per frame).
+func (f *frameBuf) copyFrom(src *frameBuf) {
+	copy(f.y.data, src.y.data)
+	copy(f.cb.data, src.cb.data)
+	copy(f.cr.data, src.cr.data)
+}
+
 // loadImage copies a source image into the padded buffer, replicating the
 // visible edge into the padding so edge blocks predict from plausible pixels.
 func (f *frameBuf) loadImage(g geometry, img *image.YCbCr) {

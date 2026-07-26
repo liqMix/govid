@@ -12,6 +12,7 @@ type tileDecoder struct {
 	dec      *ransDecoder
 	rec      *frameBuf
 	ref      *frameBuf
+	golden   *frameBuf
 	q        quantizer
 	inter    bool
 	mv       []motionVector
@@ -49,9 +50,9 @@ func newDecodeState() *decodeState {
 }
 
 // decodeCoded parses a coded frame body and decodes it into rec. For an inter
-// frame, ref is the previous reconstruction. key selects self-contained table
-// parsing.
-func (ds *decodeState) decodeCoded(rec, ref *frameBuf, body []byte, inter, key bool) error {
+// frame, ref is the previous reconstruction and golden the GOP key frame's.
+// key selects self-contained table parsing.
+func (ds *decodeState) decodeCoded(rec, ref, golden *frameBuf, body []byte, inter, key bool) error {
 	hdr, tiles, err := ds.parsePayload(body, key)
 	if err != nil {
 		return err
@@ -72,7 +73,7 @@ func (ds *decodeState) decodeCoded(rec, ref *frameBuf, body []byte, inter, key b
 	// no goroutine and allocates nothing here.
 	sharedPool().run(len(tiles), func(i int) {
 		td := &ds.tds[i]
-		td.rec, td.ref, td.q = rec, ref, q
+		td.rec, td.ref, td.golden, td.q = rec, ref, golden, q
 		td.inter, td.mv, td.mvStride = inter, ds.mv, rec.mbCols
 		if td.dec == nil {
 			td.dec = &ransDecoder{}

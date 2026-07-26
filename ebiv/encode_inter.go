@@ -16,8 +16,8 @@ import "image"
 // in principle but converges quickly around a good predictor.
 const searchStart = 16
 
-func encodeInterFrame(g geometry, img *image.YCbCr, ref *frameBuf, qp, tileCols, tileRows int, prev [][]uint32, twoPass bool) ([]byte, *frameBuf, [][]uint32) {
-	e := newFrameEncoder(g, img, ref, qp, tileCols, tileRows)
+func encodeInterFrame(g geometry, img *image.YCbCr, ref, golden *frameBuf, qp, tileCols, tileRows int, prev [][]uint32, twoPass bool) ([]byte, *frameBuf, [][]uint32) {
+	e := newFrameEncoder(g, img, ref, golden, qp, tileCols, tileRows)
 	e.encode(true, twoPass)
 	return e.finish(qp, prev)
 }
@@ -30,16 +30,16 @@ func (te *tileEncoder) encodeInterTile(s *tileStream, b tileBounds) {
 	}
 }
 
-// encodeInterMB races skip, inter (across partition shapes), and intra coding
-// for one macroblock and commits the winner. Trials reconstruct into rec as
-// they go; the committing pass re-runs the winner so rec ends bit-exact with
-// the decoder.
+// encodeInterMB races skip, inter (across partition shapes and both
+// references), and intra coding for one macroblock and commits the winner.
+// Trials reconstruct into rec as they go; the committing pass re-runs the
+// winner so rec ends bit-exact with the decoder.
 func (te *tileEncoder) encodeInterMB(s *tileStream, mbx, mby int, b tileBounds) {
 	fe := te.fe
 	pred := predictMV(fe.mv, fe.mvStride, mbx, mby, b)
 
 	// Skip candidate: prediction at the predicted MV, zero residual.
-	skipSSE := te.mcMBSSE(mbx, mby, pred)
+	skipSSE := te.mcMBSSE(fe.ref, mbx, mby, pred)
 	skipCost := skipSSE + fe.lambda*2
 
 	// Inter candidate: pick the partition shape with the lowest RD cost. Each
@@ -56,16 +56,31 @@ func (te *tileEncoder) encodeInterMB(s *tileStream, mbx, mby int, b tileBounds) 
 			if i > 0 {
 				pp = mvs[0]
 			}
-			mvs[i] = te.searchMVRect(mbx, mby, rc[0], rc[1], rc[2], rc[3], pp)
+			mvs[i] = te.searchMVRect(fe.ref, mbx, mby, rc[0], rc[1], rc[2], rc[3], pp)
 		}
 		var trial tileStream
-		sse := te.codeInterMB(&trial, mbx, mby, part, mvs[:len(rects)], pred)
-		cost := sse + fe.lambda*int64(te.rdBits(trial.toks)+2)
+		sse := te.codeInterMB(&trial, fe.ref, mbx, mby, part, mvs[:len(rects)], pred)
+		cost := sse + fe.lambda*int64(te.rdBits(trial.toks)+3)
 		if cost < bestInterCost {
 			bestInterCost = cost
 			bestPart = part
 			copy(bestMVs[:], mvs[:])
 		}
+	}
+
+	// Golden candidate: whole-macroblock motion against the GOP's key frame,
+	// predicted from zero. This is the flash-back pattern — content returning
+	// to a pose the previous frame no longer holds. Whole-partition only: when
+	// golden wins it wins as a static anchor, and skipping the sub-partition
+	// trials keeps the extra reference from doubling encode time.
+	goldenCost := int64(1) << 62
+	var goldenMV motionVector
+	if fe.golden != nil {
+		gmv := te.searchMVRect(fe.golden, mbx, mby, 0, 0, mbSize, mbSize, motionVector{})
+		var trial tileStream
+		sse := te.codeInterMB(&trial, fe.golden, mbx, mby, partWhole, []motionVector{gmv}, motionVector{})
+		goldenCost = sse + fe.lambda*int64(te.rdBits(trial.toks)+3)
+		goldenMV = gmv
 	}
 
 	// Intra candidate.
@@ -75,13 +90,19 @@ func (te *tileEncoder) encodeInterMB(s *tileStream, mbx, mby int, b tileBounds) 
 
 	idx := mby*fe.mvStride + mbx
 	switch {
-	case skipCost <= bestInterCost && skipCost <= intraCost:
+	case skipCost <= bestInterCost && skipCost <= intraCost && skipCost <= goldenCost:
 		s.put(ctxMBMode, mbSkip)
 		te.reconMC(mbx, mby, pred)
 		fe.mv[idx] = pred
+	case goldenCost < bestInterCost && goldenCost <= intraCost:
+		s.put(ctxMBMode, mbInter)
+		s.put(ctxRef, refGolden)
+		te.codeInterMB(s, fe.golden, mbx, mby, partWhole, []motionVector{goldenMV}, motionVector{})
+		fe.mv[idx] = motionVector{} // a golden MB is a zero vector to its neighbors
 	case bestInterCost <= intraCost:
 		s.put(ctxMBMode, mbInter)
-		te.codeInterMB(s, mbx, mby, bestPart, bestMVs[:len(partRects[bestPart])], pred)
+		s.put(ctxRef, refLast)
+		te.codeInterMB(s, fe.ref, mbx, mby, bestPart, bestMVs[:len(partRects[bestPart])], pred)
 		fe.mv[idx] = bestMVs[0] // the top-left partition represents the macroblock
 	default:
 		s.put(ctxMBMode, mbIntra)
@@ -125,12 +146,13 @@ func planeSSE(src, rec planeView, x0, y0, n int) int64 {
 	return sse
 }
 
-// mcMBSSE motion-compensates the whole macroblock at mv and returns its SSE
-// against the source without touching rec — the cost of the skip candidate.
-func (te *tileEncoder) mcMBSSE(mbx, mby int, mv motionVector) int64 {
+// mcMBSSE motion-compensates the whole macroblock at mv from ref and returns
+// its SSE against the source without touching rec — the cost of the skip
+// candidate.
+func (te *tileEncoder) mcMBSSE(ref *frameBuf, mbx, mby int, mv motionVector) int64 {
 	fe := te.fe
 	var mcY [mbSize * mbSize]int32
-	mcLumaMB(fe.ref.y, mbx, mby, mv, mcY[:])
+	mcLumaMB(ref.y, mbx, mby, mv, mcY[:])
 	var sse int64
 	x0, y0 := mbx*mbSize, mby*mbSize
 	for r := 0; r < mbSize; r++ {
@@ -141,14 +163,14 @@ func (te *tileEncoder) mcMBSSE(mbx, mby int, mv motionVector) int64 {
 	}
 	var mcC [chromaMB * chromaMB]int32
 	cx, cy := mbx*chromaMB, mby*chromaMB
-	mcChromaBlock(fe.ref.cb, cx, cy, mv, mcC[:])
+	mcChromaBlock(ref.cb, cx, cy, mv, mcC[:])
 	for r := 0; r < chromaMB; r++ {
 		for c := 0; c < chromaMB; c++ {
 			d := int64(fe.src.cb.at(cx+c, cy+r)) - int64(mcC[r*chromaMB+c])
 			sse += d * d
 		}
 	}
-	mcChromaBlock(fe.ref.cr, cx, cy, mv, mcC[:])
+	mcChromaBlock(ref.cr, cx, cy, mv, mcC[:])
 	for r := 0; r < chromaMB; r++ {
 		for c := 0; c < chromaMB; c++ {
 			d := int64(fe.src.cr.at(cx+c, cy+r)) - int64(mcC[r*chromaMB+c])
@@ -192,7 +214,7 @@ func writeMC(rec planeView, x0, y0, n int, mc []int32, mcStride int) {
 // reconstructs it, and returns the SSE. Residuals are tokenized to scratch
 // first so the CBP can be emitted ahead of them, and all-zero components
 // collapse to a clear bit.
-func (te *tileEncoder) codeInterMB(s *tileStream, mbx, mby, part int, mvs []motionVector, pred motionVector) int64 {
+func (te *tileEncoder) codeInterMB(s *tileStream, ref *frameBuf, mbx, mby, part int, mvs []motionVector, pred motionVector) int64 {
 	fe := te.fe
 	rects := partRects[part]
 	s.put(ctxPart, part)
@@ -208,13 +230,13 @@ func (te *tileEncoder) codeInterMB(s *tileStream, mbx, mby, part int, mvs []moti
 	// Assemble the motion-compensated prediction from the partitions.
 	var mcY [mbSize * mbSize]int32
 	for i, rc := range rects {
-		mcLumaRect(fe.ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], mcY[:])
+		mcLumaRect(ref.y, mbx, mby, rc[0], rc[1], rc[2], rc[3], mvs[i], mcY[:])
 	}
 	cx, cy := mbx*chromaMB, mby*chromaMB
 	var mcCb, mcCr [chromaMB * chromaMB]int32
 	for i, rc := range rects {
-		mcChromaRect(fe.ref.cb, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], mcCb[:])
-		mcChromaRect(fe.ref.cr, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], mcCr[:])
+		mcChromaRect(ref.cb, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], mcCb[:])
+		mcChromaRect(ref.cr, cx, cy, rc[0], rc[1], rc[2], rc[3], mvs[i], mcCr[:])
 	}
 
 	// Luma: choose the transform size that codes the residual best, tokenizing
@@ -306,11 +328,11 @@ func (te *tileEncoder) codeInterLuma(s *tileStream, mbx, mby int, mc []int32, tx
 // full-pel diamond toward lower luma SAD, then refines to quarter-pel. Diamond
 // search visits a small fraction of the points a full search would while
 // landing on essentially the same optimum for smooth motion.
-func (te *tileEncoder) searchMVRect(mbx, mby, px, py, pw, ph int, pred motionVector) motionVector {
+func (te *tileEncoder) searchMVRect(ref *frameBuf, mbx, mby, px, py, pw, ph int, pred motionVector) motionVector {
 	best := motionVector{}
-	bestSAD := te.rectSAD(mbx, mby, px, py, pw, ph, best)
+	bestSAD := te.rectSAD(ref, mbx, mby, px, py, pw, ph, best)
 	consider := func(mv motionVector) bool {
-		if sad := te.rectSAD(mbx, mby, px, py, pw, ph, mv); sad < bestSAD {
+		if sad := te.rectSAD(ref, mbx, mby, px, py, pw, ph, mv); sad < bestSAD {
 			bestSAD, best = sad, mv
 			return true
 		}
@@ -346,10 +368,10 @@ func (te *tileEncoder) searchMVRect(mbx, mby, px, py, pw, ph int, pred motionVec
 	return best
 }
 
-func (te *tileEncoder) rectSAD(mbx, mby, px, py, pw, ph int, mv motionVector) int64 {
+func (te *tileEncoder) rectSAD(ref *frameBuf, mbx, mby, px, py, pw, ph int, mv motionVector) int64 {
 	fe := te.fe
 	var mc [mbSize * mbSize]int32
-	mcLumaRect(fe.ref.y, mbx, mby, px, py, pw, ph, mv, mc[:])
+	mcLumaRect(ref.y, mbx, mby, px, py, pw, ph, mv, mc[:])
 	var sad int64
 	x0, y0 := mbx*mbSize, mby*mbSize
 	for r := 0; r < ph; r++ {
