@@ -29,6 +29,7 @@ type Encoder struct {
 	golden    *frameBuf  // the GOP key frame's reconstruction, the second reference
 	sinceKF   int        // inter frames since the last key frame
 	prevFreqs [][]uint32 // last shipped frequency vector per context (table deltas)
+	prevY     []byte     // previous source luma, packed — scene-cut detection
 }
 
 // EncoderOption configures a compressing encoder.
@@ -149,11 +150,53 @@ func (e *Encoder) writeRaw(img *image.YCbCr) error {
 	return e.w.WriteFrame(e.buf, true)
 }
 
+// Scene-cut keyframe placement. A key on a fixed cadence can land just after
+// a cut, paying the cut twice: a burst of intra-in-inter macroblocks at the
+// cut (measured at ~5% of macroblocks on real MV content), then a full key a
+// frame later. Detecting the cut and starting the GOP there converts the
+// burst into the key it wanted to be. The scheduled cadence still caps the
+// interval, so seek granularity is unchanged.
+const (
+	// sceneCutAvgSAD is the average per-pixel luma difference above which a
+	// frame is treated as starting a new scene. Pans and motion sit well
+	// below it; hard cuts sit well above.
+	sceneCutAvgSAD = 28
+	// sceneCutMinGap is the minimum frames between a key and a cut-forced
+	// key, so strobing content cannot spam keys — returning flashes are the
+	// golden reference's job, not the keyframe's.
+	sceneCutMinGap = 8
+)
+
+// sceneCut reports whether img starts a new scene relative to the previous
+// source frame, and records img as the new reference for the next call.
+func (e *Encoder) sceneCut(img *image.YCbCr) bool {
+	w, h := e.geo.W, e.geo.H
+	first := e.prevY == nil
+	if first {
+		e.prevY = make([]byte, w*h)
+	}
+	var sad int64
+	if !first {
+		for y := 0; y < h; y++ {
+			row := img.Y[y*img.YStride : y*img.YStride+w]
+			prev := e.prevY[y*w : y*w+w]
+			for x := 0; x < w; x++ {
+				d := int32(row[x]) - int32(prev[x])
+				sad += int64(abs32(d))
+			}
+		}
+	}
+	gatherPlane(e.prevY, img.Y, img.YStride, w, h)
+	return !first && sad > int64(w*h)*sceneCutAvgSAD
+}
+
 func (e *Encoder) writeCoded(img *image.YCbCr) error {
 	// Keys land every gop frames: sinceKF counts the inter frames written since
 	// the last key, so gop-1 of them fit between keys. (A >= e.gop test here is
 	// the off-by-one that made gop=1 alternate I/P instead of all-intra.)
-	key := e.ref == nil || e.sinceKF >= e.gop-1
+	// A detected scene cut starts the GOP early, min-gap guarded.
+	cut := e.sceneCut(img)
+	key := e.ref == nil || e.sinceKF >= e.gop-1 || (cut && e.sinceKF+1 >= sceneCutMinGap)
 	cols, rows := e.tileGrid()
 	var (
 		hdr     frameHeader

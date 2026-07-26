@@ -566,3 +566,82 @@ func buildTestTables(t *testing.T, toks []entToken) []ransTable {
 	installBypass(tables, true)
 	return tables
 }
+
+// frameTypes returns each frame record's type by parsing its header.
+func frameTypes(t *testing.T, container []byte) []FrameType {
+	t.Helper()
+	d, err := NewDemuxer(bytes.NewReader(container))
+	if err != nil {
+		t.Fatalf("NewDemuxer: %v", err)
+	}
+	defer d.Close()
+	var types []FrameType
+	for {
+		pkt, err := d.NextPacket()
+		if err == io.EOF {
+			return types
+		}
+		if err != nil {
+			t.Fatalf("NextPacket: %v", err)
+		}
+		fh, _, err := parseFrameHeader(pkt.Data)
+		if err != nil {
+			t.Fatalf("parseFrameHeader: %v", err)
+		}
+		types = append(types, fh.Type)
+	}
+}
+
+// TestSceneCutKeyframes pins the encoder's cut-aligned key placement: a hard
+// scene change mid-GOP becomes a key frame (starting a fresh GOP there), the
+// scheduled cadence still bounds the interval, and a change inside the
+// min-gap window does not spam an extra key.
+func TestSceneCutKeyframes(t *testing.T) {
+	cfg := Config{Width: 128, Height: 96, FPSNum: 30, FPSDen: 1}
+	const frames = 30
+	const cutAt = 12
+	gen := func(g geometry, i int) *image.YCbCr {
+		if i < cutAt {
+			return synthFrame(g, 1)
+		}
+		return synthFrame(g, 9) // unrelated content: a hard cut
+	}
+	container, _ := encodeCodedGen(t, cfg, frames, gen, WithIntra(16), WithGOP(20))
+
+	types := frameTypes(t, container)
+	if types[0] != FrameKey {
+		t.Fatalf("frame 0 is %v, want key", types[0])
+	}
+	if types[cutAt] != FrameKey {
+		t.Errorf("frame %d (scene cut) is %v, want key", cutAt, types[cutAt])
+	}
+	// The cut restarted the GOP: no other key until the cadence from the cut.
+	for i := 1; i < frames; i++ {
+		if i == cutAt {
+			continue
+		}
+		want := FrameInter
+		if (i-cutAt) > 0 && (i-cutAt)%20 == 0 {
+			want = FrameKey // scheduled cadence measured from the cut key
+		}
+		if types[i] != want {
+			t.Errorf("frame %d is %v, want %v", i, types[i], want)
+		}
+	}
+
+	// A cut immediately after a key (inside the min gap) must not force
+	// another key: frame 2 changes content but stays inter.
+	early := func(g geometry, i int) *image.YCbCr {
+		if i < 2 {
+			return synthFrame(g, 1)
+		}
+		return synthFrame(g, 9)
+	}
+	container2, _ := encodeCodedGen(t, cfg, 6, early, WithIntra(16), WithGOP(20))
+	types2 := frameTypes(t, container2)
+	for i := 1; i < len(types2); i++ {
+		if types2[i] != FrameInter {
+			t.Errorf("min-gap: frame %d is %v, want inter", i, types2[i])
+		}
+	}
+}
