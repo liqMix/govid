@@ -52,6 +52,23 @@ type frameEncoder struct {
 	// only within its own bounds. mvStride is mbCols.
 	mv       []motionVector
 	mvStride int
+
+	// mvSearch caches pass-1 motion search results per macroblock. Search
+	// inputs (source and reference planes) are identical in both passes, so
+	// pass 2 reuses the vectors and spends its time only on re-pricing the
+	// decisions with real costs. Tiles write only their own cells.
+	mvSearch []mbSearchCache
+}
+
+// mbSearchCache holds one macroblock's pass-1 search results — a vector per
+// partition of each shape against the last reference and the whole-block
+// golden vector — plus the SAD-derived trial gates, which depend only on
+// source and reference pixels and so are identical in both passes.
+type mbSearchCache struct {
+	last      [numPartModes][4]motionVector
+	golden    motionVector
+	trySubs   bool // whole-block match poor enough that sub-partitions may pay
+	tryGolden bool // zero-MV golden probe beat the whole-block last-ref match
 }
 
 // tileEncoder is one tile's worker: a pointer to the shared frame state plus
@@ -88,6 +105,9 @@ func newFrameEncoder(g geometry, img *image.YCbCr, ref, golden *frameBuf, qp, ti
 	qac := int64(e.q.ac)
 	e.lambda = qac * qac / 6 // rate weight in the SSE domain
 	e.lambdaF = float64(e.lambda)
+	if ref != nil {
+		e.mvSearch = make([]mbSearchCache, src.mbCols*src.mbRows)
+	}
 	e.counts = make([][]uint32, numContexts)
 	for c := range e.counts {
 		e.counts[c] = make([]uint32, alphabetSizes[c])

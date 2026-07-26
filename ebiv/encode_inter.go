@@ -36,59 +36,109 @@ func (te *tileEncoder) encodeInterTile(s *tileStream, b tileBounds) {
 // winner so rec ends bit-exact with the decoder.
 func (te *tileEncoder) encodeInterMB(s *tileStream, mbx, mby int, b tileBounds) {
 	fe := te.fe
+	idx := mby*fe.mvStride + mbx
 	pred := predictMV(fe.mv, fe.mvStride, mbx, mby, b)
 
 	// Skip candidate: prediction at the predicted MV, zero residual.
 	skipSSE := te.mcMBSSE(fe.ref, mbx, mby, pred)
 	skipCost := skipSSE + fe.lambda*2
 
+	// Early skip: when the whole-macroblock prediction already sits at the
+	// noise floor, no rival can reclaim enough distortion to pay for its extra
+	// tokens — commit skip without searching or trialing anything. This is the
+	// converged-static case that dominates background animation, and it is
+	// what makes encode time scale with motion instead of area.
+	if skipSSE <= fe.lambda*8 {
+		s.put(ctxMBMode, mbSkip)
+		te.reconMC(mbx, mby, pred)
+		fe.mv[idx] = pred
+		return
+	}
+
 	// Inter candidate: pick the partition shape with the lowest RD cost. Each
 	// partition searches its own motion vector; partition 0 predicts from the
-	// macroblock predictor, the rest from partition 0.
+	// macroblock predictor, the rest from partition 0. Pass 2 reuses pass 1's
+	// vectors and gates — the search inputs are identical — and only re-prices.
+	cache := &fe.mvSearch[idx]
+	pass2 := fe.rdoq != nil
 	bestPart := partWhole
 	var bestMVs [4]motionVector
-	bestInterCost := int64(1) << 62
-	for part := 0; part < numPartModes; part++ {
-		rects := partRects[part]
-		var mvs [4]motionVector
-		for i, rc := range rects {
-			pp := pred
-			if i > 0 {
-				pp = mvs[0]
-			}
-			mvs[i] = te.searchMVRect(fe.ref, mbx, mby, rc[0], rc[1], rc[2], rc[3], pp)
+
+	// Whole partition first: its match quality gates everything rarer.
+	if !pass2 {
+		cache.last[partWhole][0] = te.searchMVRect(fe.ref, mbx, mby, 0, 0, mbSize, mbSize, pred)
+	}
+	bestMVs[0] = cache.last[partWhole][0]
+	var trial tileStream
+	sse := te.codeInterMB(&trial, fe.ref, mbx, mby, partWhole, bestMVs[:1], pred)
+	bestInterCost := sse + fe.lambda*int64(te.rdBits(trial.toks)+3)
+
+	if !pass2 {
+		wholeSAD := te.rectSAD(fe.ref, mbx, mby, 0, 0, mbSize, mbSize, bestMVs[0])
+		// Sub-partitions pay extra vectors; they only win when the whole-block
+		// match is genuinely poor (avg |error| above ~2/pixel).
+		cache.trySubs = wholeSAD > 2*mbSize*mbSize
+		// Golden's case is a pose the last frame lost: probe it at zero motion
+		// and only search when the probe already beats the last-ref match.
+		cache.tryGolden = fe.golden != nil &&
+			te.rectSAD(fe.golden, mbx, mby, 0, 0, mbSize, mbSize, motionVector{}) < wholeSAD
+		if cache.tryGolden {
+			cache.golden = te.searchMVRect(fe.golden, mbx, mby, 0, 0, mbSize, mbSize, motionVector{})
 		}
-		var trial tileStream
-		sse := te.codeInterMB(&trial, fe.ref, mbx, mby, part, mvs[:len(rects)], pred)
-		cost := sse + fe.lambda*int64(te.rdBits(trial.toks)+3)
-		if cost < bestInterCost {
-			bestInterCost = cost
-			bestPart = part
-			copy(bestMVs[:], mvs[:])
+	}
+
+	if cache.trySubs {
+		for part := partWhole + 1; part < numPartModes; part++ {
+			rects := partRects[part]
+			var mvs [4]motionVector
+			for i, rc := range rects {
+				if pass2 {
+					mvs[i] = cache.last[part][i]
+					continue
+				}
+				pp := pred
+				if i > 0 {
+					pp = mvs[0]
+				}
+				mvs[i] = te.searchMVRect(fe.ref, mbx, mby, rc[0], rc[1], rc[2], rc[3], pp)
+				cache.last[part][i] = mvs[i]
+			}
+			var trial tileStream
+			sse := te.codeInterMB(&trial, fe.ref, mbx, mby, part, mvs[:len(rects)], pred)
+			cost := sse + fe.lambda*int64(te.rdBits(trial.toks)+3)
+			if cost < bestInterCost {
+				bestInterCost = cost
+				bestPart = part
+				copy(bestMVs[:], mvs[:])
+			}
 		}
 	}
 
 	// Golden candidate: whole-macroblock motion against the GOP's key frame,
-	// predicted from zero. This is the flash-back pattern — content returning
-	// to a pose the previous frame no longer holds. Whole-partition only: when
-	// golden wins it wins as a static anchor, and skipping the sub-partition
-	// trials keeps the extra reference from doubling encode time.
+	// predicted from zero — the flash-back pattern, content returning to a
+	// pose the previous frame no longer holds. Whole-partition only, and only
+	// when the zero-MV probe above said golden is in the running.
 	goldenCost := int64(1) << 62
 	var goldenMV motionVector
-	if fe.golden != nil {
-		gmv := te.searchMVRect(fe.golden, mbx, mby, 0, 0, mbSize, mbSize, motionVector{})
+	if cache.tryGolden {
+		gmv := cache.golden
 		var trial tileStream
 		sse := te.codeInterMB(&trial, fe.golden, mbx, mby, partWhole, []motionVector{gmv}, motionVector{})
 		goldenCost = sse + fe.lambda*int64(te.rdBits(trial.toks)+3)
 		goldenMV = gmv
 	}
 
-	// Intra candidate.
+	// Intra candidate — only when inter is struggling. A macroblock whose best
+	// inter cost is already below the gate cannot be beaten by intra by more
+	// than the gate, and on inter frames intra wins essentially only on
+	// occlusions and scene changes, where inter cost is enormous.
+	intraCost := int64(1) << 62
 	var intraTok tileStream
-	intraSSE := te.codeLumaMBBest(&intraTok, mbx, mby, b) + te.encodeChromaMBTo(&intraTok, mbx, mby, b)
-	intraCost := intraSSE + fe.lambda*int64(te.rdBits(intraTok.toks)+2)
+	if bestInterCost > fe.lambda*32 {
+		intraSSE := te.codeLumaMBBest(&intraTok, mbx, mby, b) + te.encodeChromaMBTo(&intraTok, mbx, mby, b)
+		intraCost = intraSSE + fe.lambda*int64(te.rdBits(intraTok.toks)+2)
+	}
 
-	idx := mby*fe.mvStride + mbx
 	switch {
 	case skipCost <= bestInterCost && skipCost <= intraCost && skipCost <= goldenCost:
 		s.put(ctxMBMode, mbSkip)
