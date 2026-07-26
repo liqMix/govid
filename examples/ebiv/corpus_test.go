@@ -11,17 +11,36 @@ package main
 // interpolated (ln size, linear in dB) between the two bracketing points —
 // the same methodology as the M4 measurements in .docs/ebiv-gap-analysis.md.
 //
-// Requires ffmpeg+ffprobe with libx264 and libvpx-vp9 on PATH. Encodes are
-// cached in EBIV_CORPUS_WORK (default <os temp>/ebiv-corpus), so re-runs only
-// re-measure. Skips unless EBIV_CORPUS is set.
+// Requires ffmpeg+ffprobe with libx264 and libvpx-vp9 on PATH. Anchor encodes
+// are cached in EBIV_CORPUS_WORK (default <os temp>/ebiv-corpus), so re-runs
+// only re-measure. Skips unless EBIV_CORPUS is set.
 //
-//	EBIV_CORPUS="clipA.mpg;clipB.mp4" EBIV_FRAMES=600 \
-//	  go test ./examples/ebiv -run TestCorpusCompare -v -timeout 6h
+// Two tiers share this one test:
 //
-// EBIV encodes use WithFastEncode (single-pass, ~3.5% larger) and VP9 uses
-// -deadline good -cpu-used 2 (not the slowest/best) — both trade a few percent
-// of their best size for tractable corpus runtime; both concessions are on the
-// same side of the ledger and are noted with the results.
+// Iteration (~10 min): a short clip list, few frames, fixed EBIV qp points,
+// no VP9. EBIV files are re-encoded every run (no EBIV_TAG), so the numbers
+// always reflect the current build:
+//
+//	EBIV_CORPUS=@.docs/ebiv-corpus-dev.txt EBIV_FRAMES=240 \
+//	EBIV_QPS=18,22 EBIV_SKIP_VP9=1 EBIV_CORPUS_TWOPASS=1 \
+//	  go test ./examples/ebiv -run TestCorpusCompare -v -timeout 2h
+//
+// Gate (hours): the full list, 600 frames, bracket search, VP9 context, and
+// an explicit EBIV_TAG naming the build so the run can resume from cache:
+//
+//	EBIV_CORPUS=@.docs/ebiv-corpus-full.txt EBIV_FRAMES=600 \
+//	EBIV_CORPUS_TWOPASS=1 EBIV_TAG=v3-golden-sdh \
+//	  go test ./examples/ebiv -run TestCorpusCompare -v -timeout 8h
+//
+// EBIV_CORPUS is a ;-separated clip list, or @file naming a text file with
+// one clip per line (# comments allowed). EBIV_TAG opts EBIV encodes into the
+// cache under that name — only use a tag that uniquely names the encoder
+// build, and bump it after any encoder change; without a tag EBIV always
+// re-encodes. Anchor caches (master/x264/VP9) are keyed by content and
+// settings only and are always safe to reuse.
+//
+// VP9 uses -deadline good -cpu-used 2 (not the slowest/best), a few percent
+// off its best size, noted with the results.
 
 import (
 	"fmt"
@@ -56,23 +75,22 @@ func TestCorpusCompare(t *testing.T) {
 	}
 
 	var results []clipResult
-	for _, clip := range strings.Split(clips, ";") {
-		clip = strings.TrimSpace(clip)
-		if clip == "" {
-			continue
-		}
+	for _, clip := range corpusClips(t, clips) {
 		r, err := measureClip(t, clip, work, frames)
 		if err != nil {
 			t.Errorf("%s: %v", clipName(clip), err)
 			continue
 		}
 		results = append(results, r)
-		t.Logf("%-28s %dx%d@%.3g  x264 %.2fdB %s | x264-g %.2fdB %s | EBIV %s = %.2fx x264, %.2fx x264-g, %.2fx VP9 | decode %.2f/%.2f ms/f (1T/par), vp9 C %.2f",
+		vp9Part := ""
+		if r.vp9Size > 0 {
+			vp9Part = fmt.Sprintf(", %.2fx VP9", float64(r.ebivSize)/float64(r.vp9Size))
+		}
+		t.Logf("%-28s %dx%d@%.3g  x264 %.2fdB %s | x264-g %.2fdB %s | EBIV %s = %.2fx x264, %.2fx x264-g%s | decode %.2f/%.2f ms/f (1T/par), vp9 C %.2f",
 			r.name, r.w, r.h, r.fps, r.anchorPSNR, fmtMB(r.x264Size),
 			r.anchorGPSNR, fmtMB(r.x264gSize),
 			fmtMB(r.ebivSize), float64(r.ebivSize)/float64(r.x264Size),
-			float64(r.ebivSizeG)/float64(r.x264gSize),
-			float64(r.ebivSize)/float64(r.vp9Size),
+			float64(r.ebivSizeG)/float64(r.x264gSize), vp9Part,
 			r.ebivDecode1T, r.ebivDecodePar, r.vp9Decode1T)
 	}
 	if len(results) == 0 {
@@ -83,12 +101,16 @@ func TestCorpusCompare(t *testing.T) {
 	for _, r := range results {
 		vsX264 = append(vsX264, float64(r.ebivSize)/float64(r.x264Size))
 		vsX264g = append(vsX264g, float64(r.ebivSizeG)/float64(r.x264gSize))
-		vsVP9 = append(vsVP9, float64(r.ebivSize)/float64(r.vp9Size))
+		if r.vp9Size > 0 {
+			vsVP9 = append(vsVP9, float64(r.ebivSize)/float64(r.vp9Size))
+		}
 	}
 	t.Logf("=== corpus summary (%d clips, %d frames each, matched-PSNR sizes) ===", len(results), frames)
 	t.Logf("EBIV vs x264 (default keyint): median %.2fx, range %.2fx-%.2fx", median(vsX264), minOf(vsX264), maxOf(vsX264))
 	t.Logf("EBIV vs x264 (matched ~1s cadence): median %.2fx, range %.2fx-%.2fx", median(vsX264g), minOf(vsX264g), maxOf(vsX264g))
-	t.Logf("EBIV vs VP9 (context only): median %.2fx, range %.2fx-%.2fx", median(vsVP9), minOf(vsVP9), maxOf(vsVP9))
+	if len(vsVP9) > 0 {
+		t.Logf("EBIV vs VP9 (context only): median %.2fx, range %.2fx-%.2fx", median(vsVP9), minOf(vsVP9), maxOf(vsVP9))
+	}
 	t.Logf("EBIV encode: %s; VP9 good/cpu-used 2 (not best), default cadence", map[bool]string{true: "two-pass (final-asset config)", false: "single-pass -fast (~+3.5%)"}[os.Getenv("EBIV_CORPUS_TWOPASS") != ""])
 }
 
@@ -173,44 +195,70 @@ func measureClip(t *testing.T, clip, work string, frames int) (clipResult, error
 		return clipResult{}, fmt.Errorf("x264 -g psnr: %w", err)
 	}
 
-	// VP9: bracket the anchor PSNR with crf points, interpolate size.
-	vp9Points, err := bracket(anchorPSNR, 30, 6, 4, 63, func(crf int) (ratePoint, error) {
-		f := filepath.Join(dir, fmt.Sprintf("vp9_crf%d_%d.webm", crf, frames))
-		if err := runCached(f, "ffmpeg", "-v", "error", "-y",
-			"-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", fmt.Sprintf("%dx%d", w, h),
-			"-r", fmt.Sprintf("%d/%d", fpsNum, fpsDen), "-i", master,
-			"-frames:v", strconv.Itoa(frames),
-			"-c:v", "libvpx-vp9", "-crf", strconv.Itoa(crf), "-b:v", "0",
-			"-deadline", "good", "-cpu-used", "2", "-row-mt", "1", f); err != nil {
-			return ratePoint{}, err
+	// VP9: bracket the anchor PSNR with crf points, interpolate size. Skipped
+	// in iteration runs (EBIV_SKIP_VP9) — VP9 is context, not the gate.
+	var vp9Points []ratePoint
+	if os.Getenv("EBIV_SKIP_VP9") == "" {
+		vp9Points, err = bracket(anchorPSNR, 30, 6, 4, 63, func(crf int) (ratePoint, error) {
+			f := filepath.Join(dir, fmt.Sprintf("vp9_crf%d_%d.webm", crf, frames))
+			if err := runCached(f, "ffmpeg", "-v", "error", "-y",
+				"-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", fmt.Sprintf("%dx%d", w, h),
+				"-r", fmt.Sprintf("%d/%d", fpsNum, fpsDen), "-i", master,
+				"-frames:v", strconv.Itoa(frames),
+				"-c:v", "libvpx-vp9", "-crf", strconv.Itoa(crf), "-b:v", "0",
+				"-deadline", "good", "-cpu-used", "2", "-row-mt", "1", f); err != nil {
+				return ratePoint{}, err
+			}
+			p, err := psnrFFmpeg(f, master, w, h, frames)
+			return ratePoint{psnr: p, size: fileSize(f)}, err
+		})
+		if err != nil {
+			return clipResult{}, fmt.Errorf("vp9: %w", err)
 		}
-		p, err := psnrFFmpeg(f, master, w, h, frames)
-		return ratePoint{psnr: p, size: fileSize(f)}, err
-	})
-	if err != nil {
-		return clipResult{}, fmt.Errorf("vp9: %w", err)
 	}
 
-	// EBIV: bracket with qp points, ~1s GOP, auto tiles. EBIV_CORPUS_TWOPASS
-	// selects the full two-pass RDO encode (the final-asset configuration);
-	// default is the single-pass fast mode for iteration.
+	// EBIV: ~1s GOP, auto tiles. EBIV_CORPUS_TWOPASS selects the full two-pass
+	// RDO encode (the final-asset configuration); default is the single-pass
+	// fast mode. EBIV_QPS pins fixed operating points (iteration — no bracket
+	// search); otherwise points are bracketed around the anchor. Without an
+	// EBIV_TAG the encode always re-runs, so results reflect the current
+	// build; a tag opts into the cache under that build name.
 	twoPass := os.Getenv("EBIV_CORPUS_TWOPASS") != ""
 	suffix := ""
 	if twoPass {
 		suffix = "_2p"
 	}
+	if tag := os.Getenv("EBIV_TAG"); tag != "" {
+		suffix = "_" + tag + suffix
+	}
 	var lastEbiv string
-	ebivPoints, err := bracket(anchorPSNR, 18, 4, 0, 63, func(qp int) (ratePoint, error) {
+	measureEbiv := func(qp int) (ratePoint, error) {
 		f := filepath.Join(dir, fmt.Sprintf("ebiv_v%d_qp%d_gop%d_%d%s.ebiv", ebiv.Version, qp, gop, frames, suffix))
+		if os.Getenv("EBIV_TAG") == "" {
+			os.Remove(f) // untagged: never trust a file from another build
+		}
 		if err := encodeEbivFromYUV(f, master, w, h, fpsNum, fpsDen, qp, gop, frames, twoPass); err != nil {
 			return ratePoint{}, err
 		}
 		lastEbiv = f
 		p, err := psnrGovid(t, f, master, w, h, frames)
 		return ratePoint{psnr: p, size: fileSize(f)}, err
-	})
-	if err != nil {
-		return clipResult{}, fmt.Errorf("ebiv: %w", err)
+	}
+	var ebivPoints []ratePoint
+	if qps := envQPList(); qps != nil {
+		for _, qp := range qps {
+			pt, err := measureEbiv(qp)
+			if err != nil {
+				return clipResult{}, fmt.Errorf("ebiv qp%d: %w", qp, err)
+			}
+			ebivPoints = append(ebivPoints, pt)
+		}
+		sort.Slice(ebivPoints, func(i, j int) bool { return ebivPoints[i].psnr < ebivPoints[j].psnr })
+	} else {
+		ebivPoints, err = bracket(anchorPSNR, 18, 4, 0, 63, measureEbiv)
+		if err != nil {
+			return clipResult{}, fmt.Errorf("ebiv: %w", err)
+		}
 	}
 
 	r := clipResult{
@@ -219,7 +267,6 @@ func measureClip(t *testing.T, clip, work string, frames int) (clipResult, error
 		anchorGPSNR: anchorGPSNR,
 		x264Size:    fileSize(x264File),
 		x264gSize:   fileSize(x264gFile),
-		vp9Size:     interpolateSize(vp9Points, anchorPSNR),
 		ebivSize:    interpolateSize(ebivPoints, anchorPSNR),
 		ebivSizeG:   interpolateSize(ebivPoints, anchorGPSNR),
 	}
@@ -230,7 +277,10 @@ func measureClip(t *testing.T, clip, work string, frames int) (clipResult, error
 	prev := runtime.GOMAXPROCS(1)
 	r.ebivDecode1T = decodeSpeed(t, lastEbiv, frames)
 	runtime.GOMAXPROCS(prev)
-	r.vp9Decode1T = ffmpegDecodeSpeed(filepath.Join(dir, nearestVP9(dir, vp9Points, frames)), frames)
+	if len(vp9Points) > 0 {
+		r.vp9Size = interpolateSize(vp9Points, anchorPSNR)
+		r.vp9Decode1T = ffmpegDecodeSpeed(filepath.Join(dir, nearestVP9(dir, vp9Points, frames)), frames)
+	}
 	return r, nil
 }
 
@@ -527,6 +577,47 @@ func probeClip(path string) (w, h, fpsNum, fpsDen int, err error) {
 		return 0, 0, 0, 0, fmt.Errorf("odd dimensions %dx%d", w, h)
 	}
 	return w, h, fpsNum, fpsDen, nil
+}
+
+// corpusClips resolves EBIV_CORPUS: a ;-separated list, or @file naming a
+// text file with one clip path per line (blank lines and # comments skipped).
+func corpusClips(t *testing.T, spec string) []string {
+	t.Helper()
+	raw := spec
+	sep := ";"
+	if strings.HasPrefix(spec, "@") {
+		data, err := os.ReadFile(spec[1:])
+		if err != nil {
+			t.Fatalf("EBIV_CORPUS list file: %v", err)
+		}
+		raw = string(data)
+		sep = "\n"
+	}
+	var clips []string
+	for _, line := range strings.Split(raw, sep) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		clips = append(clips, line)
+	}
+	return clips
+}
+
+// envQPList parses EBIV_QPS ("18,22") into fixed EBIV operating points, or
+// nil when unset (bracket search).
+func envQPList() []int {
+	v := os.Getenv("EBIV_QPS")
+	if v == "" {
+		return nil
+	}
+	var qps []int
+	for _, p := range strings.Split(v, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+			qps = append(qps, n)
+		}
+	}
+	return qps
 }
 
 func clipName(path string) string {
