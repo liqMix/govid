@@ -98,11 +98,12 @@ func TestBitAudit(t *testing.T) {
 		}
 
 		// Price every token and walk. Static contexts are priced from the exact
-		// shipped tables; coefficient contexts adapt per tile (v4), so their
-		// per-token cost varies — they are priced from the frame-aggregate
-		// distribution, a stationary approximation of the adaptive cost. The
-		// entropy cross-check below uses the same approximation, so it still
-		// pins the walker's grammar exactly.
+		// shipped tables; coefficient contexts adapt per tile from a seed built
+		// on those tables (v4), so their per-token cost varies — they are
+		// priced from the frame-aggregate distribution, a stationary
+		// approximation of the adaptive cost. The entropy cross-check below
+		// uses the same approximation, so it still pins the walker's grammar
+		// exactly.
 		freqs := make([][]uint32, numContexts)
 		for c := range freqs {
 			if c == ctxBypass {
@@ -110,12 +111,7 @@ func TestBitAudit(t *testing.T) {
 			}
 			freqs[c] = normalizeFreqs(e.counts[c])
 		}
-		shippedTables := make([][]uint32, numContexts)
-		copy(shippedTables, freqs)
-		for c := ctxTokenBase; c < numContexts; c++ {
-			shippedTables[c] = nil // adaptive contexts ship no table
-		}
-		tablesSum += len(serializeTables(shippedTables, prev))
+		tablesSum += len(serializeTables(freqs, prev))
 		cost := makeCostTable(freqs)
 
 		frameTally := newAuditTally()

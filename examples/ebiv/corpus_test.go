@@ -586,7 +586,13 @@ func corpusClips(t *testing.T, spec string) []string {
 	raw := spec
 	sep := ";"
 	if strings.HasPrefix(spec, "@") {
-		data, err := os.ReadFile(spec[1:])
+		// go test runs in the package directory; accept repo-root-relative
+		// list paths too.
+		path := spec[1:]
+		data, err := os.ReadFile(path)
+		if err != nil && !filepath.IsAbs(path) {
+			data, err = os.ReadFile(filepath.Join("..", "..", path))
+		}
 		if err != nil {
 			t.Fatalf("EBIV_CORPUS list file: %v", err)
 		}

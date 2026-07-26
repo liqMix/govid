@@ -148,9 +148,8 @@ func (e *frameEncoder) finish(qp int, prev [][]uint32) ([]byte, *frameBuf, [][]u
 	freqs := make([][]uint32, numContexts)
 	tables := make([]ransTable, numContexts)
 	for c := 0; c < numContexts; c++ {
-		if c == ctxBypass || c >= ctxTokenBase {
-			continue // bypass is fixed uniform; token contexts adapt per tile —
-			// neither ships a table (counts still feed the RDOQ cost model)
+		if c == ctxBypass {
+			continue // fixed uniform, installed below
 		}
 		freqs[c] = normalizeFreqs(e.counts[c])
 		tables[c] = buildTable(freqOrZero(freqs[c], alphabetSizes[c]), false)
