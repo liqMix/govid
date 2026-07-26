@@ -16,7 +16,7 @@ Every decoder is verified plane-by-plane against raw YUV dumped from ffmpeg for 
 | `mp4/`, `webm/` | Container demuxers (mp4ff / ebml-go) with keyframe-accurate seek | **Working** |
 | `player.go`, `ebitengine/` | Playback orchestration + Ebitengine bridge | **Working** |
 | `av1/` | From-scratch AV1 decoder | **Not usable** — parses structure, output is wrong |
-| `ebiv/` | EBIV — a decode-optimized codec of our own ([design plan](.docs/codec-design-plan.md)) | **Working, v2** — intra + inter (skip/partitions/qpel), directional intra, real-cost RD encoder, parallel tiles; ~1.33× x264 size at matched PSNR (projected), decode-speed work (M3) in progress |
+| `ebiv/` | EBIV — a decode-optimized codec of our own ([design plan](.docs/codec-design-plan.md)) | **Working, feature-complete** — measured 1.16× x264 size on background-animation content at matched PSNR and seek cadence; 1080p decode 4–11 ms single-thread, **1.0–1.8 ms tiled**; fuzz-hardened, CI-pinned size and decode budgets |
 
 ## Codec / container support
 
@@ -126,7 +126,8 @@ player, _ := govid.NewPlayer(source, source)
 ### EBIV
 
 A decode-optimized codec built for this use case: static-table interleaved
-rANS, no in-loop filter, and independent tiles for parallel decode. See the
+rANS, no in-loop filter, a golden reference for looping/flashing content, and
+independent tiles for parallel decode. See the
 [design plan](.docs/codec-design-plan.md).
 
 ```go
@@ -134,7 +135,8 @@ demuxer, _ := ebiv.NewDemuxer(f)
 player, _ := govid.NewPlayer(demuxer, ebiv.NewCodec())
 ```
 
-Encode from any govid-supported source with the transcoder:
+Encode from any govid-supported source with the transcoder (`-fast` halves
+encode time during iteration at ~3.5% size cost; drop it for final assets):
 
 ```bash
 go run ./examples/ebiv -q 22 -gop 60 -tilecols 4 -tilerows 3 in.mp4 out.ebiv
@@ -161,6 +163,10 @@ Same API, different behavior under load: if the decoder falls behind, `Update`/`
 
 ### Ebitengine
 
+A complete background-video loop with EBIV — decode runs on a background
+goroutine (`NewAsyncPlayer`), so a slow frame holds the last video image
+instead of stalling the game:
+
 ```go
 package main
 
@@ -170,7 +176,7 @@ import (
 	"github.com/hajimehoshi/ebiten/v2"
 	govid "github.com/liqmix/govid"
 	govidebiten "github.com/liqmix/govid/ebitengine"
-	"github.com/liqmix/govid/mpeg1"
+	"github.com/liqmix/govid/ebiv"
 )
 
 type Game struct {
@@ -183,7 +189,7 @@ func (g *Game) Update() error {
 }
 
 func (g *Game) Draw(screen *ebiten.Image) {
-	screen.DrawImage(g.video.Image(), nil)
+	screen.DrawImage(g.video.Image(), nil) // draw first: it's the background
 }
 
 func (g *Game) Layout(_, _ int) (int, int) {
@@ -192,13 +198,18 @@ func (g *Game) Layout(_, _ int) (int, int) {
 }
 
 func main() {
-	f, _ := os.Open(os.Args[1])
+	f, _ := os.Open("bg.ebiv")
 	defer f.Close()
 
-	source, _ := mpeg1.NewSource(f)
-	defer source.Close()
+	demuxer, _ := ebiv.NewDemuxer(f)
+	defer demuxer.Close()
 
-	player, _ := govid.NewPlayer(source, source)
+	const decodeAhead = 4
+	codec := ebiv.NewCodec(ebiv.WithFrameRing(decodeAhead + 2))
+	player, _ := govid.NewAsyncPlayer(demuxer, codec, decodeAhead, govid.WithRGBA())
+	defer player.Close()
+
+	player.SetLoop(true)
 	player.Play()
 
 	game := &Game{video: govidebiten.New(player)}
@@ -207,32 +218,48 @@ func main() {
 }
 ```
 
-See [`examples/`](examples) for runnable programs, one per codec.
+The same skeleton plays any govid format — swap the demuxer/codec pair (see
+the MPEG-1/H.264/VP8 sections above). See [`examples/`](examples) for
+runnable programs, one per codec.
 
 ## EBIV for Ebitengine: when it earns its place
 
-EBIV is a codec built specifically for this problem — video decoded inside a
-game loop that can't stall — so it's worth being concrete about where it helps
-and where one of the other decoders is the better call. The design trades some
-compression for **cheap, embarrassingly-parallel decode**; whether that trade
-pays off depends on your resolution, frame rate, and target hardware.
+EBIV exists because none of the other options fit the job this library was
+built for: **background animation playing inside a game loop that can't
+stall**. H.264 ships the smallest files but eats most of a 60 Hz tick on one
+core and won't parallelize (and shipping an H.264 decoder in a commercial game
+touches the MPEG-LA patent pool). MPEG-1 decodes for free but ships files
+nearly twice as large. EBIV is a clean-room, royalty-free format that splits
+the difference on size and then wins decisively on decode by being the only
+decoder here that **scales across cores**: encoded once offline, decoded in
+1–2 ms/frame at 1080p on a desktop, with graceful degradation below that.
+(Its v1 measured 2.19× x264 at 88 ms/frame; every number below is the result
+of a measured, gate-driven program to fix that — the full history lives in the
+[gap analysis](.docs/ebiv-gap-analysis.md).)
 
 Measured against the *other govid decoders* (the real alternatives), 1080p, at
-matched quality:
+matched quality and seek granularity, across an 11-clip corpus:
 
 | codec (via govid) | file size vs H.264 | decode, 1 core | decode, tiled |
 |---|---:|---:|---:|
 | H.264 | 1.00× (smallest) | ~27 ms | — (single-threaded) |
 | VP8 | ~1.5× | ~24 ms | — |
 | MPEG-1 | ~1.7× | **1.9 ms** | — |
-| **EBIV** | **~1.24×** | 7.4 ms | **1.66 ms** |
+| **EBIV** | **1.16× (BGA median)** | 4–11 ms | **1.0–1.8 ms** |
 
-EBIV is the **Pareto point** between "MPEG-1: trivially cheap decode, fat files"
-and "H.264: smallest files, expensive single-threaded decode." It dominates VP8
-(smaller *and* faster), ships ~33% smaller than MPEG-1 while decoding as fast
-tiled, and decodes far cheaper than H.264 for a modest size increase. It is the
-only decoder here that **scales across cores** and holds ~zero per-frame
-allocation.
+EBIV is the **Pareto point** between "MPEG-1: trivially cheap decode, fat
+files" and "H.264: smallest files, expensive single-threaded decode." On the
+background-animation content it targets, half the corpus encodes **at or
+below x264's size** (0.70–0.99×) while the median sits at 1.16×; it ships
+~40% smaller than MPEG-1, dominates VP8 (smaller *and* faster), and its tiled
+decode outruns even libvpx-vp9's hand-vectorized C decoder on every measured
+clip. It holds ~zero per-frame allocation, decodes bit-identically on every
+platform, and corrupt files return errors — the decoder is fuzz-tested, never
+panicking or hanging on hostile input.
+
+Know its measured limits too: grain-heavy or shimmer-heavy animation encodes
+~1.6× x264, and high-motion 60 fps screen capture (not its use case) runs
+1.6–1.9×.
 
 **Reach for EBIV when:**
 
@@ -249,17 +276,19 @@ allocation.
 
 - **720p30, a single video, a healthy CPU.** govid's H.264 already decodes in
   ~15 ms and ships smaller — EBIV's cheaper decode buys nothing you needed, and
-  you pay ~24% more bytes. This is the common case; don't reach for EBIV
+  you pay ~16% more bytes. This is the common case; don't reach for EBIV
   reflexively.
-- **File size is paramount** → H.264 (~24% smaller than EBIV).
+- **File size is paramount** → H.264 (~16% smaller than EBIV on BGA content,
+  more on grain-heavy clips).
 - **You want the simplest, most decode-cheap option and can spare the bytes**
   → MPEG-1.
 
-**Also weigh:** EBIV's encoder is offline and slow (much slower than an ffmpeg
-encode), the format is young (validated on a handful of clips, not a corpus),
+**Also weigh:** EBIV's encoder is offline (a few hundred ms per 720p frame
+two-pass — slower than ffmpeg, fine for an asset pipeline, `-fast` halves it),
 and it is code this repo owns and maintains versus mature H.264/MPEG-1 paths.
-Full measured status and the milestone history live in the
-[gap analysis](.docs/ebiv-gap-analysis.md).
+The format's size and decode budgets are pinned by CI regression gates, so
+neither can silently drift. Full measured status and the milestone history
+live in the [gap analysis](.docs/ebiv-gap-analysis.md).
 
 Playing an `.ebiv` file is identical to any other format — the Ebitengine
 example above works unchanged; just point it at a `.ebiv` and size the codec's
@@ -309,8 +338,9 @@ go run ./examples/ebiv -q 22 -gop 60 -tilecols 4 -tilerows 2  in.mp4  out.ebiv
 | Flag | Meaning | Guidance |
 |---|---|---|
 | `-q` | quantizer 0–63, lower = better | **22** is a good ship point (~40+ dB). `18` for hero/archival content; `26+` for out-of-focus background where size wins. `-1` stores lossless (huge — not for distribution). |
-| `-gop` | key-frame interval | **60** (~1 s at 60 fps) balances size, seek granularity, and — because there is no in-loop filter — how far blocking artifacts propagate. Use `~30` for tight song-position seeking. |
+| `-gop` | key-frame interval | **60** (~1 s at 60 fps) balances size, seek granularity, and — because there is no in-loop filter — how far blocking artifacts propagate. Use `~30` for tight song-position seeking. The encoder also starts a fresh GOP at detected scene cuts automatically. |
 | `-tilecols`/`-tilerows` | tile grid | Set explicitly; ~8 tiles for 1080p/720p (see above). |
+| `-fast` | single-pass encode | ~2× faster encode, ~3.5% larger files. Use while iterating; drop it for the final asset. |
 
 ### Play it back off the game thread
 
@@ -321,20 +351,21 @@ updates a little slower, which is usually imperceptible.
 
 ### What to expect
 
-These are **extrapolated** from measurements on one desktop (Ryzen 9 7950X:
-1080p decode ≈ 82 ms/frame single-threaded, ≈ 9 ms/frame tiled across cores),
-scaled for slower cores and lower thread counts — **profile on your actual
-targets before committing**:
+Measured on one desktop (Ryzen 9 7950X: 1080p decode 4–11 ms/frame
+single-threaded, **1.0–1.8 ms/frame tiled**), extrapolated for slower cores
+and lower thread counts — **profile on your actual targets before
+committing**:
 
 | Target | 1080p60 | 1080p30 | 720p60 |
 |---|---|---|---|
-| Desktop, 8+ cores | comfortable | easy | easy |
-| Steam Deck (8 threads) | marginal (~40–50 fps, degrades gracefully) | comfortable | comfortable |
-| Low-end 4-core | tight | fine | comfortable |
+| Desktop, 8+ cores | easy | easy | easy |
+| Steam Deck (8 threads) | comfortable (est. ~5–8 ms tiled) | easy | easy |
+| Low-end 4-core | comfortable | easy | easy |
 
-For background animation, **720p at `-q 22`–`26` is the safe universal 60 fps
-choice**; 1080p is comfortable at 30 fps everywhere and 60 fps on real 8-core
-machines.
+Even the pessimistic case — a weak 4-core running the busiest clip
+single-threaded — sits near 30–40 ms/frame, and `NewAsyncPlayer` degrades
+gracefully from there. For background animation, 720p and 1080p are both
+realistic 60 fps targets on anything Steam-Deck-class or better.
 
 ### Notes for asset pipelines
 
@@ -345,13 +376,14 @@ machines.
   ~3 MB of YCbCr plus ~8 MB of RGBA (with `WithRGBA`), times the `decodeAhead`
   queue and the decoder's frame ring. Budget for it if several play at once;
   drop `WithRGBA` or the resolution if that is tight.
-- **Where v2 stands, measured on real content:** matched-PSNR size is
-  **0.99×–1.33× x264** (real video → screen capture; down from v1's ~2.2×) via
-  skip mode, motion partitions, quarter-pel, directional intra, and a two-pass
-  real-cost RD encoder — and **0.59×–0.63× MPEG-1**. Decode after the M3 speed
-  work is **7.4 ms/frame single-thread, 1.66 ms/frame tiled** (down from v1's
-  88 / 8.0) — comfortably real-time even on one core. So v2 hits its design
-  goal: H.264-class size with cheap, parallel, pure-Go decode. Full status:
+- **Final measured status (11-clip corpus, matched PSNR and seek cadence):**
+  size is **1.16× x264 on the background-animation median** — half the target
+  clips at or below x264 parity (0.70–0.99×) — and **~0.6× MPEG-1**, via skip
+  mode, motion partitions, quarter-pel, directional intra, a golden reference
+  for looping/flashing content, sign data hiding, scene-cut keyframes, and a
+  two-pass real-cost RD encoder. Decode is **4–11 ms/frame single-thread and
+  1.0–1.8 ms/frame tiled at 1080p** (v1 shipped at 2.19× x264 and 88 ms).
+  Both numbers are pinned by CI regression gates. Full history:
   [gap analysis](.docs/ebiv-gap-analysis.md).
 
 ## Development
@@ -366,7 +398,8 @@ Short test fixtures with ffmpeg-generated YUV references are committed under eac
 
 ## Roadmap
 
-- EBIV v2: close the measured gap to x264 (currently 2.2× at matched PSNR) — bitstream v2 (skip/CBP, MV classes, richer contexts, directional intra, qpel, partitions), real-cost RDO encoder, butterfly transforms + BCE'd hot paths for decode; hard gates in `.docs/ebiv-gap-analysis.md`
+- EBIV integration (M9): zero-copy YCbCr plane accessor + Kage-shader color conversion in the Ebitengine bridge, in-engine frame-time measurements against the H.264 path, low-core-count profiling. The codec itself is feature-complete — its size/decode plateau is measured, gated in CI, and documented (eleven optimization experiments recorded in `.docs/`, kept or reverted strictly by measurement)
+- EBIV half-resolution experiment: encode below display resolution and reconstruct in a display shader — the remaining size lever, judged perceptually in-engine rather than by PSNR
 - Fix govid/h264 silent mis-decode of High 4:4:4 Predictive (profile 244): must return an error
 - Get AV1 intra reconstruction correct before adding inter prediction
 - H.264 leftovers if ever needed: interlaced (field/MBAFF) coding, FMO, POC type 1
