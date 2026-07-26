@@ -103,7 +103,9 @@ func newFrameEncoder(g geometry, img *image.YCbCr, ref, golden *frameBuf, qp, ti
 		mvStride: src.mbCols,
 	}
 	qac := int64(e.q.ac)
-	e.lambda = qac * qac / 6 // rate weight in the SSE domain
+	e.lambda = qac * qac / 6 // rate weight in the SSE domain: swept 2026-07-26
+	// (qac²/9 and qac²/4 both measured ≈equal-or-worse on the BGA corpus at
+	// matched PSNR), so /6 stands as the calibrated value for target content.
 	e.lambdaF = float64(e.lambda)
 	if ref != nil {
 		e.mvSearch = make([]mbSearchCache, src.mbCols*src.mbRows)
