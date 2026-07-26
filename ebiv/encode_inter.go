@@ -420,6 +420,26 @@ func (te *tileEncoder) searchMVRect(ref *frameBuf, mbx, mby, px, py, pw, ph int,
 
 func (te *tileEncoder) rectSAD(ref *frameBuf, mbx, mby, px, py, pw, ph int, mv motionVector) int64 {
 	fe := te.fe
+	// Full-pel interior candidates — the bulk of a diamond search — compare
+	// bytes directly, skipping the int32 prediction buffer entirely.
+	if mv.x&3 == 0 && mv.y&3 == 0 {
+		srcX := mbx*mbSize + px + int(mv.x>>2)
+		srcY := mby*mbSize + py + int(mv.y>>2)
+		if srcX >= 0 && srcY >= 0 && srcX+pw <= ref.y.w && srcY+ph <= ref.y.h {
+			x0, y0 := mbx*mbSize+px, mby*mbSize+py
+			var sad int64
+			for r := 0; r < ph; r++ {
+				sb := (y0+r)*fe.src.y.stride + x0
+				a := fe.src.y.data[sb : sb+pw : sb+pw]
+				rb := (srcY+r)*ref.y.stride + srcX
+				b := ref.y.data[rb : rb+pw : rb+pw]
+				for c := 0; c < pw; c++ {
+					sad += int64(abs32(int32(a[c]) - int32(b[c])))
+				}
+			}
+			return sad
+		}
+	}
 	var mc [mbSize * mbSize]int32
 	mcLumaRect(ref.y, mbx, mby, px, py, pw, ph, mv, mc[:])
 	var sad int64

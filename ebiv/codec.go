@@ -116,11 +116,21 @@ func (c *Codec) Flush() {
 	c.next = 0
 }
 
+// maxDecodePixels bounds the frame area a key frame header may declare, so a
+// hostile stream cannot drive multi-gigabyte plane allocations before any
+// payload is even parsed. 8K (8192×4320) is far beyond the format's use case
+// and still allocates only a few hundred megabytes across the ring.
+const maxDecodePixels = 8192 * 4320
+
 // configure sizes the plane ring for a key frame's geometry. A mid-stream
 // resolution change is not supported: it would invalidate every reference
 // buffer, and the format's use case (a single offline-encoded clip) never
 // produces one.
 func (c *Codec) configure(w, h int) error {
+	if w*h > maxDecodePixels {
+		return fmt.Errorf("%w: frame %dx%d exceeds the decoder's %d-pixel bound",
+			ErrUnsupported, w, h, maxDecodePixels)
+	}
 	if c.ready {
 		if w != c.geo.W || h != c.geo.H {
 			return fmt.Errorf("%w: key frame is %dx%d, stream is %dx%d",

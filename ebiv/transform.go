@@ -46,16 +46,23 @@ func forwardDCT(src, dst []int32, n int) {
 	var tmp [maxLevels]int32
 	round := int64(1) << (dctScaleBits - 1)
 
-	// Columns: tmp = C · src.
-	for k := 0; k < n; k++ {
-		crow := c[k*n : k*n+n : k*n+n]
-		for j := 0; j < n; j++ {
-			var acc int64
-			for i := 0; i < n; i++ {
-				acc += int64(crow[i]) * int64(src[i*n+j])
+	// Columns: tmp = C · src, accumulated input-row-major so every inner loop
+	// walks contiguous memory (the k/j-outer form strides src by n per step,
+	// which is what made this the encoder's hottest kernel). Identical output:
+	// int64 addition reorders exactly.
+	var acc [maxLevels]int64
+	for i := 0; i < n; i++ {
+		srow := src[i*n : i*n+n : i*n+n]
+		for k := 0; k < n; k++ {
+			cki := int64(c[k*n+i])
+			arow := acc[k*n : k*n+n : k*n+n]
+			for j := 0; j < n; j++ {
+				arow[j] += cki * int64(srow[j])
 			}
-			tmp[k*n+j] = int32((acc + round) >> dctScaleBits)
 		}
+	}
+	for k := 0; k < n*n; k++ {
+		tmp[k] = int32((acc[k] + round) >> dctScaleBits)
 	}
 	// Rows: dst = tmp · Cᵀ.
 	for k := 0; k < n; k++ {
