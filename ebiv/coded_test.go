@@ -475,3 +475,94 @@ func TestGoldenRefFlashingSequence(t *testing.T) {
 	t.Logf("key %d B, excursion %d B, returns %d/%d/%d/%d B",
 		sizes[0], sizes[1], sizes[2], sizes[4], sizes[6], sizes[8])
 }
+
+// TestSignDataHidingBlock pins the SDH block grammar directly: for arbitrary
+// level patterns, applySignDataHiding must leave the first and last nonzero
+// positions in place and make qualifying blocks' parity encode the first sign,
+// and encodeBlock/decodeBlock must round-trip the adjusted levels exactly.
+func TestSignDataHidingBlock(t *testing.T) {
+	cases := [][]int32{
+		{3, 0, 0, -2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},   // qualifying, mag>1 available
+		{-1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},   // dense ones, bump path
+		{1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},   // two ones, interior-zero path
+		{2, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},   // short span: sign coded, no hiding
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -7},   // single coefficient at the end
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},    // all zero
+		{5, 4, 3, 2, 1, -1, -2, -3, -4, -5, 6, 7, 8, 9, 1, 1}, // full block, no EOB
+	}
+	n := 4
+	scan := scanOrders[n]
+	for ci, orig := range cases {
+		levels := append([]int32(nil), orig...)
+		applySignDataHiding(levels, n)
+
+		first, last := -1, -1
+		var sum int32
+		for i := 0; i < n*n; i++ {
+			if v := abs32(levels[scan[i]]); v != 0 {
+				if first < 0 {
+					first = i
+				}
+				last = i
+				sum += v
+			}
+		}
+		oFirst, oLast := -1, -1
+		for i := 0; i < n*n; i++ {
+			if orig[scan[i]] != 0 {
+				if oFirst < 0 {
+					oFirst = i
+				}
+				oLast = i
+			}
+		}
+		if first != oFirst || last != oLast {
+			t.Errorf("case %d: adjustment moved first/last: %d/%d -> %d/%d", ci, oFirst, oLast, first, last)
+		}
+		if first >= 0 && last-first >= sdhMinSpan {
+			if int(sum&1) != signBit(levels[scan[first]]) {
+				t.Errorf("case %d: parity %d does not encode first sign %d", ci, sum&1, signBit(levels[scan[first]]))
+			}
+		}
+
+		// Round-trip through the entropy layer.
+		var s tileStream
+		encodeBlock(&s, planeLuma, 0, levels, n)
+		tables := buildTestTables(t, s.toks)
+		buf := ransEncode(s.toks, tables)
+		var d ransDecoder
+		if err := d.reset(buf, tables); err != nil {
+			t.Fatalf("case %d: reset: %v", ci, err)
+		}
+		got := make([]int32, n*n)
+		decodeBlock(&d, planeLuma, 0, got, n)
+		if d.err != nil {
+			t.Fatalf("case %d: decode: %v", ci, d.err)
+		}
+		for i := range got {
+			if got[i] != levels[i] {
+				t.Errorf("case %d: level[%d] = %d, want %d", ci, i, got[i], levels[i])
+			}
+		}
+	}
+}
+
+// buildTestTables builds usable rANS tables covering every context a token run
+// touches, uniform elsewhere.
+func buildTestTables(t *testing.T, toks []entToken) []ransTable {
+	t.Helper()
+	counts := make([][]uint32, numContexts)
+	for c := range counts {
+		counts[c] = make([]uint32, alphabetSizes[c])
+	}
+	for _, tk := range toks {
+		counts[tk.ctx][tk.sym]++
+	}
+	tables := make([]ransTable, numContexts)
+	for c := range tables {
+		freq := normalizeFreqs(counts[c])
+		tables[c] = buildTable(freqOrZero(freq, alphabetSizes[c]), true)
+	}
+	installBypass(tables, true)
+	return tables
+}

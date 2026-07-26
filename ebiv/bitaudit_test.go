@@ -411,22 +411,31 @@ func (w *auditWalker) walkInterMB(stats *auditMBStats) {
 }
 
 // block walks one residual block and reports whether it was all-zero
-// (immediate EOB).
+// (immediate EOB). Signs are inline for all but the first nonzero; the first
+// sign closes the block when the span is too short for sign data hiding.
 func (w *auditWalker) block(n int) bool {
 	total := n * n
+	first, last := -1, -1
 	for i := 0; i < total; i++ {
 		_, sym := w.next()
-		switch {
-		case sym == tEOB:
-			return i == 0
-		case sym == tZero:
-			// keep scanning
-		case sym == tEscape:
+		if sym == tEOB {
+			break
+		}
+		if sym == tZero {
+			continue
+		}
+		if sym == tEscape {
 			w.classValue("escape")
-			w.next() // ctxSign
-		default: // tOne..tFour
+		}
+		if first < 0 {
+			first = i
+		} else {
 			w.next() // ctxSign
 		}
+		last = i
 	}
-	return false
+	if first >= 0 && last-first < sdhMinSpan {
+		w.next() // ctxSign, the deferred first sign
+	}
+	return first < 0
 }

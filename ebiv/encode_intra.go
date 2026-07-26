@@ -334,6 +334,7 @@ func (te *tileEncoder) codeResidual(s *tileStream, plane, txIdx int, src, rec pl
 	} else {
 		te.fe.q.quantize(sc.coeffs[:n*n], sc.levels[:n*n], n) // pass 1: dead zone
 	}
+	applySignDataHiding(sc.levels[:n*n], n)
 	encodeBlock(s, plane, txIdx, sc.levels[:n*n], n)
 
 	// Reconstruct exactly as the decoder will.
