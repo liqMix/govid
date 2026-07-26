@@ -147,6 +147,75 @@ func buildTableInto(t *ransTable, freq []uint32, forDecode bool) {
 	}
 }
 
+// --- Adaptive coefficient contexts -------------------------------------------
+//
+// Coefficient tokens (ctx >= ctxTokenBase) are coded against per-tile adaptive
+// CDFs instead of shipped static tables (v4). Each tile's model starts from a
+// uniform default and nudges toward every symbol it codes, so the statistics
+// track the content with no table cost and no cross-tile dependency. rANS is
+// LIFO, so the encoder walks the token stream forward first — simulating
+// exactly the decoder's model — records each symbol's interval, then encodes
+// the stream in reverse from the recording.
+//
+// CDFs live in a reserved-slot domain: the adaptive values span ransM minus
+// one slot per symbol, and symbol s's real interval adds s..s+1 back, so every
+// symbol keeps frequency >= 1 no matter how far adaptation runs — an
+// undecodable zero-frequency state cannot be reached.
+
+const (
+	adaptRate = 4                 // CDF step: larger adapts slower, smoother
+	adaptSpan = ransM - numTokens // adaptive domain, one slot per symbol reserved
+)
+
+// adaptiveModel is the per-tile CDF state for every coefficient-token context.
+type adaptiveModel struct {
+	cdf [numTokenCtx][numTokens + 1]uint16
+}
+
+var adaptDefault = func() (m adaptiveModel) {
+	for c := range m.cdf {
+		for s := 0; s <= numTokens; s++ {
+			m.cdf[c][s] = uint16(s * adaptSpan / numTokens)
+		}
+	}
+	return
+}()
+
+func (m *adaptiveModel) reset() { *m = adaptDefault }
+
+// interval returns symbol s's coding interval in token context c, mapping the
+// reserved-domain CDF back to the full ransM line.
+func (m *adaptiveModel) interval(c, s int) ransSym {
+	cdf := &m.cdf[c]
+	start := uint32(cdf[s]) + uint32(s)
+	return ransSym{start: start, freq: uint32(cdf[s+1]) + uint32(s+1) - start}
+}
+
+// lookup finds the symbol whose interval contains slot. Seven symbols make a
+// linear scan cheaper than maintaining a reverse map under adaptation.
+func (m *adaptiveModel) lookup(c int, slot uint32) int {
+	cdf := &m.cdf[c]
+	s := 0
+	for s+1 < numTokens && uint32(cdf[s+1])+uint32(s+1) <= slot {
+		s++
+	}
+	return s
+}
+
+// update nudges context c toward symbol s: boundaries at or below s move down,
+// boundaries above move up, both by a 1/2^adaptRate step. Monotonicity is
+// preserved, so with the reserved slots every frequency stays >= 1.
+func (m *adaptiveModel) update(c, s int) {
+	cdf := &m.cdf[c]
+	for i := 1; i < numTokens; i++ {
+		if i <= s {
+			cdf[i] -= cdf[i] >> adaptRate
+		} else {
+			cdf[i] += (adaptSpan - cdf[i]) >> adaptRate
+		}
+	}
+}
+
 // --- Byte stack -------------------------------------------------------------
 
 // ransStack collects encoder output. Encoding pushes bytes; decoding pops them
@@ -192,20 +261,33 @@ func ransEncPut(x uint32, st *ransStack, sym ransSym) uint32 {
 	return ((x / sym.freq) << ransScaleBits) + (x % sym.freq) + sym.start
 }
 
-// ransEncode encodes one tile's token stream against the shared tables and
-// returns the byte stack. Symbols are processed in reverse; the N states are
-// assigned round-robin by decode index so the forward decoder pairs each
-// symbol with the same state.
+// ransEncode encodes one tile's token stream and returns the byte stack.
+// Static contexts use the shared tables; coefficient contexts use the
+// adaptive model, whose per-symbol intervals are recorded in a forward pass
+// (the model must evolve in decode order) and consumed by the reverse encode.
+// The N states are assigned round-robin by decode index so the forward
+// decoder pairs each symbol with the same state.
 func ransEncode(toks []entToken, tables []ransTable) []byte {
+	recorded := make([]ransSym, len(toks))
+	var m adaptiveModel
+	m.reset()
+	for j, t := range toks {
+		if int(t.ctx) >= ctxTokenBase {
+			c := int(t.ctx) - ctxTokenBase
+			recorded[j] = m.interval(c, int(t.sym))
+			m.update(c, int(t.sym))
+		} else {
+			recorded[j] = tables[t.ctx].enc[t.sym]
+		}
+	}
+
 	var st ransStack
 	var state [ransStates]uint32
 	for i := range state {
 		state[i] = ransLower
 	}
 	for j := len(toks) - 1; j >= 0; j-- {
-		t := toks[j]
-		sym := tables[t.ctx].enc[t.sym]
-		state[j%ransStates] = ransEncPut(state[j%ransStates], &st, sym)
+		state[j%ransStates] = ransEncPut(state[j%ransStates], &st, recorded[j])
 	}
 	for i := 0; i < ransStates; i++ {
 		st.push32(state[i])
@@ -226,6 +308,7 @@ type ransDecoder struct {
 	state   [ransStates]uint32
 	counter int
 	err     error
+	adapt   adaptiveModel
 }
 
 func newRansDecoder(buf []byte, tables []ransTable) (*ransDecoder, error) {
@@ -243,6 +326,7 @@ func (d *ransDecoder) reset(buf []byte, tables []ransTable) error {
 	d.tables = tables
 	d.counter = 0
 	d.err = nil
+	d.adapt.reset()
 	for i := ransStates - 1; i >= 0; i-- {
 		d.state[i] = d.pop32()
 	}
@@ -271,18 +355,27 @@ func (d *ransDecoder) decode(ctx int) int {
 	if d.err != nil {
 		return 0
 	}
-	t := &d.tables[ctx]
-	if !t.used {
-		d.fail(fmt.Errorf("%w: symbol decoded from unused context %d", ErrCorrupt, ctx))
-		return 0
-	}
 	i := d.counter & (ransStates - 1)
 	d.counter++
 
 	x := d.state[i]
 	slot := x & (ransM - 1)
-	sym := t.slot2sym[slot]
-	s := t.enc[sym]
+	var sym int
+	var s ransSym
+	if ctx >= ctxTokenBase {
+		c := ctx - ctxTokenBase
+		sym = d.adapt.lookup(c, slot)
+		s = d.adapt.interval(c, sym)
+		d.adapt.update(c, sym)
+	} else {
+		t := &d.tables[ctx]
+		if !t.used {
+			d.fail(fmt.Errorf("%w: symbol decoded from unused context %d", ErrCorrupt, ctx))
+			return 0
+		}
+		sym = int(t.slot2sym[slot])
+		s = t.enc[sym]
+	}
 	x = s.freq*(x>>ransScaleBits) + slot - s.start
 	if x < ransLower {
 		// A normalized state drops by at most 8 bits per symbol, so one or two

@@ -21,9 +21,11 @@ import (
 // Format version written by this package. The reader accepts only this exact
 // version — the bitstream is not frozen and there is no compatibility story
 // until it is. Version 2 was the M1 bitstream (skip/CBP, class-coded MVs and
-// escapes, tx-split coefficient contexts, table delta-coding); version 3 adds
-// the golden reference frame (per-macroblock reference select).
-const Version = 3
+// escapes, tx-split coefficient contexts, table delta-coding); version 3
+// added the golden reference frame (per-macroblock reference select) and
+// sign data hiding; version 4 codes coefficient tokens with per-tile
+// adaptive CDFs (no shipped tables for those contexts).
+const Version = 4
 
 // On-disk sizes, in bytes.
 const (
