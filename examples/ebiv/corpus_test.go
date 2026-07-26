@@ -67,35 +67,42 @@ func TestCorpusCompare(t *testing.T) {
 			continue
 		}
 		results = append(results, r)
-		t.Logf("%-28s %dx%d@%.3g  anchor x264 %.2f dB %s | VP9 %s (EBIV %.2fx) | EBIV %s (%.2fx x264) | EBIV decode %.2f/%.2f ms/f (1T/par) | vp9 C decode %.2f ms/f 1T",
+		t.Logf("%-28s %dx%d@%.3g  x264 %.2fdB %s | x264-g %.2fdB %s | EBIV %s = %.2fx x264, %.2fx x264-g, %.2fx VP9 | decode %.2f/%.2f ms/f (1T/par), vp9 C %.2f",
 			r.name, r.w, r.h, r.fps, r.anchorPSNR, fmtMB(r.x264Size),
-			fmtMB(r.vp9Size), float64(r.ebivSize)/float64(r.vp9Size),
+			r.anchorGPSNR, fmtMB(r.x264gSize),
 			fmtMB(r.ebivSize), float64(r.ebivSize)/float64(r.x264Size),
+			float64(r.ebivSizeG)/float64(r.x264gSize),
+			float64(r.ebivSize)/float64(r.vp9Size),
 			r.ebivDecode1T, r.ebivDecodePar, r.vp9Decode1T)
 	}
 	if len(results) == 0 {
 		t.Fatal("no clips measured")
 	}
 
-	var vsX264, vsVP9 []float64
+	var vsX264, vsX264g, vsVP9 []float64
 	for _, r := range results {
 		vsX264 = append(vsX264, float64(r.ebivSize)/float64(r.x264Size))
+		vsX264g = append(vsX264g, float64(r.ebivSizeG)/float64(r.x264gSize))
 		vsVP9 = append(vsVP9, float64(r.ebivSize)/float64(r.vp9Size))
 	}
 	t.Logf("=== corpus summary (%d clips, %d frames each, matched-PSNR sizes) ===", len(results), frames)
-	t.Logf("EBIV vs x264: median %.2fx, range %.2fx-%.2fx", median(vsX264), minOf(vsX264), maxOf(vsX264))
-	t.Logf("EBIV vs VP9:  median %.2fx, range %.2fx-%.2fx", median(vsVP9), minOf(vsVP9), maxOf(vsVP9))
-	t.Logf("caveats: EBIV single-pass (-fast, ~+3.5%%), VP9 good/cpu-used 2 (not best), x264/VP9 default keyframe cadence vs EBIV ~1s GOP")
+	t.Logf("EBIV vs x264 (default keyint): median %.2fx, range %.2fx-%.2fx", median(vsX264), minOf(vsX264), maxOf(vsX264))
+	t.Logf("EBIV vs x264 (matched ~1s cadence): median %.2fx, range %.2fx-%.2fx", median(vsX264g), minOf(vsX264g), maxOf(vsX264g))
+	t.Logf("EBIV vs VP9 (context only): median %.2fx, range %.2fx-%.2fx", median(vsVP9), minOf(vsVP9), maxOf(vsVP9))
+	t.Logf("EBIV encode: %s; VP9 good/cpu-used 2 (not best), default cadence", map[bool]string{true: "two-pass (final-asset config)", false: "single-pass -fast (~+3.5%)"}[os.Getenv("EBIV_CORPUS_TWOPASS") != ""])
 }
 
 type clipResult struct {
 	name          string
 	w, h          int
 	fps           float64
-	anchorPSNR    float64
+	anchorPSNR    float64 // x264 default keyframe cadence
+	anchorGPSNR   float64 // x264 at EBIV's ~1s seek cadence (-g ≈ fps)
 	x264Size      int64
+	x264gSize     int64
 	vp9Size       int64 // interpolated at anchorPSNR
 	ebivSize      int64 // interpolated at anchorPSNR
+	ebivSizeG     int64 // interpolated at anchorGPSNR
 	ebivDecode1T  float64
 	ebivDecodePar float64
 	vp9Decode1T   float64 // libvpx via ffmpeg -threads 1 (C reference, not pure Go)
@@ -147,6 +154,25 @@ func measureClip(t *testing.T, clip, work string, frames int) (clipResult, error
 		return clipResult{}, fmt.Errorf("x264 psnr: %w", err)
 	}
 
+	// Cadence-matched x264: the same ~1 s keyframe interval EBIV pays for.
+	// Seeking is a product requirement for BGA, so this is the like-for-like
+	// anchor; scene-cut keys stay enabled, so x264 may place extra keys, never
+	// fewer. The default-cadence anchor above stays on record alongside it.
+	gop := max(1, int(math.Round(fps)))
+	x264gFile := filepath.Join(dir, fmt.Sprintf("x264_crf20_g%d_%d.mp4", gop, frames))
+	if err := runCached(x264gFile, "ffmpeg", "-v", "error", "-y",
+		"-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", fmt.Sprintf("%dx%d", w, h),
+		"-r", fmt.Sprintf("%d/%d", fpsNum, fpsDen), "-i", master,
+		"-frames:v", strconv.Itoa(frames),
+		"-c:v", "libx264", "-crf", "20", "-preset", "medium", "-g", strconv.Itoa(gop),
+		"-pix_fmt", "yuv420p", x264gFile); err != nil {
+		return clipResult{}, fmt.Errorf("x264 -g encode: %w", err)
+	}
+	anchorGPSNR, err := psnrGovid(t, x264gFile, master, w, h, frames)
+	if err != nil {
+		return clipResult{}, fmt.Errorf("x264 -g psnr: %w", err)
+	}
+
 	// VP9: bracket the anchor PSNR with crf points, interpolate size.
 	vp9Points, err := bracket(anchorPSNR, 30, 6, 4, 63, func(crf int) (ratePoint, error) {
 		f := filepath.Join(dir, fmt.Sprintf("vp9_crf%d_%d.webm", crf, frames))
@@ -165,12 +191,18 @@ func measureClip(t *testing.T, clip, work string, frames int) (clipResult, error
 		return clipResult{}, fmt.Errorf("vp9: %w", err)
 	}
 
-	// EBIV: bracket with qp points, single-pass fast encode, ~1s GOP, auto tiles.
-	gop := max(1, int(math.Round(fps)))
+	// EBIV: bracket with qp points, ~1s GOP, auto tiles. EBIV_CORPUS_TWOPASS
+	// selects the full two-pass RDO encode (the final-asset configuration);
+	// default is the single-pass fast mode for iteration.
+	twoPass := os.Getenv("EBIV_CORPUS_TWOPASS") != ""
+	suffix := ""
+	if twoPass {
+		suffix = "_2p"
+	}
 	var lastEbiv string
 	ebivPoints, err := bracket(anchorPSNR, 18, 4, 0, 63, func(qp int) (ratePoint, error) {
-		f := filepath.Join(dir, fmt.Sprintf("ebiv_qp%d_gop%d_%d.ebiv", qp, gop, frames))
-		if err := encodeEbivFromYUV(f, master, w, h, fpsNum, fpsDen, qp, gop, frames); err != nil {
+		f := filepath.Join(dir, fmt.Sprintf("ebiv_qp%d_gop%d_%d%s.ebiv", qp, gop, frames, suffix))
+		if err := encodeEbivFromYUV(f, master, w, h, fpsNum, fpsDen, qp, gop, frames, twoPass); err != nil {
 			return ratePoint{}, err
 		}
 		lastEbiv = f
@@ -183,10 +215,13 @@ func measureClip(t *testing.T, clip, work string, frames int) (clipResult, error
 
 	r := clipResult{
 		name: name, w: w, h: h, fps: fps,
-		anchorPSNR: anchorPSNR,
-		x264Size:   fileSize(x264File),
-		vp9Size:    interpolateSize(vp9Points, anchorPSNR),
-		ebivSize:   interpolateSize(ebivPoints, anchorPSNR),
+		anchorPSNR:  anchorPSNR,
+		anchorGPSNR: anchorGPSNR,
+		x264Size:    fileSize(x264File),
+		x264gSize:   fileSize(x264gFile),
+		vp9Size:     interpolateSize(vp9Points, anchorPSNR),
+		ebivSize:    interpolateSize(ebivPoints, anchorPSNR),
+		ebivSizeG:   interpolateSize(ebivPoints, anchorGPSNR),
 	}
 
 	// Decode timings on the EBIV point nearest the anchor (lastEbiv is fine —
@@ -262,8 +297,9 @@ func interpolateSize(pts []ratePoint, target float64) int64 {
 }
 
 // encodeEbivFromYUV encodes a raw YUV 4:2:0 master into an EBIV file with the
-// shipping transcoder configuration (auto tiles) in single-pass fast mode.
-func encodeEbivFromYUV(dst, master string, w, h, fpsNum, fpsDen, qp, gop, frames int) error {
+// shipping transcoder configuration (auto tiles); twoPass selects the full
+// real-cost RDO encode, else the single-pass fast mode.
+func encodeEbivFromYUV(dst, master string, w, h, fpsNum, fpsDen, qp, gop, frames int, twoPass bool) error {
 	if _, err := os.Stat(dst); err == nil {
 		return nil
 	}
@@ -279,9 +315,15 @@ func encodeEbivFromYUV(dst, master string, w, h, fpsNum, fpsDen, qp, gop, frames
 	}
 	defer out.Close()
 
+	opts := []ebiv.EncoderOption{
+		ebiv.WithIntra(qp), ebiv.WithGOP(gop), ebiv.WithAutoTiles(runtime.NumCPU()),
+	}
+	if !twoPass {
+		opts = append(opts, ebiv.WithFastEncode())
+	}
 	enc, err := ebiv.NewEncoder(out, ebiv.Config{
 		Width: w, Height: h, FPSNum: uint32(fpsNum), FPSDen: uint32(fpsDen),
-	}, ebiv.WithIntra(qp), ebiv.WithGOP(gop), ebiv.WithAutoTiles(runtime.NumCPU()), ebiv.WithFastEncode())
+	}, opts...)
 	if err != nil {
 		return err
 	}
