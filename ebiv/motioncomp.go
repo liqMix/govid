@@ -21,6 +21,12 @@ const mvClampRange = 4096
 // lumaTaps is the 4-tap luma interpolation bank indexed by the quarter-pel
 // phase. Phase 0 copies; phase 2 is the half-pel (−1,5,5,−1)-shape kernel;
 // phases 1 and 3 are the quarter positions. Each row sums to 64.
+//
+// A sharper 6-tap bank (H.264 half-pel + folded HEVC quarter-pel) was tried
+// 2026-07-26 and measured WORSE at matched PSNR on the BGA corpus (+2-3%
+// size) while costing ~25% more MC decode time: on this content the 4-tap's
+// mild smoothing suppresses noise the sharper filter faithfully preserves
+// into the residual. Don't re-try sharper taps without new evidence.
 var lumaTaps = [4][4]int32{
 	{0, 64, 0, 0},
 	{-6, 55, 18, -3},
